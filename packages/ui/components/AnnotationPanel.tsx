@@ -1,6 +1,7 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { Annotation, AnnotationType, Block } from '../types';
 import { isCurrentUser } from '../utils/identity';
+import { formatTimestamp } from '../utils/format';
 import { ImageThumbnail } from './ImageThumbnail';
 
 interface PanelProps {
@@ -114,21 +115,6 @@ export const AnnotationPanel: React.FC<PanelProps> = ({
   );
 };
 
-function formatTimestamp(ts: number): string {
-  const now = Date.now();
-  const diff = now - ts;
-  const seconds = Math.floor(diff / 1000);
-  const minutes = Math.floor(seconds / 60);
-  const hours = Math.floor(minutes / 60);
-  const days = Math.floor(hours / 24);
-
-  if (seconds < 60) return 'now';
-  if (minutes < 60) return `${minutes}m`;
-  if (hours < 24) return `${hours}h`;
-  if (days < 7) return `${days}d`;
-
-  return new Date(ts).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
-}
 
 const AnnotationCard: React.FC<{
   annotation: Annotation;
