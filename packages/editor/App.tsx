@@ -855,7 +855,7 @@ const App: React.FC = () => {
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [
     showExport, showImport, showFeedbackPrompt, showClaudeCodeWarning, showAgentWarning,
-    showPermissionModeSetup, showUIFeaturesSetup, showWhatsNew, pendingPasteImage,
+    showPermissionModeSetup, showUIFeaturesSetup, showPlanDiffMarketing, showWhatsNew, pendingPasteImage,
     submitted, isSubmitting, isApiMode, linkedDocHook.isActive, annotations.length, annotateMode,
     origin, getAgentWarning,
   ]);
@@ -1008,7 +1008,7 @@ const App: React.FC = () => {
     return () => window.removeEventListener('keydown', handleSaveShortcut);
   }, [
     showExport, showFeedbackPrompt, showClaudeCodeWarning, showAgentWarning,
-    showPermissionModeSetup, showUIFeaturesSetup, showWhatsNew, pendingPasteImage,
+    showPermissionModeSetup, showUIFeaturesSetup, showPlanDiffMarketing, showWhatsNew, pendingPasteImage,
     submitted, isApiMode, markdown, annotationsOutput,
   ]);
 
