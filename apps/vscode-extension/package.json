@@ -30,7 +30,7 @@
     "commands": [
       {
         "command": "plannotator-webview.openUrl",
-        "title": "Plannotator: Open URL in Simple Browser"
+        "title": "Plannotator: Open URL in Editor"
       }
     ],
     "configuration": {
