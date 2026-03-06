@@ -209,6 +209,11 @@ echo The /plannotator-review and /plannotator-annotate commands are ready to use
 
 REM Warn if plannotator is configured in both settings.json hooks AND the plugin (causes double execution)
 REM Only warn when the plugin is installed — manual-only users won't have overlap
+if defined CLAUDE_CONFIG_DIR (
+    set "CLAUDE_SETTINGS=%CLAUDE_CONFIG_DIR%\settings.json"
+) else (
+    set "CLAUDE_SETTINGS=%USERPROFILE%\.claude\settings.json"
+)
 if exist "!PLUGIN_HOOKS!" if exist "!CLAUDE_SETTINGS!" (
     findstr /r /c:"\"command\".*plannotator" "!CLAUDE_SETTINGS!" >nul 2>&1
     if !ERRORLEVEL! equ 0 (
