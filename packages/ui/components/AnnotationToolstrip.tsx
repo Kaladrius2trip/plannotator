@@ -18,6 +18,7 @@ export const AnnotationToolstrip: React.FC<AnnotationToolstripProps> = ({
   taterMode,
 }) => {
   const [showHelp, setShowHelp] = useState(false);
+  const [helpTab, setHelpTab] = useState<'selection' | 'plannotator'>('selection');
   const [mounted, setMounted] = useState(false);
 
   // Enable transitions only after first paint
@@ -126,7 +127,28 @@ export const AnnotationToolstrip: React.FC<AnnotationToolstripProps> = ({
           >
             {taterMode && <TaterSpritePullup />}
             <div className="flex items-center justify-between p-4 border-b border-border">
-              <h3 className="font-semibold text-sm">How Plannotator Works</h3>
+              <div className="flex items-center gap-1 bg-muted/50 rounded-lg p-0.5">
+                <button
+                  onClick={() => setHelpTab('selection')}
+                  className={`px-3 py-1.5 rounded-md text-xs font-medium transition-colors ${
+                    helpTab === 'selection'
+                      ? 'bg-background text-foreground shadow-sm'
+                      : 'text-muted-foreground hover:text-foreground'
+                  }`}
+                >
+                  Selection Modes
+                </button>
+                <button
+                  onClick={() => setHelpTab('plannotator')}
+                  className={`px-3 py-1.5 rounded-md text-xs font-medium transition-colors ${
+                    helpTab === 'plannotator'
+                      ? 'bg-background text-foreground shadow-sm'
+                      : 'text-muted-foreground hover:text-foreground'
+                  }`}
+                >
+                  How Plannotator Works
+                </button>
+              </div>
               <button
                 onClick={() => setShowHelp(false)}
                 className="p-1.5 rounded-md hover:bg-muted text-muted-foreground hover:text-foreground transition-colors"
@@ -138,10 +160,14 @@ export const AnnotationToolstrip: React.FC<AnnotationToolstripProps> = ({
             </div>
             <div className="aspect-video">
               <iframe
+                key={helpTab}
                 width="100%"
                 height="100%"
-                src="https://www.youtube.com/embed/a_AT7cEN_9I?autoplay=1"
-                title="How Plannotator Works"
+                src={helpTab === 'selection'
+                  ? 'https://www.youtube.com/embed/ZNt9jtfx9TY?autoplay=1'
+                  : 'https://www.youtube.com/embed/a_AT7cEN_9I?autoplay=1'
+                }
+                title={helpTab === 'selection' ? 'How Selection Modes Work' : 'How Plannotator Works'}
                 frameBorder="0"
                 allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
                 allowFullScreen
