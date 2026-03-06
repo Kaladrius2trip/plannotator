@@ -8,6 +8,8 @@ export enum AnnotationType {
 
 export type EditorMode = 'selection' | 'comment' | 'redline';
 
+export type InputMethod = 'drag' | 'pinpoint';
+
 export interface ImageAttachment {
   path: string;
   name: string;

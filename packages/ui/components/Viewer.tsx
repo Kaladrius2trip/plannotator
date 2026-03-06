@@ -2,7 +2,7 @@ import React, { useRef, useState, useEffect, forwardRef, useImperativeHandle, us
 import Highlighter from '@plannotator/web-highlighter';
 import hljs from 'highlight.js';
 import 'highlight.js/styles/github-dark.css';
-import { Block, Annotation, AnnotationType, EditorMode, type ImageAttachment } from '../types';
+import { Block, Annotation, AnnotationType, EditorMode, type InputMethod, type ImageAttachment } from '../types';
 import { Frontmatter } from '../utils/parser';
 import { AnnotationToolbar } from './AnnotationToolbar';
 import { CommentPopover } from './CommentPopover';
@@ -11,6 +11,8 @@ import { AttachmentsButton } from './AttachmentsButton';
 import { MermaidBlock } from './MermaidBlock';
 import { getIdentity } from '../utils/identity';
 import { PlanDiffBadge } from './plan-diff/PlanDiffBadge';
+import { PinpointOverlay } from './PinpointOverlay';
+import { usePinpoint } from '../hooks/usePinpoint';
 
 interface ViewerProps {
   blocks: Block[];
@@ -21,6 +23,7 @@ interface ViewerProps {
   onSelectAnnotation: (id: string | null) => void;
   selectedAnnotationId: string | null;
   mode: EditorMode;
+  inputMethod?: InputMethod;
   taterMode: boolean;
   globalAttachments?: ImageAttachment[];
   onAddGlobalAttachment?: (image: ImageAttachment) => void;
@@ -86,6 +89,7 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(({
   onSelectAnnotation,
   selectedAnnotationId,
   mode,
+  inputMethod = 'drag',
   taterMode,
   globalAttachments = [],
   onAddGlobalAttachment,
@@ -135,6 +139,32 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(({
   const hoverTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const stickySentinelRef = useRef<HTMLDivElement>(null);
   const [isStuck, setIsStuck] = useState(false);
+
+  // Pinpoint mode: hover + click to select elements
+  const handlePinpointCodeBlockClick = useCallback((blockId: string, element: HTMLElement) => {
+    const codeEl = element.querySelector('code');
+    if (!codeEl) return;
+    // In pinpoint mode, apply code block annotation based on current editor mode
+    if (modeRef.current === 'redline') {
+      applyCodeBlockAnnotation(blockId, codeEl, AnnotationType.DELETION);
+    } else {
+      // Show comment popover anchored to the code block
+      setCommentPopover({
+        anchorEl: element,
+        contextText: (codeEl.textContent || '').slice(0, 80),
+        isGlobal: false,
+        codeBlock: { block: blocks.find(b => b.id === blockId)!, element },
+      });
+    }
+  }, [blocks]);
+
+  const { hoverTarget } = usePinpoint({
+    containerRef,
+    highlighterRef,
+    inputMethod,
+    enabled: !toolbarState && !commentPopover && !(isPlanDiffActive ?? false),
+    onCodeBlockClick: handlePinpointCodeBlockClick,
+  });
 
   // Detect when sticky action bar is "stuck" to show card background
   useEffect(() => {
@@ -691,7 +721,7 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(({
         ref={containerRef}
         className={`w-full max-w-[832px] 2xl:max-w-5xl bg-card rounded-xl shadow-xl p-5 md:p-8 lg:p-10 xl:p-12 relative ${
           linkedDocInfo ? 'border-2 border-primary' : 'border border-border/50'
-        }`}
+        } ${inputMethod === 'pinpoint' ? 'cursor-crosshair' : ''}`}
       >
         {/* Repo info + plan diff badge + demo badge + linked doc badge - top left */}
         {(repoInfo || hasPreviousVersion || showDemoBadge || linkedDocInfo) && (
@@ -814,7 +844,7 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(({
             <CodeBlock
               key={block.id}
               block={block}
-              onHover={(element) => {
+              onHover={inputMethod === 'pinpoint' ? () => {} : (element) => {
                 // Clear any pending leave timeout
                 if (hoverTimeoutRef.current) {
                   clearTimeout(hoverTimeoutRef.current);
@@ -827,7 +857,7 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(({
                   setHoveredCodeBlock({ block, element });
                 }
               }}
-              onLeave={() => {
+              onLeave={inputMethod === 'pinpoint' ? () => {} : () => {
                 // Delay then start exit animation
                 hoverTimeoutRef.current = setTimeout(() => {
                   setIsCodeBlockToolbarExiting(true);
@@ -838,7 +868,7 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(({
                   }, 150);
                 }, 100);
               }}
-              isHovered={hoveredCodeBlock?.block.id === block.id}
+              isHovered={inputMethod !== 'pinpoint' && hoveredCodeBlock?.block.id === block.id}
             />
           ) : (
             <BlockRenderer key={block.id} block={block} onOpenLinkedDoc={onOpenLinkedDoc} />
@@ -884,6 +914,11 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(({
               }, 100);
             }}
           />
+        )}
+
+        {/* Pinpoint hover overlay */}
+        {inputMethod === 'pinpoint' && (
+          <PinpointOverlay target={hoverTarget} containerRef={containerRef} />
         )}
 
         {/* Comment popover */}

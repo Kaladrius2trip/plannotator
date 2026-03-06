@@ -5,10 +5,11 @@ import { AnnotationPanel } from '@plannotator/ui/components/AnnotationPanel';
 import { ExportModal } from '@plannotator/ui/components/ExportModal';
 import { ImportModal } from '@plannotator/ui/components/ImportModal';
 import { ConfirmDialog } from '@plannotator/ui/components/ConfirmDialog';
-import { Annotation, Block, EditorMode, type ImageAttachment } from '@plannotator/ui/types';
+import { Annotation, Block, EditorMode, type InputMethod, type ImageAttachment } from '@plannotator/ui/types';
 import { ThemeProvider } from '@plannotator/ui/components/ThemeProvider';
 import { ModeToggle } from '@plannotator/ui/components/ModeToggle';
 import { ModeSwitcher } from '@plannotator/ui/components/ModeSwitcher';
+import { InputMethodToggle } from '@plannotator/ui/components/InputMethodToggle';
 import { TaterSpriteRunning } from '@plannotator/ui/components/TaterSpriteRunning';
 import { TaterSpritePullup } from '@plannotator/ui/components/TaterSpritePullup';
 import { Settings } from '@plannotator/ui/components/Settings';
@@ -25,6 +26,7 @@ import { getAgentSwitchSettings, getEffectiveAgentName } from '@plannotator/ui/u
 import { getPlanSaveSettings } from '@plannotator/ui/utils/planSave';
 import { getUIPreferences, needsUIFeaturesSetup, type UIPreferences } from '@plannotator/ui/utils/uiPreferences';
 import { getEditorMode, saveEditorMode } from '@plannotator/ui/utils/editorMode';
+import { getInputMethod, saveInputMethod } from '@plannotator/ui/utils/inputMethod';
 import { useResizablePanel } from '@plannotator/ui/hooks/useResizablePanel';
 import { ResizeHandle } from '@plannotator/ui/components/ResizeHandle';
 import {
@@ -358,6 +360,7 @@ const App: React.FC = () => {
   const [agentWarningMessage, setAgentWarningMessage] = useState('');
   const [isPanelOpen, setIsPanelOpen] = useState(true);
   const [editorMode, setEditorMode] = useState<EditorMode>(getEditorMode);
+  const [inputMethod, setInputMethod] = useState<InputMethod>(getInputMethod);
   const [taterMode, setTaterMode] = useState(() => {
     const stored = storage.getItem('plannotator-tater-mode');
     return stored === 'true';
@@ -575,6 +578,11 @@ const App: React.FC = () => {
   const handleEditorModeChange = (mode: EditorMode) => {
     setEditorMode(mode);
     saveEditorMode(mode);
+  };
+
+  const handleInputMethodChange = (method: InputMethod) => {
+    setInputMethod(method);
+    saveInputMethod(method);
   };
 
   // Check if we're in API mode (served from Bun hook server)
@@ -1336,9 +1344,10 @@ const App: React.FC = () => {
               showCancel
             />
             <div className="min-h-full flex flex-col items-center px-4 py-3 md:px-10 md:py-8 xl:px-16">
-              {/* Mode Switcher (hidden during plan diff) */}
+              {/* Mode Switcher + Input Method Toggle (hidden during plan diff) */}
               {!isPlanDiffActive && (
-                <div className="w-full max-w-[832px] 2xl:max-w-5xl mb-3 md:mb-4 flex justify-start">
+                <div className="w-full max-w-[832px] 2xl:max-w-5xl mb-3 md:mb-4 flex items-center justify-start gap-2">
+                  <InputMethodToggle method={inputMethod} onChange={handleInputMethodChange} />
                   <ModeSwitcher mode={editorMode} onChange={handleEditorModeChange} taterMode={taterMode} />
                 </div>
               )}
@@ -1367,6 +1376,7 @@ const App: React.FC = () => {
                   onSelectAnnotation={setSelectedAnnotationId}
                   selectedAnnotationId={selectedAnnotationId}
                   mode={editorMode}
+                  inputMethod={inputMethod}
                   taterMode={taterMode}
                   globalAttachments={globalAttachments}
                   onAddGlobalAttachment={handleAddGlobalAttachment}
