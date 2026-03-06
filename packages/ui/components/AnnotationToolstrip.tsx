@@ -29,7 +29,7 @@ export const AnnotationToolstrip: React.FC<AnnotationToolstripProps> = ({
     <>
       <div className="flex items-center gap-1.5">
         {/* Input method group */}
-        <div className="inline-flex items-center bg-muted/50 rounded-lg p-0.5 border border-border/30">
+        <div className="inline-flex items-center gap-0.5 bg-muted/50 rounded-lg p-0.5 border border-border/30">
           <ToolstripButton
             active={inputMethod === 'drag'}
             onClick={() => onInputMethodChange('drag')}
@@ -38,9 +38,11 @@ export const AnnotationToolstrip: React.FC<AnnotationToolstripProps> = ({
             mounted={mounted}
             icon={
               <svg className="w-3.5 h-3.5 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
-                <path d="M5 3h14" />
-                <path d="M12 3v18" />
-                <path d="M5 21h14" />
+                <path d="M12 20h-1a2 2 0 0 1-2-2 2 2 0 0 1-2 2H6"/>
+                <path d="M13 8h7a2 2 0 0 1 2 2v4a2 2 0 0 1-2 2h-7"/>
+                <path d="M5 16H4a2 2 0 0 1-2-2v-4a2 2 0 0 1 2-2h1"/>
+                <path d="M6 4h1a2 2 0 0 1 2 2 2 2 0 0 1 2-2h1"/>
+                <path d="M9 6v12"/>
               </svg>
             }
           />
@@ -64,7 +66,7 @@ export const AnnotationToolstrip: React.FC<AnnotationToolstripProps> = ({
         </div>
 
         {/* Action mode group */}
-        <div className="inline-flex items-center bg-muted/50 rounded-lg p-0.5 border border-border/30">
+        <div className="inline-flex items-center gap-0.5 bg-muted/50 rounded-lg p-0.5 border border-border/30">
           <ToolstripButton
             active={mode === 'selection'}
             onClick={() => onModeChange('selection')}
@@ -73,11 +75,7 @@ export const AnnotationToolstrip: React.FC<AnnotationToolstripProps> = ({
             mounted={mounted}
             icon={
               <svg className="w-3.5 h-3.5 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
-                <path d="M12 20h-1a2 2 0 0 1-2-2 2 2 0 0 1-2 2H6"/>
-                <path d="M13 8h7a2 2 0 0 1 2 2v4a2 2 0 0 1-2 2h-7"/>
-                <path d="M5 16H4a2 2 0 0 1-2-2v-4a2 2 0 0 1 2-2h1"/>
-                <path d="M6 4h1a2 2 0 0 1 2 2 2 2 0 0 1 2-2h1"/>
-                <path d="M9 6v12"/>
+                <path d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z" />
               </svg>
             }
           />
@@ -110,10 +108,9 @@ export const AnnotationToolstrip: React.FC<AnnotationToolstripProps> = ({
         {/* Help */}
         <button
           onClick={() => setShowHelp(true)}
-          className="w-5 h-5 flex items-center justify-center rounded-full text-[10px] font-medium text-muted-foreground/50 hover:text-muted-foreground hover:bg-muted/50 transition-colors"
-          title="How does this work?"
+          className="ml-2 text-[10px] text-muted-foreground/60 hover:text-muted-foreground transition-colors"
         >
-          ?
+          how does this work?
         </button>
       </div>
 
@@ -161,22 +158,22 @@ export const AnnotationToolstrip: React.FC<AnnotationToolstripProps> = ({
 
 const colorStyles = {
   primary: {
-    active: 'bg-primary/15 text-primary shadow-sm',
+    active: 'bg-primary text-primary-foreground shadow-sm',
     hover: 'text-primary/80 bg-primary/8',
     inactive: 'text-muted-foreground',
   },
   secondary: {
-    active: 'bg-secondary/15 text-secondary shadow-sm',
+    active: 'bg-secondary text-secondary-foreground shadow-sm',
     hover: 'text-secondary/80 bg-secondary/8',
     inactive: 'text-muted-foreground',
   },
   accent: {
-    active: 'bg-accent/15 text-accent shadow-sm',
+    active: 'bg-accent text-accent-foreground shadow-sm',
     hover: 'text-accent/80 bg-accent/8',
     inactive: 'text-muted-foreground',
   },
   destructive: {
-    active: 'bg-destructive/15 text-destructive shadow-sm',
+    active: 'bg-destructive text-destructive-foreground shadow-sm',
     hover: 'text-destructive/80 bg-destructive/8',
     inactive: 'text-muted-foreground',
   },
