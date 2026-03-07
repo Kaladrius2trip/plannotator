@@ -14,6 +14,7 @@ import { type DiffType, type GitContext, runGitDiff, getWorktreeDiffOptions } fr
 import { getRepoInfo } from "./repo";
 import { handleImage, handleUpload, handleAgents, handleServerReady, handleDraftSave, handleDraftLoad, handleDraftDelete, type OpencodeClient } from "./shared-handlers";
 import { contentHash, deleteDraft } from "./draft";
+import { createEditorAnnotationHandler } from "./editor-annotations";
 
 // Re-export utilities
 export { isRemoteSession, getServerPort } from "./remote";
@@ -84,6 +85,7 @@ export async function startReviewServer(
   const { htmlContent, origin, gitContext, sharingEnabled = true, shareBaseUrl, onReady } = options;
 
   const draftKey = contentHash(options.rawPatch);
+  const editorAnnotations = createEditorAnnotationHandler();
 
   // Mutable state for diff switching
   let currentPatch = options.rawPatch;
@@ -217,6 +219,10 @@ export async function startReviewServer(
             if (req.method === "DELETE") return handleDraftDelete(draftKey);
             return handleDraftLoad(draftKey);
           }
+
+          // API: Editor annotations (VS Code extension)
+          const editorResponse = await editorAnnotations.handle(req, url);
+          if (editorResponse) return editorResponse;
 
           // API: Submit review feedback
           if (url.pathname === "/api/feedback" && req.method === "POST") {

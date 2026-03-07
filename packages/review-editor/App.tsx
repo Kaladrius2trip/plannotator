@@ -11,6 +11,8 @@ import { getAgentSwitchSettings, getEffectiveAgentName } from '@plannotator/ui/u
 import { CodeAnnotation, CodeAnnotationType, SelectedLineRange } from '@plannotator/ui/types';
 import { useResizablePanel } from '@plannotator/ui/hooks/useResizablePanel';
 import { useCodeAnnotationDraft } from '@plannotator/ui/hooks/useCodeAnnotationDraft';
+import { useEditorAnnotations } from '@plannotator/ui/hooks/useEditorAnnotations';
+import { exportEditorAnnotations } from '@plannotator/ui/utils/parser';
 import { ResizeHandle } from '@plannotator/ui/components/ResizeHandle';
 import { DiffViewer } from './components/DiffViewer';
 import { ReviewPanel } from './components/ReviewPanel';
@@ -171,6 +173,9 @@ const ReviewApp: React.FC = () => {
     const restored = restoreDraft();
     if (restored.length > 0) setAnnotations(restored);
   }, [restoreDraft]);
+
+  // VS Code editor annotations (only polls when inside VS Code webview)
+  const { editorAnnotations, deleteEditorAnnotation } = useEditorAnnotations();
 
   // Resizable panels
   const panelResize = useResizablePanel({ storageKey: 'plannotator-review-panel-width' });
@@ -449,15 +454,25 @@ const ReviewApp: React.FC = () => {
     }
   }, [annotations, files]);
 
+  const activeFile = files[activeFileIndex];
+  const feedbackMarkdown = useMemo(() => {
+    let output = exportReviewFeedback(annotations, files);
+    if (editorAnnotations.length > 0) {
+      output += exportEditorAnnotations(editorAnnotations);
+    }
+    return output;
+  }, [annotations, files, editorAnnotations]);
+
+  const totalAnnotationCount = annotations.length + editorAnnotations.length;
+
   // Send feedback to OpenCode via API
   const handleSendFeedback = useCallback(async () => {
-    if (annotations.length === 0) {
+    if (totalAnnotationCount === 0) {
       setShowNoAnnotationsDialog(true);
       return;
     }
     setIsSendingFeedback(true);
     try {
-      const feedback = exportReviewFeedback(annotations, files);
       const agentSwitchSettings = getAgentSwitchSettings();
       const effectiveAgent = getEffectiveAgentName(agentSwitchSettings);
 
@@ -465,7 +480,7 @@ const ReviewApp: React.FC = () => {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          feedback,
+          feedback: feedbackMarkdown,
           annotations,
           ...(effectiveAgent && { agentSwitch: effectiveAgent }),
         }),
@@ -481,7 +496,7 @@ const ReviewApp: React.FC = () => {
       setTimeout(() => setCopyFeedback(null), 2000);
       setIsSendingFeedback(false);
     }
-  }, [annotations, files]);
+  }, [totalAnnotationCount, feedbackMarkdown, annotations]);
 
   // Approve without feedback (LGTM)
   const handleApprove = useCallback(async () => {
@@ -522,7 +537,7 @@ const ReviewApp: React.FC = () => {
       e.preventDefault();
 
       // No annotations → Approve, otherwise → Send Feedback
-      if (annotations.length === 0) {
+      if (totalAnnotationCount === 0) {
         handleApprove();
       } else {
         handleSendFeedback();
@@ -533,15 +548,9 @@ const ReviewApp: React.FC = () => {
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [
     showExportModal, showNoAnnotationsDialog, showApproveWarning,
-    submitted, isSendingFeedback, isApproving, origin, annotations.length,
+    submitted, isSendingFeedback, isApproving, origin, totalAnnotationCount,
     handleApprove, handleSendFeedback
   ]);
-
-  const activeFile = files[activeFileIndex];
-  const feedbackMarkdown = useMemo(() =>
-    exportReviewFeedback(annotations, files),
-    [annotations, files]
-  );
 
   if (isLoading) {
     return (
@@ -650,15 +659,15 @@ const ReviewApp: React.FC = () => {
                 {/* Send Feedback button - accent color, disabled if no annotations */}
                 <button
                   onClick={handleSendFeedback}
-                  disabled={isSendingFeedback || isApproving || annotations.length === 0}
+                  disabled={isSendingFeedback || isApproving || totalAnnotationCount === 0}
                   className={`p-1.5 md:px-2.5 md:py-1 rounded-md text-xs font-medium transition-all ${
                     isSendingFeedback || isApproving
                       ? 'opacity-50 cursor-not-allowed bg-muted text-muted-foreground'
-                      : annotations.length === 0
+                      : totalAnnotationCount === 0
                         ? 'opacity-50 cursor-not-allowed bg-accent/10 text-accent/50'
                         : 'bg-accent/15 text-accent hover:bg-accent/25 border border-accent/30'
                   }`}
-                  title={annotations.length === 0 ? "Add annotations to send feedback" : "Send feedback"}
+                  title={totalAnnotationCount === 0 ? "Add annotations to send feedback" : "Send feedback"}
                 >
                   <svg className="w-4 h-4 md:hidden" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
                     <path strokeLinecap="round" strokeLinejoin="round" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" />
@@ -670,7 +679,7 @@ const ReviewApp: React.FC = () => {
                 <div className="relative group/approve">
                   <button
                     onClick={() => {
-                      if (annotations.length > 0) {
+                      if (totalAnnotationCount > 0) {
                         setShowApproveWarning(true);
                       } else {
                         handleApprove();
@@ -680,7 +689,7 @@ const ReviewApp: React.FC = () => {
                     className={`px-2 py-1 md:px-2.5 rounded-md text-xs font-medium transition-all ${
                       isSendingFeedback || isApproving
                         ? 'opacity-50 cursor-not-allowed bg-muted text-muted-foreground'
-                        : annotations.length > 0
+                        : totalAnnotationCount > 0
                           ? 'bg-success/50 text-success-foreground/70 hover:bg-success hover:text-success-foreground'
                           : 'bg-success text-success-foreground hover:opacity-90'
                     }`}
@@ -689,11 +698,11 @@ const ReviewApp: React.FC = () => {
                     <span className="md:hidden">{isApproving ? '...' : 'OK'}</span>
                     <span className="hidden md:inline">{isApproving ? 'Approving...' : 'Approve'}</span>
                   </button>
-                  {annotations.length > 0 && (
+                  {totalAnnotationCount > 0 && (
                     <div className="absolute top-full right-0 mt-2 px-3 py-2 bg-popover border border-border rounded-lg shadow-xl text-xs text-foreground w-56 text-center opacity-0 invisible group-hover/approve:opacity-100 group-hover/approve:visible transition-all pointer-events-none z-50">
                       <div className="absolute bottom-full right-4 border-4 border-transparent border-b-border" />
                       <div className="absolute bottom-full right-4 mt-px border-4 border-transparent border-b-popover" />
-                      Your {annotations.length} annotation{annotations.length !== 1 ? 's' : ''} won't be sent if you approve.
+                      Your {totalAnnotationCount} annotation{totalAnnotationCount !== 1 ? 's' : ''} won't be sent if you approve.
                     </div>
                   )}
                 </div>
@@ -878,6 +887,8 @@ const ReviewApp: React.FC = () => {
             onDeleteAnnotation={handleDeleteAnnotation}
             feedbackMarkdown={feedbackMarkdown}
             width={panelResize.width}
+            editorAnnotations={editorAnnotations}
+            onDeleteEditorAnnotation={deleteEditorAnnotation}
           />
         </div>
 
@@ -936,7 +947,7 @@ const ReviewApp: React.FC = () => {
             handleApprove();
           }}
           title="Annotations Won't Be Sent"
-          message={<>You have {annotations.length} annotation{annotations.length !== 1 ? 's' : ''} that will be lost if you approve.</>}
+          message={<>You have {totalAnnotationCount} annotation{totalAnnotationCount !== 1 ? 's' : ''} that will be lost if you approve.</>}
           subMessage="To send your feedback, use Send Feedback instead."
           confirmText="Approve Anyway"
           cancelText="Cancel"

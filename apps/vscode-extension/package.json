@@ -31,8 +31,53 @@
       {
         "command": "plannotator-webview.openUrl",
         "title": "Plannotator: Open URL in Editor"
+      },
+      {
+        "command": "plannotator-webview.addEditorAnnotation",
+        "title": "Plannotator: Add Annotation"
+      },
+      {
+        "command": "plannotator-webview.submitComment",
+        "title": "Submit Annotation",
+        "icon": "$(check)"
+      },
+      {
+        "command": "plannotator-webview.deleteEditorAnnotation",
+        "title": "Delete Annotation",
+        "icon": "$(trash)"
       }
     ],
+    "keybindings": [
+      {
+        "command": "plannotator-webview.addEditorAnnotation",
+        "key": "ctrl+shift+.",
+        "mac": "cmd+shift+.",
+        "when": "editorHasSelection"
+      }
+    ],
+    "menus": {
+      "editor/context": [
+        {
+          "command": "plannotator-webview.addEditorAnnotation",
+          "when": "editorHasSelection",
+          "group": "plannotator"
+        }
+      ],
+      "comments/commentThread/title": [
+        {
+          "command": "plannotator-webview.deleteEditorAnnotation",
+          "group": "inline",
+          "when": "commentController == plannotator && commentThread == plannotator-thread"
+        }
+      ],
+      "comments/commentThread/context": [
+        {
+          "command": "plannotator-webview.submitComment",
+          "group": "inline",
+          "when": "commentController == plannotator"
+        }
+      ]
+    },
     "configuration": {
       "title": "Plannotator",
       "properties": {

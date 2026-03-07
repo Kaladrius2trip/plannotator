@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
-import { CodeAnnotation } from '@plannotator/ui/types';
+import { CodeAnnotation, type EditorAnnotation } from '@plannotator/ui/types';
 import { isCurrentUser } from '@plannotator/ui/utils/identity';
+import { EditorAnnotationCard } from '@plannotator/ui/components/EditorAnnotationCard';
 import { HighlightedCode } from './HighlightedCode';
 import { detectLanguage } from '../utils/detectLanguage';
 import { renderInlineMarkdown } from '../utils/renderInlineMarkdown';
@@ -21,6 +22,8 @@ interface ReviewPanelProps {
   onDeleteAnnotation: (id: string) => void;
   feedbackMarkdown?: string;
   width?: number;
+  editorAnnotations?: EditorAnnotation[];
+  onDeleteEditorAnnotation?: (id: string) => void;
 }
 
 const SuggestionPreview: React.FC<{ code: string; originalCode?: string; language?: string }> = ({ code, originalCode, language }) => {
@@ -75,7 +78,10 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
   onDeleteAnnotation,
   feedbackMarkdown,
   width,
+  editorAnnotations,
+  onDeleteEditorAnnotation,
 }) => {
+  const totalCount = annotations.length + (editorAnnotations?.length ?? 0);
   const [copied, setCopied] = useState(false);
 
   const handleQuickCopy = async () => {
@@ -114,14 +120,14 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
               Annotations
             </h2>
             <span className="text-[10px] font-mono bg-muted px-1.5 py-0.5 rounded text-muted-foreground">
-              {annotations.length}
+              {totalCount}
             </span>
           </div>
         </div>
 
         {/* Content */}
         <div className="flex-1 overflow-y-auto p-2 space-y-1.5">
-          {annotations.length === 0 ? (
+          {totalCount === 0 ? (
             <div className="flex flex-col items-center justify-center h-40 text-center px-4">
               <div className="w-10 h-10 rounded-full bg-muted/50 flex items-center justify-center mb-3">
                 <svg className="w-5 h-5 text-muted-foreground" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
@@ -208,10 +214,30 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
               ))}
             </div>
           )}
+
+          {/* Editor annotations (VS Code) */}
+          {editorAnnotations && editorAnnotations.length > 0 && (
+            <>
+              {annotations.length > 0 && (
+                <div className="flex items-center gap-2 pt-2 pb-1">
+                  <div className="flex-1 border-t border-border/30" />
+                  <span className="text-[9px] font-semibold uppercase tracking-wider text-muted-foreground/60">Editor</span>
+                  <div className="flex-1 border-t border-border/30" />
+                </div>
+              )}
+              {editorAnnotations.map(ann => (
+                <EditorAnnotationCard
+                  key={ann.id}
+                  annotation={ann}
+                  onDelete={() => onDeleteEditorAnnotation?.(ann.id)}
+                />
+              ))}
+            </>
+          )}
         </div>
 
         {/* Quick Copy Footer */}
-        {feedbackMarkdown && annotations.length > 0 && (
+        {feedbackMarkdown && totalCount > 0 && (
           <div className="p-2 border-t border-border/50">
             <button
               onClick={handleQuickCopy}
