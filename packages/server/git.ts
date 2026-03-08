@@ -30,6 +30,7 @@ export interface GitContext {
   currentBranch: string;
   defaultBranch: string;
   diffOptions: DiffOption[];
+  worktrees: WorktreeInfo[];
 }
 
 export interface DiffResult {
@@ -137,7 +138,7 @@ export async function getGitContext(): Promise<GitContext> {
     diffOptions.push({ id: "branch", label: `vs ${defaultBranch}` });
   }
 
-  // Discover worktrees and add them as diff options
+  // Discover worktrees (exposed separately from diff options)
   const [worktrees, currentTreePath] = await Promise.all([
     getWorktrees(),
     $`git rev-parse --show-toplevel`.quiet().then(r => r.text().trim()).catch(() => null),
@@ -145,17 +146,7 @@ export async function getGitContext(): Promise<GitContext> {
 
   const otherWorktrees = worktrees.filter(wt => wt.path !== currentTreePath);
 
-  if (otherWorktrees.length > 0) {
-    diffOptions.push({ id: "separator", label: "" });
-    for (const wt of otherWorktrees) {
-      const label = wt.branch
-        ? `${wt.branch} (worktree)`
-        : `${wt.path.split("/").pop()} (worktree)`;
-      diffOptions.push({ id: `worktree:${wt.path}`, label });
-    }
-  }
-
-  return { currentBranch, defaultBranch, diffOptions };
+  return { currentBranch, defaultBranch, diffOptions, worktrees: otherWorktrees };
 }
 
 /**
@@ -214,20 +205,6 @@ export function parseWorktreeDiffType(diffType: string): { path: string; subType
   return { path: rest, subType: "uncommitted" };
 }
 
-/**
- * Build diff options for worktree mode: back-to-main, separator, then
- * standard diff types with the worktree path baked into each id.
- */
-export function getWorktreeDiffOptions(worktreePath: string, defaultBranch: string): DiffOption[] {
-  const prefix = `worktree:${worktreePath}:`;
-  return [
-    { id: "back-to-main" as DiffType, label: "\u2190 Back to main repo" },
-    { id: "separator", label: "" },
-    { id: `${prefix}uncommitted` as DiffType, label: "Uncommitted changes" },
-    { id: `${prefix}last-commit` as DiffType, label: "Last commit" },
-    { id: `${prefix}branch` as DiffType, label: `vs ${defaultBranch}` },
-  ];
-}
 
 /**
  * Run git diff with the specified type
