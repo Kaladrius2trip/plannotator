@@ -347,6 +347,14 @@ diffs-container {
   opacity: 0.8;
 }
 
+.file-tree-item.staged {
+  border-left: 2px solid var(--primary);
+}
+
+.file-tree-item.staged.active {
+  border-left-color: var(--primary-foreground);
+}
+
 /* Annotation toolbar for code review */
 .review-toolbar {
   position: absolute;

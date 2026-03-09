@@ -114,6 +114,8 @@ export async function getGitContext(): Promise<GitContext> {
 
   const diffOptions: DiffOption[] = [
     { id: "uncommitted", label: "Uncommitted changes" },
+    { id: "staged", label: "Staged changes" },
+    { id: "unstaged", label: "Unstaged changes" },
     { id: "last-commit", label: "Last commit" },
   ];
 
@@ -378,4 +380,32 @@ export async function getFileContentsForDiff(
   }
 
   return { oldContent, newContent };
+}
+
+/**
+ * Validate a file path for git operations.
+ * Rejects path traversal and absolute paths.
+ */
+function validateFilePath(filePath: string): void {
+  if (filePath.includes("..") || filePath.startsWith("/")) {
+    throw new Error("Invalid file path");
+  }
+}
+
+/**
+ * Stage a file via `git add`.
+ */
+export async function gitAddFile(filePath: string, cwd?: string): Promise<void> {
+  validateFilePath(filePath);
+  const cmd = $`git add -- ${filePath}`.quiet();
+  await (cwd ? cmd.cwd(cwd) : cmd);
+}
+
+/**
+ * Unstage a file via `git reset HEAD`.
+ */
+export async function gitResetFile(filePath: string, cwd?: string): Promise<void> {
+  validateFilePath(filePath);
+  const cmd = $`git reset HEAD -- ${filePath}`.quiet();
+  await (cwd ? cmd.cwd(cwd) : cmd);
 }
