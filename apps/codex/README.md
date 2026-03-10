@@ -1,5 +1,7 @@
 # Plannotator for Codex
 
+> **Plan mode is not yet supported.** Plannotator's plan review UI requires hooks to intercept the agent's plan submission, and Codex does not currently expose a hook system. Code review and markdown annotation work today.
+
 Plannotator works in Codex via the CLI binary — no plugin or skill required. Codex runs `plannotator` as a normal shell command.
 
 ## Install
@@ -35,10 +37,6 @@ Run `plannotator annotate` to annotate any markdown file:
 ```bash
 plannotator annotate path/to/file.md
 ```
-
-## Plan Mode
-
-Plan review is not yet supported in Codex. Plannotator's plan review UI requires hooks to intercept the agent's plan submission, and Codex does not currently expose a hook system. We're tracking this for future integration.
 
 ## Environment Variables
 
