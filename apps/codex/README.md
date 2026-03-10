@@ -36,6 +36,10 @@ Run `plannotator annotate` to annotate any markdown file:
 plannotator annotate path/to/file.md
 ```
 
+## Plan Mode
+
+Plan review is not yet supported in Codex. Plannotator's plan review UI requires hooks to intercept the agent's plan submission, and Codex does not currently expose a hook system. We're tracking this for future integration.
+
 ## Environment Variables
 
 | Variable | Description |
