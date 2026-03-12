@@ -23,7 +23,7 @@ import { getBearSettings } from '@plannotator/ui/utils/bear';
 import { getDefaultNotesApp } from '@plannotator/ui/utils/defaultNotesApp';
 import { getAgentSwitchSettings, getEffectiveAgentName } from '@plannotator/ui/utils/agentSwitch';
 import { getPlanSaveSettings } from '@plannotator/ui/utils/planSave';
-import { getUIPreferences, needsUIFeaturesSetup, type UIPreferences, type PlanWidth } from '@plannotator/ui/utils/uiPreferences';
+import { getUIPreferences, type UIPreferences, type PlanWidth } from '@plannotator/ui/utils/uiPreferences';
 import { getEditorMode, saveEditorMode } from '@plannotator/ui/utils/editorMode';
 import { getInputMethod, saveInputMethod } from '@plannotator/ui/utils/inputMethod';
 import { useInputMethodSwitch } from '@plannotator/ui/hooks/useInputMethodSwitch';
@@ -36,11 +36,6 @@ import {
   type PermissionMode,
 } from '@plannotator/ui/utils/permissionMode';
 import { PermissionModeSetup } from '@plannotator/ui/components/PermissionModeSetup';
-import { UIFeaturesSetup } from '@plannotator/ui/components/UIFeaturesSetup';
-import { PlanDiffMarketing } from '@plannotator/ui/components/plan-diff/PlanDiffMarketing';
-import { needsPlanDiffMarketingDialog } from '@plannotator/ui/utils/planDiffMarketing';
-import { WhatsNewV011 } from '@plannotator/ui/components/WhatsNewV011';
-import { needsWhatsNewDialog } from '@plannotator/ui/utils/whatsNew';
 import { ImageAnnotator } from '@plannotator/ui/components/ImageAnnotator';
 import { deriveImageName } from '@plannotator/ui/components/AttachmentsButton';
 import { useSidebar } from '@plannotator/ui/hooks/useSidebar';
@@ -421,9 +416,6 @@ const App: React.FC = () => {
   const [submitted, setSubmitted] = useState<'approved' | 'denied' | null>(null);
   const [pendingPasteImage, setPendingPasteImage] = useState<{ file: File; blobUrl: string; initialName: string } | null>(null);
   const [showPermissionModeSetup, setShowPermissionModeSetup] = useState(false);
-  const [showUIFeaturesSetup, setShowUIFeaturesSetup] = useState(false);
-  const [showPlanDiffMarketing, setShowPlanDiffMarketing] = useState(false);
-  const [showWhatsNew, setShowWhatsNew] = useState(false);
   const [permissionMode, setPermissionMode] = useState<PermissionMode>('bypassPermissions');
   const [sharingEnabled, setSharingEnabled] = useState(true);
   const [shareBaseUrl, setShareBaseUrl] = useState<string | undefined>(undefined);
@@ -690,12 +682,6 @@ const App: React.FC = () => {
           // For Claude Code, check if user needs to configure permission mode
           if (data.origin === 'claude-code' && needsPermissionModeSetup()) {
             setShowPermissionModeSetup(true);
-          } else if (needsUIFeaturesSetup()) {
-            setShowUIFeaturesSetup(true);
-          } else if (needsPlanDiffMarketingDialog()) {
-            setShowPlanDiffMarketing(true);
-          } else if (needsWhatsNewDialog()) {
-            setShowWhatsNew(true);
           }
           // Load saved permission mode preference
           setPermissionMode(getPermissionModeSettings().mode);
@@ -927,7 +913,7 @@ const App: React.FC = () => {
 
       // Don't intercept if any modal is open
       if (showExport || showImport || showFeedbackPrompt || showClaudeCodeWarning ||
-          showAgentWarning || showPermissionModeSetup || showUIFeaturesSetup || showPlanDiffMarketing || showWhatsNew || pendingPasteImage) return;
+          showAgentWarning || showPermissionModeSetup || pendingPasteImage) return;
 
       // Don't intercept if already submitted or submitting
       if (submitted || isSubmitting) return;
@@ -971,7 +957,7 @@ const App: React.FC = () => {
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [
     showExport, showImport, showFeedbackPrompt, showClaudeCodeWarning, showAgentWarning,
-    showPermissionModeSetup, showUIFeaturesSetup, showPlanDiffMarketing, showWhatsNew, pendingPasteImage,
+    showPermissionModeSetup, pendingPasteImage,
     submitted, isSubmitting, isApiMode, linkedDocHook.isActive, annotations.length, annotateMode,
     origin, getAgentWarning,
   ]);
@@ -1110,7 +1096,7 @@ const App: React.FC = () => {
       if (tag === 'INPUT' || tag === 'TEXTAREA') return;
 
       if (showExport || showFeedbackPrompt || showClaudeCodeWarning ||
-          showAgentWarning || showPermissionModeSetup || showUIFeaturesSetup || showPlanDiffMarketing || showWhatsNew || pendingPasteImage) return;
+          showAgentWarning || showPermissionModeSetup || pendingPasteImage) return;
 
       if (submitted || !isApiMode) return;
 
@@ -1136,7 +1122,7 @@ const App: React.FC = () => {
     return () => window.removeEventListener('keydown', handleSaveShortcut);
   }, [
     showExport, showFeedbackPrompt, showClaudeCodeWarning, showAgentWarning,
-    showPermissionModeSetup, showUIFeaturesSetup, showPlanDiffMarketing, showWhatsNew, pendingPasteImage,
+    showPermissionModeSetup, pendingPasteImage,
     submitted, isApiMode, markdown, annotationsOutput,
   ]);
 
@@ -1708,47 +1694,6 @@ const App: React.FC = () => {
           onComplete={(mode) => {
             setPermissionMode(mode);
             setShowPermissionModeSetup(false);
-            if (needsUIFeaturesSetup()) {
-              setShowUIFeaturesSetup(true);
-            } else if (needsPlanDiffMarketingDialog()) {
-              setShowPlanDiffMarketing(true);
-            } else if (needsWhatsNewDialog()) {
-              setShowWhatsNew(true);
-            }
-          }}
-        />
-
-        {/* UI Features Setup (TOC & Sticky Actions) */}
-        <UIFeaturesSetup
-          isOpen={showUIFeaturesSetup}
-          onComplete={(prefs) => {
-            setUiPrefs(prefs);
-            setShowUIFeaturesSetup(false);
-            if (needsPlanDiffMarketingDialog()) {
-              setShowPlanDiffMarketing(true);
-            } else if (needsWhatsNewDialog()) {
-              setShowWhatsNew(true);
-            }
-          }}
-        />
-
-        {/* Plan Diff Marketing (feature announcement) */}
-        <PlanDiffMarketing
-          isOpen={showPlanDiffMarketing}
-          origin={origin}
-          onComplete={() => {
-            setShowPlanDiffMarketing(false);
-            if (needsWhatsNewDialog()) {
-              setShowWhatsNew(true);
-            }
-          }}
-        />
-
-        {/* What's New v0.11.0 (feature announcement) */}
-        <WhatsNewV011
-          isOpen={showWhatsNew}
-          onComplete={() => {
-            setShowWhatsNew(false);
           }}
         />
       </div>

@@ -2,7 +2,6 @@ import { storage } from './storage';
 
 const STORAGE_KEY_TOC = 'plannotator-toc-enabled';
 const STORAGE_KEY_STICKY_ACTIONS = 'plannotator-sticky-actions-enabled';
-const STORAGE_KEY_UI_FEATURES_CONFIGURED = 'plannotator-ui-features-configured';
 const STORAGE_KEY_PLAN_WIDTH = 'plannotator-plan-width';
 
 export type PlanWidth = 'compact' | 'default' | 'wide';
@@ -32,12 +31,4 @@ export function saveUIPreferences(prefs: UIPreferences): void {
   storage.setItem(STORAGE_KEY_TOC, String(prefs.tocEnabled));
   storage.setItem(STORAGE_KEY_STICKY_ACTIONS, String(prefs.stickyActionsEnabled));
   storage.setItem(STORAGE_KEY_PLAN_WIDTH, prefs.planWidth);
-}
-
-export function needsUIFeaturesSetup(): boolean {
-  return storage.getItem(STORAGE_KEY_UI_FEATURES_CONFIGURED) !== 'true';
-}
-
-export function markUIFeaturesSetupDone(): void {
-  storage.setItem(STORAGE_KEY_UI_FEATURES_CONFIGURED, 'true');
 }
