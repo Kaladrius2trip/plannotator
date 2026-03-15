@@ -35,6 +35,7 @@ import {
   runGitDiff,
   openBrowser,
 } from "./server.js";
+import { planDenyFeedback, codeReviewFeedback, codeReviewApproved, annotateFeedback } from "./feedback-templates.js";
 
 // Load HTML at runtime (jiti doesn't support import attributes)
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -256,9 +257,9 @@ export default function plannotator(pi: ExtensionAPI): void {
 
       if (result.feedback) {
         if (result.approved) {
-          pi.sendUserMessage(`# Code Review\n\nCode review completed — no changes requested.`);
+          pi.sendUserMessage(codeReviewApproved());
         } else {
-          pi.sendUserMessage(`# Code Review Feedback\n\n${result.feedback}\n\nPlease address this feedback.`);
+          pi.sendUserMessage(codeReviewFeedback(result.feedback));
         }
       } else {
         ctx.ui.notify("Code review closed (no feedback).", "info");
@@ -302,9 +303,7 @@ export default function plannotator(pi: ExtensionAPI): void {
       server.stop();
 
       if (result.feedback) {
-        pi.sendUserMessage(
-          `# Markdown Annotations\n\nFile: ${absolutePath}\n\n${result.feedback}\n\nPlease address the annotation feedback above.`,
-        );
+        pi.sendUserMessage(annotateFeedback(result.feedback, absolutePath));
       } else {
         ctx.ui.notify("Annotation closed (no feedback).", "info");
       }
@@ -445,7 +444,7 @@ export default function plannotator(pi: ExtensionAPI): void {
         content: [
           {
             type: "text",
-            text: `Plan not approved.\n\nUser feedback: ${feedbackText}\n\nRevise the plan:\n1. Read ${planFilePath} to see the current plan.\n2. Use the edit tool to make targeted changes addressing the feedback above — do not rewrite the entire file.\n3. Call exit_plan_mode again when ready.`,
+            text: planDenyFeedback(feedbackText, "exit_plan_mode"),
           },
         ],
         details: { approved: false, feedback: feedbackText },
