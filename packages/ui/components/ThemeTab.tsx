@@ -58,7 +58,7 @@ export const ThemeTab: React.FC = () => {
       {/* Theme */}
       <div className="space-y-2">
         <label className="text-xs font-medium text-muted-foreground uppercase tracking-wide">Theme</label>
-        <div className="grid grid-cols-3 gap-2 max-h-[340px] overflow-y-auto pr-1">
+        <div className="grid grid-cols-3 gap-2 overflow-y-auto pr-1">
           {availableThemes.map(theme => {
             const isSelected = colorTheme === theme.id;
             const colors = theme.colors[resolvedMode];

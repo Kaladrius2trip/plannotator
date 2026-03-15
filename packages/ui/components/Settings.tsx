@@ -312,7 +312,7 @@ export const Settings: React.FC<SettingsProps> = ({ taterMode, onTaterModeChange
               </nav>
 
               {/* Content — scrollable */}
-              <div className="flex-1 p-4 space-y-4 overflow-y-auto max-h-[70vh]">
+              <div className="flex-1 p-4 space-y-4 overflow-y-auto max-h-[85vh]">
 
                 {/* === GENERAL TAB === */}
                 {activeTab === 'general' && (
