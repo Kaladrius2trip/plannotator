@@ -271,7 +271,7 @@ const App: React.FC = () => {
       if (restoredGlobal.length > 0) setGlobalAttachments(restoredGlobal);
       // Apply highlights to DOM after a tick
       setTimeout(() => {
-        viewerRef.current?.applySharedAnnotations(restored);
+        viewerRef.current?.applySharedAnnotations(restored.filter(a => !a.diffContext));
       }, 100);
     }
   }, [restoreDraft]);
@@ -286,7 +286,7 @@ const App: React.FC = () => {
       const timer = setTimeout(() => {
         // Clear existing highlights first (important when loading new share URL)
         viewerRef.current?.clearAllHighlights();
-        viewerRef.current?.applySharedAnnotations(pendingSharedAnnotations);
+        viewerRef.current?.applySharedAnnotations(pendingSharedAnnotations.filter(a => !a.diffContext));
         clearPendingSharedAnnotations();
       }, 100);
       return () => clearTimeout(timer);
@@ -1241,8 +1241,8 @@ const App: React.FC = () => {
               showCancel
             />
             <div className="min-h-full flex flex-col items-center px-2 py-3 md:px-10 md:py-8 xl:px-16">
-              {/* Annotation Toolstrip (hidden during plan diff) */}
-              {!isPlanDiffActive && (
+              {/* Annotation Toolstrip */}
+              {(
                 <div className="w-full mb-3 md:mb-4 flex items-center justify-start" style={{ maxWidth: planMaxWidth }}>
                   <AnnotationToolstrip
                     inputMethod={inputMethod}
@@ -1266,6 +1266,11 @@ const App: React.FC = () => {
                   baseVersionLabel={planDiff.diffBaseVersion != null ? `v${planDiff.diffBaseVersion}` : undefined}
                   baseVersion={planDiff.diffBaseVersion ?? undefined}
                   maxWidth={planMaxWidth}
+                  annotations={annotations.filter(a => !!a.diffContext)}
+                  onAddAnnotation={handleAddAnnotation}
+                  onSelectAnnotation={handleSelectAnnotation}
+                  selectedAnnotationId={selectedAnnotationId}
+                  mode={editorMode}
                 />
               ) : (
                 <Viewer
@@ -1274,7 +1279,7 @@ const App: React.FC = () => {
                   blocks={blocks}
                   markdown={markdown}
                   frontmatter={frontmatter}
-                  annotations={annotations}
+                  annotations={annotations.filter(a => !a.diffContext)}
                   onAddAnnotation={handleAddAnnotation}
                   onSelectAnnotation={handleSelectAnnotation}
                   selectedAnnotationId={selectedAnnotationId}
