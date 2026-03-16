@@ -64,13 +64,12 @@ export const PlanCleanDiffView: React.FC<PlanCleanDiffViewProps> = ({
   useEffect(() => { modeRef.current = mode; }, [mode]);
   useEffect(() => { onAddAnnotationRef.current = onAddAnnotation; }, [onAddAnnotation]);
 
-  // Scroll to selected annotation's diff block
+  // Clean up hover timeout on unmount
   useEffect(() => {
-    if (!selectedAnnotationId) return;
-    const el = document.querySelector(`[data-diff-block-index]`);
-    // Find the block by checking all diff blocks for matching annotation blockId
-    // For now, this is a no-op — diff annotations don't have scroll-to support yet
-  }, [selectedAnnotationId]);
+    return () => {
+      if (hoverTimeoutRef.current) clearTimeout(hoverTimeoutRef.current);
+    };
+  }, []);
 
   const createDiffAnnotation = useCallback((
     block: PlanDiffBlock,
@@ -244,15 +243,7 @@ export const PlanCleanDiffView: React.FC<PlanCleanDiffViewProps> = ({
             }
             setIsExiting(false);
           }}
-          onMouseLeave={() => {
-            hoverTimeoutRef.current = setTimeout(() => {
-              setIsExiting(true);
-              setTimeout(() => {
-                setHoveredBlock(null);
-                setIsExiting(false);
-              }, 150);
-            }, 100);
-          }}
+          onMouseLeave={handleLeave}
         />
       )}
 

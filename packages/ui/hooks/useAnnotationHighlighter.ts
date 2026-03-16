@@ -390,9 +390,8 @@ export function useAnnotationHighlighter({
             setCommentPopover({
               anchorEl: doms[0] as HTMLElement,
               contextText: source.text.slice(0, 80),
-              isGlobal: false,
               source,
-            } as any);
+            });
           } else if (modeRef.current === 'quickLabel') {
             pendingSourceRef.current = source;
             setQuickLabelPicker({

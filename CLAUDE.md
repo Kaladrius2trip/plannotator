@@ -227,9 +227,9 @@ When a user denies a plan and Claude resubmits, the UI shows what changed betwee
 
 **State** (`packages/ui/hooks/usePlanDiff.ts`): Manages base version selection, diff computation, and version fetching. The server sends `previousPlan` with the initial `/api/plan` response; the hook auto-diffs against it. Users can select any prior version from the sidebar Version Browser.
 
-**Diff annotations:** The clean diff view supports full annotation (same as normal plan view). Annotations created in diff mode carry a `diffContext` field (`added`/`removed`/`modified`). Exported feedback includes context labels like `[In newly added content]`.
+**Diff annotations:** The clean diff view supports block-level annotation — hover over added/removed/modified sections to annotate entire blocks. Annotations carry a `diffContext` field (`added`/`removed`/`modified`). Exported feedback includes `[In diff content]` labels.
 
-**Annotation hook** (`packages/ui/hooks/useAnnotationHighlighter.ts`): Shared annotation infrastructure used by both `Viewer.tsx` and `PlanCleanDiffView.tsx`. Manages web-highlighter lifecycle, toolbar/popover state, annotation creation, text-based restoration, and scroll-to-selected. Accepts an optional `resolveContext` callback for diff-specific context tagging.
+**Annotation hook** (`packages/ui/hooks/useAnnotationHighlighter.ts`): Annotation infrastructure used by `Viewer.tsx`. Manages web-highlighter lifecycle, toolbar/popover state, annotation creation, text-based restoration, and scroll-to-selected. The diff view uses its own block-level hover system instead.
 
 **Sidebar** (`packages/ui/hooks/useSidebar.ts`): Shared left sidebar with two tabs — Table of Contents and Version Browser. The "Auto-open Sidebar" setting controls whether it opens on load (TOC tab only).
 
@@ -291,7 +291,7 @@ interface Block {
 - Horizontal rules (`---`)
 - Paragraphs (default)
 
-`exportAnnotations(blocks, annotations, globalAttachments)` generates human-readable feedback for Claude. Images are referenced by name: `[image-name] /tmp/path...`. Annotations with `diffContext` include labels like `[In newly added content]`.
+`exportAnnotations(blocks, annotations, globalAttachments)` generates human-readable feedback for Claude. Images are referenced by name: `[image-name] /tmp/path...`. Annotations with `diffContext` include `[In diff content]` labels.
 
 ## Annotation System
 

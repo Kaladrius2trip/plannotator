@@ -29,7 +29,6 @@ interface PlanDiffViewerProps {
   baseVersion?: number;
   maxWidth?: number;
   // Annotation props
-  annotations?: Annotation[];
   onAddAnnotation?: (ann: Annotation) => void;
   onSelectAnnotation?: (id: string | null) => void;
   selectedAnnotationId?: string | null;
@@ -46,7 +45,6 @@ export const PlanDiffViewer: React.FC<PlanDiffViewerProps> = ({
   baseVersionLabel,
   baseVersion,
   maxWidth,
-  annotations,
   onAddAnnotation,
   onSelectAnnotation,
   selectedAnnotationId,

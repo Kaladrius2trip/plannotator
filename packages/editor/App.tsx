@@ -264,7 +264,7 @@ const App: React.FC = () => {
       if (restoredGlobal.length > 0) setGlobalAttachments(restoredGlobal);
       // Apply highlights to DOM after a tick
       setTimeout(() => {
-        viewerRef.current?.applySharedAnnotations(restored);
+        viewerRef.current?.applySharedAnnotations(restored.filter(a => !a.diffContext));
       }, 100);
     }
   }, [restoreDraft]);
@@ -279,7 +279,7 @@ const App: React.FC = () => {
       const timer = setTimeout(() => {
         // Clear existing highlights first (important when loading new share URL)
         viewerRef.current?.clearAllHighlights();
-        viewerRef.current?.applySharedAnnotations(pendingSharedAnnotations);
+        viewerRef.current?.applySharedAnnotations(pendingSharedAnnotations.filter(a => !a.diffContext));
         clearPendingSharedAnnotations();
       }, 100);
       return () => clearTimeout(timer);
@@ -1175,7 +1175,6 @@ const App: React.FC = () => {
                   baseVersionLabel={planDiff.diffBaseVersion != null ? `v${planDiff.diffBaseVersion}` : undefined}
                   baseVersion={planDiff.diffBaseVersion ?? undefined}
                   maxWidth={planMaxWidth}
-                  annotations={annotations.filter(a => !!a.diffContext)}
                   onAddAnnotation={handleAddAnnotation}
                   onSelectAnnotation={handleSelectAnnotation}
                   selectedAnnotationId={selectedAnnotationId}
