@@ -907,8 +907,6 @@ const App: React.FC = () => {
   return (
     <ThemeProvider defaultTheme="dark">
       <div className="h-screen flex flex-col bg-background overflow-hidden">
-        {/* Tater sprites */}
-        {taterMode && <TaterSpriteRunning />}
         {/* Minimal Header */}
         <header className="h-12 flex items-center justify-between px-2 md:px-4 border-b border-border/50 bg-card/50 backdrop-blur-xl sticky top-0 z-[50]">
           <div className="flex items-center gap-2 md:gap-3">
@@ -1180,6 +1178,8 @@ const App: React.FC = () => {
 
         {/* Main Content */}
         <div className={`flex-1 flex overflow-hidden relative z-0 ${isResizing ? 'select-none' : ''}`}>
+          {/* Tater sprites — inside content wrapper so z-0 stacking context applies */}
+          {taterMode && <TaterSpriteRunning />}
           {/* Left Sidebar: collapsed tab flags (when sidebar is closed) */}
           {!sidebar.isOpen && (
             <SidebarTabs
@@ -1229,7 +1229,7 @@ const App: React.FC = () => {
           )}
 
           {/* Document Area */}
-          <main ref={containerRef} className="flex-1 min-w-0 overflow-y-auto bg-grid">
+          <main ref={containerRef} className="flex-1 min-w-0 overflow-y-auto bg-grid relative z-10">
             <ConfirmDialog
               isOpen={!!draftBanner}
               onClose={dismissDraft}
