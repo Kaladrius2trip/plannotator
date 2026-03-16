@@ -1,15 +1,20 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, rmSync } from "fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import path from "path";
 import {
-  ensureSessionPlanPath,
-  getSessionPlanPath,
-  sanitizeSessionID,
+  getPlanDirectory,
+  validatePlanPath,
   stripConflictingPlanModeRules,
 } from "./plan-mode";
 
 const tempDirs: string[] = [];
+
+function makeTempDir(): string {
+  const dir = mkdtempSync(path.join(tmpdir(), "plannotator-test-"));
+  tempDirs.push(dir);
+  return dir;
+}
 
 afterEach(() => {
   for (const dir of tempDirs.splice(0)) {
@@ -17,38 +22,128 @@ afterEach(() => {
   }
 });
 
-describe("sanitizeSessionID", () => {
-  test("preserves slug-like session IDs", () => {
-    expect(sanitizeSessionID("curried-coalescing-cascade")).toBe("curried-coalescing-cascade");
-  });
+describe("getPlanDirectory", () => {
+  test("creates and returns the plan directory", () => {
+    const homeDir = makeTempDir();
+    const planDir = getPlanDirectory(homeDir);
 
-  test("replaces unsafe path characters", () => {
-    expect(sanitizeSessionID("plan/session:42?draft")).toBe("plan-session-42-draft");
+    expect(planDir).toBe(
+      path.join(homeDir, ".plannotator", "session-plans", "opencode"),
+    );
+    expect(existsSync(planDir)).toBe(true);
   });
 });
 
-describe("getSessionPlanPath", () => {
-  test("stores session plans outside the repo under plannotator", () => {
-    const planPath = getSessionPlanPath("curried-coalescing-cascade", "/tmp/home");
-    expect(planPath).toBe(
-      path.join(
-        "/tmp/home",
-        ".plannotator",
-        "session-plans",
-        "opencode",
-        "curried-coalescing-cascade",
-        "plan.md",
-      ),
-    );
+describe("validatePlanPath", () => {
+  test("rejects non-absolute paths", () => {
+    const planDir = makeTempDir();
+    const result = validatePlanPath("relative/plan.md", planDir);
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error).toContain("Path must be absolute");
+      expect(result.error).toContain("relative/plan.md");
+    }
   });
 
-  test("creates the parent directory on demand", () => {
-    const homeDir = mkdtempSync(path.join(tmpdir(), "plannotator-opencode-"));
-    tempDirs.push(homeDir);
+  test("rejects paths outside the plan directory", () => {
+    const planDir = makeTempDir();
+    const outsidePath = path.join(makeTempDir(), "evil-plan.md");
+    writeFileSync(outsidePath, "# Evil plan");
 
-    const planPath = ensureSessionPlanPath("curried-coalescing-cascade", homeDir);
+    const result = validatePlanPath(outsidePath, planDir);
 
-    expect(existsSync(path.dirname(planPath))).toBe(true);
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error).toContain("must be inside");
+      expect(result.error).toContain(planDir);
+    }
+  });
+
+  test("rejects .. traversal attempts", () => {
+    const planDir = makeTempDir();
+    const traversalPath = path.join(planDir, "..", "escaped.md");
+
+    const result = validatePlanPath(traversalPath, planDir);
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error).toContain("must be inside");
+    }
+  });
+
+  test("rejects symlink escapes", () => {
+    const planDir = makeTempDir();
+    const outsideDir = makeTempDir();
+    const outsideFile = path.join(outsideDir, "secret.md");
+    writeFileSync(outsideFile, "# Secret");
+
+    const linkPath = path.join(planDir, "link-to-outside");
+    symlinkSync(outsideDir, linkPath);
+    const symlinkPlanPath = path.join(linkPath, "secret.md");
+
+    const result = validatePlanPath(symlinkPlanPath, planDir);
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error).toContain("must be inside");
+    }
+  });
+
+  test("rejects missing files", () => {
+    const planDir = makeTempDir();
+    const missingPath = path.join(planDir, "nonexistent.md");
+
+    const result = validatePlanPath(missingPath, planDir);
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error).toContain("No plan file found");
+      expect(result.error).toContain(missingPath);
+    }
+  });
+
+  test("rejects whitespace-only files", () => {
+    const planDir = makeTempDir();
+    const emptyPath = path.join(planDir, "empty.md");
+    writeFileSync(emptyPath, "   \n\n  \t  ");
+
+    const result = validatePlanPath(emptyPath, planDir);
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error).toContain("is empty");
+    }
+  });
+
+  test("accepts a valid plan file inside the directory", () => {
+    const planDir = makeTempDir();
+    const validPath = path.join(planDir, "auth-refactor.md");
+    writeFileSync(validPath, "# Auth Refactor\n\nRewrite the auth layer.");
+
+    const result = validatePlanPath(validPath, planDir);
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.content).toBe("# Auth Refactor\n\nRewrite the auth layer.");
+    }
+  });
+
+  test("deny and resubmit reads updated content from the same path", () => {
+    const planDir = makeTempDir();
+    const planPath = path.join(planDir, "my-plan.md");
+    writeFileSync(planPath, "# Plan v1");
+
+    const result1 = validatePlanPath(planPath, planDir);
+    expect(result1.ok).toBe(true);
+    if (result1.ok) expect(result1.content).toBe("# Plan v1");
+
+    // Simulate agent revising the file after denial
+    writeFileSync(planPath, "# Plan v2 — addressed feedback");
+
+    const result2 = validatePlanPath(planPath, planDir);
+    expect(result2.ok).toBe(true);
+    if (result2.ok) expect(result2.content).toBe("# Plan v2 — addressed feedback");
   });
 });
 

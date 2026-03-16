@@ -1,14 +1,13 @@
 /**
  * Plannotator Plugin for OpenCode
  *
- * Provides Pi-style iterative planning with interactive browser-based plan review.
- * Works with both OpenCode's native plan mode (experimental flag) and without it.
+ * Provides iterative planning with interactive browser-based plan review.
  *
  * When the agent is in plan mode:
- * - Injects Pi-style iterative planning prompt
- * - Agent writes the working plan to a per-session file under ~/.plannotator/session-plans/
- * - submit_plan reads the session plan file (or falls back to the passed plan argument)
- * - plan_exit suppressed in favor of submit_plan
+ * - Injects planning prompt directing the agent to write plans in ~/.plannotator/session-plans/opencode/
+ * - Agent creates a uniquely-named plan file, revises it on feedback
+ * - submit_plan(path) reads the plan from disk and opens browser UI
+ * - plan_exit suppressed in favor of submit_plan (experimental mode compatibility)
  *
  * Environment variables:
  *   PLANNOTATOR_REMOTE - Set to "1" or "true" for remote mode (devcontainer, SSH)
@@ -37,8 +36,8 @@ import { writeRemoteShareLink } from "@plannotator/server/share-url";
 import { resolveMarkdownFile } from "@plannotator/server/resolve-file";
 import { planDenyFeedback } from "@plannotator/shared/feedback-templates";
 import {
-  ensureSessionPlanPath,
-  getSessionPlanPath,
+  getPlanDirectory,
+  validatePlanPath,
   stripConflictingPlanModeRules,
 } from "./plan-mode";
 
@@ -52,62 +51,60 @@ const reviewHtmlContent = reviewHtml as unknown as string;
 
 const DEFAULT_PLAN_TIMEOUT_SECONDS = 345_600; // 96 hours
 
-// ── Planning prompt (adapted from Pi) ─────────────────────────────────────
+// ── Planning prompt ───────────────────────────────────────────────────────
 
-function getPlanningPrompt(planFilePath: string): string {
+function getPlanningPrompt(planDir: string): string {
   return `## Plannotator — Iterative Planning
 
-You are pair-planning with the user. Your plan file is at ${planFilePath}.
+Your plan files must live in this directory:
 
-You MUST NOT make any changes to the codebase during planning. The ONLY file you may create or update is ${planFilePath}.
+${planDir}
 
-Use the available exploration tools to inspect the codebase. Use the available file-editing tool to create and update ${planFilePath}. Use submit_plan when the plan is ready, and use the question tool when you need information only the user can provide.
+You must not edit the codebase during planning. The only files you may create or edit are plan markdown files inside that directory.
 
 Do not run destructive shell commands (rm, git push, npm install, etc.) — focus on reading and exploring the codebase.
 
-### The Loop
+When planning starts:
+1. Create exactly one new markdown plan file in that directory with a unique, descriptive filename (e.g. \`auth-refactor.md\`, \`fix-upload-timeout.md\`).
+2. Do not overwrite or reuse filenames from existing plans in the directory.
+3. Keep using that same file for the rest of this planning cycle.
 
-Repeat until the plan is complete:
+During planning:
+- Use exploration tools to inspect the codebase.
+- After each discovery, update the same plan file.
+- Do not create a new plan file unless you are starting a new, separate plan.
 
-1. **Explore** — Use the available read/search/shell tools and subagents to understand the codebase. Actively search for existing functions, utilities, and patterns that can be reused.
-2. **Update the plan file** — After each discovery, immediately capture what you learned in ${planFilePath}. Don't wait until the end. Create the initial draft with the available file-editing tool, then keep refining the same file incrementally.
-3. **Ask the user** — When you hit an ambiguity or decision you can't resolve from code alone, use the question tool to ask. Then go back to step 1.
+When the plan is ready:
+- Call \`submit_plan(path: "/absolute/path/to/your-plan.md")\`
 
-### First Turn
+If the user requests changes:
+1. Read the same plan file you previously submitted.
+2. Edit that same file to address the feedback.
+3. Call \`submit_plan\` again with the same \`path\`.
+4. Never create a new file in response to feedback — always revise the existing one.
 
-Start by quickly scanning key files to form an initial understanding of the task scope. Then create the plan file with a skeleton (headers and rough notes), and ask the user your first round of questions via the question tool. Don't explore exhaustively before engaging the user. Keep updating the same file as your understanding improves.
+Do not submit plan text directly. Submit the file path.
 
-### Asking Good Questions
+### Asking Questions
+
+Use the \`question\` tool to ask the user when you need input. Do not ask questions via plain text output — always use the tool.
 
 - Never ask what you could find out by reading the code.
-- Batch related questions together.
+- Batch related questions together into a single \`question\` call.
 - Focus on things only the user can answer: requirements, preferences, tradeoffs, edge-case priorities.
 - Scale depth to the task — a vague feature request needs many rounds; a focused bug fix may need one or none.
 
 ### Plan File Structure
 
 Your plan file should use markdown with clear sections:
-- **Context** — Why this change is being made: the problem, what prompted it, the intended outcome.
+- **Context** — Why this change is being made.
 - **Approach** — Your recommended approach only, not all alternatives considered.
 - **Files to modify** — List the critical file paths that will be changed.
 - **Reuse** — Reference existing functions and utilities you found, with their file paths.
-- **Steps** — Implementation checklist:
-  - [ ] Step 1 description
-  - [ ] Step 2 description
+- **Steps** — Implementation checklist with \`- [ ]\` items.
 - **Verification** — How to test the changes end-to-end.
 
 Keep the plan concise enough to scan quickly, but detailed enough to execute effectively.
-
-### When to Submit
-
-Your plan is ready when you've addressed all ambiguities and it covers: what to change, which files to modify, what existing code to reuse, and how to verify. Call submit_plan to submit for visual review.
-
-### Revising After Feedback
-
-When the user denies a plan with feedback:
-1. Read ${planFilePath} to see the current plan.
-2. Use the available file-editing tool to make targeted changes addressing the feedback — do NOT rewrite the entire file.
-3. Call submit_plan again to resubmit.
 
 ### Ending Your Turn
 
@@ -242,9 +239,9 @@ export const PlannotatorPlugin: Plugin = async (ctx) => {
 
       // Plan agent: inject full iterative planning prompt
       if (lastUserAgent === "plan") {
-        const planFilePath = ensureSessionPlanPath(input.sessionID);
+        const planDir = getPlanDirectory();
         output.system = stripConflictingPlanModeRules(output.system);
-        output.system.push(getPlanningPrompt(planFilePath));
+        output.system.push(getPlanningPrompt(planDir));
         return;
       }
 
@@ -420,38 +417,22 @@ Do NOT proceed with implementation until your plan is approved.
     tool: {
       submit_plan: tool({
         description:
-          "Submit your plan for interactive user review. The user can annotate, approve, or request changes in a visual browser UI. Call this when your plan file is ready for review.",
+          "Submit your plan file for interactive user review. The user can annotate, approve, or request changes in a visual browser UI. Pass the absolute path to your plan file.",
         args: {
-          plan: tool.schema
+          path: tool.schema
             .string()
-            .optional()
-            .describe("The plan in markdown format. If omitted, reads from the session plan file on disk."),
-          summary: tool.schema
-            .string()
-            .describe("A brief 1-2 sentence summary of what the plan accomplishes"),
+            .describe("Absolute path to the plan markdown file on disk."),
         },
 
         async execute(args, context) {
-          // Resolve plan content: prefer the session plan file on disk, fall back to the tool argument
-          let planContent = "";
-          const planFilePath = getSessionPlanPath(context.sessionID);
+          const planDir = getPlanDirectory();
+          const validation = validatePlanPath(args.path, planDir);
 
-          try {
-            planContent = await Bun.file(planFilePath).text();
-          } catch {
-            // File doesn't exist or read failed, fall through to arg
+          if (!validation.ok) {
+            return `Error: ${validation.error}`;
           }
 
-          if (!planContent.trim() && args.plan?.trim()) {
-            planContent = args.plan;
-            const writablePlanPath = ensureSessionPlanPath(context.sessionID);
-            await Bun.write(writablePlanPath, planContent);
-          }
-
-          if (!planContent.trim()) {
-            return `Error: No plan content found. Either pass the plan as an argument or write it to ${planFilePath} first.`;
-          }
-
+          const planContent = validation.content;
           const sharingEnabled = await getSharingEnabled();
           const server = await startPlannotatorServer({
             plan: planContent,
@@ -521,8 +502,6 @@ Do NOT proceed with implementation until your plan is approved.
 
             if (result.feedback) {
               return `Plan approved with notes!
-
-Plan Summary: ${args.summary}
 ${result.savedPath ? `Saved to: ${result.savedPath}` : ""}
 
 ## Implementation Notes
@@ -534,12 +513,9 @@ ${result.feedback}
 Proceed with implementation, incorporating these notes where applicable.`;
             }
 
-            return `Plan approved!
-
-Plan Summary: ${args.summary}
-${result.savedPath ? `Saved to: ${result.savedPath}` : ""}`;
+            return `Plan approved!${result.savedPath ? ` Saved to: ${result.savedPath}` : ""}`;
           } else {
-            return planDenyFeedback(result.feedback || "", "submit_plan", { planFilePath });
+            return planDenyFeedback(result.feedback || "", "submit_plan", { planFilePath: args.path });
           }
         },
       }),
