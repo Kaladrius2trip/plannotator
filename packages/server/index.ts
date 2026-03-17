@@ -35,9 +35,24 @@ import {
 } from "./storage";
 import { getRepoInfo } from "./repo";
 import { detectProjectName } from "./project";
-import { handleImage, handleUpload, handleAgents, handleServerReady, handleDraftSave, handleDraftLoad, handleDraftDelete, handleFavicon, type OpencodeClient } from "./shared-handlers";
+import {
+  handleImage,
+  handleUpload,
+  handleAgents,
+  handleServerReady,
+  handleDraftSave,
+  handleDraftLoad,
+  handleDraftDelete,
+  handleFavicon,
+  type OpencodeClient,
+} from "./shared-handlers";
 import { contentHash, deleteDraft } from "./draft";
-import { handleDoc, handleObsidianVaults, handleObsidianFiles, handleObsidianDoc } from "./reference-handlers";
+import {
+  handleDoc,
+  handleObsidianVaults,
+  handleObsidianFiles,
+  handleObsidianDoc,
+} from "./reference-handlers";
 import { createEditorAnnotationHandler } from "./editor-annotations";
 
 // Re-export utilities
@@ -86,6 +101,8 @@ export interface ServerResult {
     agentSwitch?: string;
     permissionMode?: string;
   }>;
+  /** Resolves when the browser first loads the page */
+  waitForViewing: () => Promise<void>;
   /** Stop the server */
   stop: () => void;
 }
@@ -105,9 +122,18 @@ const RETRY_DELAY_MS = 500;
  * - Port conflict retries
  */
 export async function startPlannotatorServer(
-  options: ServerOptions
+  options: ServerOptions,
 ): Promise<ServerResult> {
-  const { plan, origin, htmlContent, permissionMode, sharingEnabled = true, shareBaseUrl, pasteApiUrl, onReady } = options;
+  const {
+    plan,
+    origin,
+    htmlContent,
+    permissionMode,
+    sharingEnabled = true,
+    shareBaseUrl,
+    pasteApiUrl,
+    onReady,
+  } = options;
 
   const isRemote = isRemoteSession();
   const configuredPort = getServerPort();
@@ -134,7 +160,6 @@ export async function startPlannotatorServer(
     project,
   };
 
-
   // Decision promise
   let resolveDecision: (result: {
     approved: boolean;
@@ -152,6 +177,12 @@ export async function startPlannotatorServer(
   }>((resolve) => {
     resolveDecision = resolve;
   });
+
+  let resolveViewing: () => void;
+  const viewingPromise = new Promise<void>((resolve) => {
+    resolveViewing = resolve;
+  });
+  let viewed = false;
 
   // Start server with retry logic
   let server: ReturnType<typeof Bun.serve> | null = null;
@@ -176,7 +207,10 @@ export async function startPlannotatorServer(
             }
             const content = getPlanVersion(project, slug, v);
             if (content === null) {
-              return Response.json({ error: "Version not found" }, { status: 404 });
+              return Response.json(
+                { error: "Version not found" },
+                { status: 404 },
+              );
             }
             return Response.json({ plan: content, version: v });
           }
@@ -200,7 +234,17 @@ export async function startPlannotatorServer(
 
           // API: Get plan content
           if (url.pathname === "/api/plan") {
-            return Response.json({ plan, origin, permissionMode, sharingEnabled, shareBaseUrl, pasteApiUrl, repoInfo, previousPlan, versionInfo });
+            return Response.json({
+              plan,
+              origin,
+              permissionMode,
+              sharingEnabled,
+              shareBaseUrl,
+              pasteApiUrl,
+              repoInfo,
+              previousPlan,
+              versionInfo,
+            });
           }
 
           // API: Serve a linked markdown document
@@ -219,17 +263,30 @@ export async function startPlannotatorServer(
           }
 
           // API: Open plan diff in VS Code
-          if (url.pathname === "/api/plan/vscode-diff" && req.method === "POST") {
+          if (
+            url.pathname === "/api/plan/vscode-diff" &&
+            req.method === "POST"
+          ) {
             try {
               const body = (await req.json()) as { baseVersion: number };
 
               if (!body.baseVersion) {
-                return Response.json({ error: "Missing baseVersion" }, { status: 400 });
+                return Response.json(
+                  { error: "Missing baseVersion" },
+                  { status: 400 },
+                );
               }
 
-              const basePath = getPlanVersionPath(project, slug, body.baseVersion);
+              const basePath = getPlanVersionPath(
+                project,
+                slug,
+                body.baseVersion,
+              );
               if (!basePath) {
-                return Response.json({ error: `Version ${body.baseVersion} not found` }, { status: 404 });
+                return Response.json(
+                  { error: `Version ${body.baseVersion} not found` },
+                  { status: 404 },
+                );
               }
 
               const result = await openEditorDiff(basePath, currentPlanPath);
@@ -238,7 +295,10 @@ export async function startPlannotatorServer(
               }
               return Response.json({ ok: true });
             } catch (err) {
-              const message = err instanceof Error ? err.message : "Failed to open VS Code diff";
+              const message =
+                err instanceof Error
+                  ? err.message
+                  : "Failed to open VS Code diff";
               return Response.json({ error: message }, { status: 500 });
             }
           }
@@ -249,12 +309,18 @@ export async function startPlannotatorServer(
           }
 
           // API: List Obsidian vault files as a tree
-          if (url.pathname === "/api/reference/obsidian/files" && req.method === "GET") {
+          if (
+            url.pathname === "/api/reference/obsidian/files" &&
+            req.method === "GET"
+          ) {
             return handleObsidianFiles(req);
           }
 
           // API: Read an Obsidian vault document
-          if (url.pathname === "/api/reference/obsidian/doc" && req.method === "GET") {
+          if (
+            url.pathname === "/api/reference/obsidian/doc" &&
+            req.method === "GET"
+          ) {
             return handleObsidianDoc(req);
           }
 
@@ -276,7 +342,11 @@ export async function startPlannotatorServer(
 
           // API: Save to notes (decoupled from approve/deny)
           if (url.pathname === "/api/save-notes" && req.method === "POST") {
-            const results: { obsidian?: IntegrationResult; bear?: IntegrationResult; octarine?: IntegrationResult } = {};
+            const results: {
+              obsidian?: IntegrationResult;
+              bear?: IntegrationResult;
+              octarine?: IntegrationResult;
+            } = {};
 
             try {
               const body = (await req.json()) as {
@@ -288,19 +358,33 @@ export async function startPlannotatorServer(
               // Run integrations in parallel — they're independent
               const promises: Promise<void>[] = [];
               if (body.obsidian?.vaultPath && body.obsidian?.plan) {
-                promises.push(saveToObsidian(body.obsidian).then(r => { results.obsidian = r; }));
+                promises.push(
+                  saveToObsidian(body.obsidian).then((r) => {
+                    results.obsidian = r;
+                  }),
+                );
               }
               if (body.bear?.plan) {
-                promises.push(saveToBear(body.bear).then(r => { results.bear = r; }));
+                promises.push(
+                  saveToBear(body.bear).then((r) => {
+                    results.bear = r;
+                  }),
+                );
               }
               if (body.octarine?.plan && body.octarine?.workspace) {
-                promises.push(saveToOctarine(body.octarine).then(r => { results.octarine = r; }));
+                promises.push(
+                  saveToOctarine(body.octarine).then((r) => {
+                    results.octarine = r;
+                  }),
+                );
               }
               await Promise.allSettled(promises);
 
               for (const [name, result] of Object.entries(results)) {
                 if (result?.success) {
-                  console.error(`[${name}] Saved plan${result.path ? ` to: ${result.path}` : ''}`);
+                  console.error(
+                    `[${name}] Saved plan${result.path ? ` to: ${result.path}` : ""}`,
+                  );
                 } else if (result) {
                   console.error(`[${name}] Save failed: ${result.error}`);
                 }
@@ -357,19 +441,33 @@ export async function startPlannotatorServer(
               const integrationResults: Record<string, IntegrationResult> = {};
               const integrationPromises: Promise<void>[] = [];
               if (body.obsidian?.vaultPath && body.obsidian?.plan) {
-                integrationPromises.push(saveToObsidian(body.obsidian).then(r => { integrationResults.obsidian = r; }));
+                integrationPromises.push(
+                  saveToObsidian(body.obsidian).then((r) => {
+                    integrationResults.obsidian = r;
+                  }),
+                );
               }
               if (body.bear?.plan) {
-                integrationPromises.push(saveToBear(body.bear).then(r => { integrationResults.bear = r; }));
+                integrationPromises.push(
+                  saveToBear(body.bear).then((r) => {
+                    integrationResults.bear = r;
+                  }),
+                );
               }
               if (body.octarine?.plan && body.octarine?.workspace) {
-                integrationPromises.push(saveToOctarine(body.octarine).then(r => { integrationResults.octarine = r; }));
+                integrationPromises.push(
+                  saveToOctarine(body.octarine).then((r) => {
+                    integrationResults.octarine = r;
+                  }),
+                );
               }
               await Promise.allSettled(integrationPromises);
 
               for (const [name, result] of Object.entries(integrationResults)) {
                 if (result?.success) {
-                  console.error(`[${name}] Saved plan${result.path ? ` to: ${result.path}` : ''}`);
+                  console.error(
+                    `[${name}] Saved plan${result.path ? ` to: ${result.path}` : ""}`,
+                  );
                 } else if (result) {
                   console.error(`[${name}] Save failed: ${result.error}`);
                 }
@@ -386,15 +484,28 @@ export async function startPlannotatorServer(
               if (annotations) {
                 saveAnnotations(slug, annotations, planSaveCustomPath);
               }
-              savedPath = saveFinalSnapshot(slug, "approved", plan, annotations, planSaveCustomPath);
+              savedPath = saveFinalSnapshot(
+                slug,
+                "approved",
+                plan,
+                annotations,
+                planSaveCustomPath,
+              );
             }
 
             // Clean up draft on successful submit
             deleteDraft(draftKey);
 
             // Use permission mode from client request if provided, otherwise fall back to hook input
-            const effectivePermissionMode = requestedPermissionMode || permissionMode;
-            resolveDecision({ approved: true, feedback, savedPath, agentSwitch, permissionMode: effectivePermissionMode });
+            const effectivePermissionMode =
+              requestedPermissionMode || permissionMode;
+            resolveDecision({
+              approved: true,
+              feedback,
+              savedPath,
+              agentSwitch,
+              permissionMode: effectivePermissionMode,
+            });
             return Response.json({ ok: true, savedPath });
           }
 
@@ -423,7 +534,13 @@ export async function startPlannotatorServer(
             let savedPath: string | undefined;
             if (planSaveEnabled) {
               saveAnnotations(slug, feedback, planSaveCustomPath);
-              savedPath = saveFinalSnapshot(slug, "denied", plan, feedback, planSaveCustomPath);
+              savedPath = saveFinalSnapshot(
+                slug,
+                "denied",
+                plan,
+                feedback,
+                planSaveCustomPath,
+              );
             }
 
             deleteDraft(draftKey);
@@ -434,7 +551,10 @@ export async function startPlannotatorServer(
           // Favicon
           if (url.pathname === "/favicon.svg") return handleFavicon();
 
-          // Serve embedded HTML for all other routes (SPA)
+          if (!viewed) {
+            viewed = true;
+            resolveViewing();
+          }
           return new Response(htmlContent, {
             headers: { "Content-Type": "text/html" },
           });
@@ -452,8 +572,12 @@ export async function startPlannotatorServer(
       }
 
       if (isAddressInUse) {
-        const hint = isRemote ? " (set PLANNOTATOR_PORT to use different port)" : "";
-        throw new Error(`Port ${configuredPort} in use after ${MAX_RETRIES} retries${hint}`);
+        const hint = isRemote
+          ? " (set PLANNOTATOR_PORT to use different port)"
+          : "";
+        throw new Error(
+          `Port ${configuredPort} in use after ${MAX_RETRIES} retries${hint}`,
+        );
       }
 
       throw err;
@@ -476,6 +600,7 @@ export async function startPlannotatorServer(
     url: serverUrl,
     isRemote,
     waitForDecision: () => decisionPromise,
+    waitForViewing: () => viewingPromise,
     stop: () => server.stop(),
   };
 }

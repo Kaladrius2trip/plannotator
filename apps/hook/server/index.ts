@@ -31,10 +31,7 @@
  *   PLANNOTATOR_PORT   - Fixed port to use (default: random locally, 19432 for remote)
  */
 
-import {
-  startPlannotatorServer,
-  handleServerReady,
-} from "@plannotator/server";
+import { startPlannotatorServer, handleServerReady } from "@plannotator/server";
 import {
   startReviewServer,
   handleReviewServerReady,
@@ -46,7 +43,11 @@ import {
 import { getGitContext, runGitDiff } from "@plannotator/server/git";
 import { writeRemoteShareLink } from "@plannotator/server/share-url";
 import { resolveMarkdownFile } from "@plannotator/server/resolve-file";
-import { registerSession, unregisterSession, listSessions } from "@plannotator/server/sessions";
+import {
+  registerSession,
+  unregisterSession,
+  listSessions,
+} from "@plannotator/server/sessions";
 import { openBrowser } from "@plannotator/server/browser";
 import { detectProjectName } from "@plannotator/server/project";
 import { planDenyFeedback } from "@plannotator/shared/feedback-templates";
@@ -91,7 +92,9 @@ if (args[0] === "sessions") {
   if (args.includes("--clean")) {
     // Force cleanup: list sessions (which auto-removes stale entries)
     const sessions = listSessions();
-    console.error(`Cleaned up stale sessions. ${sessions.length} active session(s) remain.`);
+    console.error(
+      `Cleaned up stale sessions. ${sessions.length} active session(s) remain.`,
+    );
     process.exit(0);
   }
 
@@ -109,7 +112,9 @@ if (args[0] === "sessions") {
     const n = nArg ? parseInt(nArg, 10) : 1;
     const session = sessions[n - 1];
     if (!session) {
-      console.error(`Session #${n} not found. ${sessions.length} active session(s).`);
+      console.error(
+        `Session #${n} not found. ${sessions.length} active session(s).`,
+      );
       process.exit(1);
     }
     await openBrowser(session.url);
@@ -121,13 +126,17 @@ if (args[0] === "sessions") {
   console.error("Active Plannotator sessions:\n");
   for (let i = 0; i < sessions.length; i++) {
     const s = sessions[i];
-    const age = Math.round((Date.now() - new Date(s.startedAt).getTime()) / 60000);
-    const ageStr = age < 60 ? `${age}m` : `${Math.floor(age / 60)}h ${age % 60}m`;
-    console.error(`  #${i + 1}  ${s.mode.padEnd(9)} ${s.project.padEnd(20)} ${s.url.padEnd(28)} ${ageStr} ago`);
+    const age = Math.round(
+      (Date.now() - new Date(s.startedAt).getTime()) / 60000,
+    );
+    const ageStr =
+      age < 60 ? `${age}m` : `${Math.floor(age / 60)}h ${age % 60}m`;
+    console.error(
+      `  #${i + 1}  ${s.mode.padEnd(9)} ${s.project.padEnd(20)} ${s.url.padEnd(28)} ${ageStr} ago`,
+    );
   }
   console.error(`\nReopen with: plannotator sessions --open [N]`);
   process.exit(0);
-
 } else if (args[0] === "review") {
   // ============================================
   // CODE REVIEW MODE
@@ -137,10 +146,11 @@ if (args[0] === "sessions") {
   const gitContext = await getGitContext();
 
   // Run git diff HEAD (uncommitted changes - default)
-  const { patch: rawPatch, label: gitRef, error: diffError } = await runGitDiff(
-    "uncommitted",
-    gitContext.defaultBranch
-  );
+  const {
+    patch: rawPatch,
+    label: gitRef,
+    error: diffError,
+  } = await runGitDiff("uncommitted", gitContext.defaultBranch);
 
   const reviewProject = (await detectProjectName()) ?? "_unknown";
 
@@ -159,7 +169,12 @@ if (args[0] === "sessions") {
       handleReviewServerReady(url, isRemote, port);
 
       if (isRemote && sharingEnabled && rawPatch) {
-        await writeRemoteShareLink(rawPatch, shareBaseUrl, "review changes", "diff only").catch(() => {});
+        await writeRemoteShareLink(
+          rawPatch,
+          shareBaseUrl,
+          "review changes",
+          "diff only",
+        ).catch(() => {});
       }
     },
   });
@@ -188,10 +203,11 @@ if (args[0] === "sessions") {
     console.log("Code review completed — no changes requested.");
   } else {
     console.log(result.feedback);
-    console.log("\nThe reviewer has identified issues above. You must address all of them.");
+    console.log(
+      "\nThe reviewer has identified issues above. You must address all of them.",
+    );
   }
   process.exit(0);
-
 } else if (args[0] === "annotate") {
   // ============================================
   // ANNOTATE MODE
@@ -220,7 +236,9 @@ if (args[0] === "sessions") {
   const resolved = await resolveMarkdownFile(filePath, projectRoot);
 
   if (resolved.kind === "ambiguous") {
-    console.error(`Ambiguous filename "${resolved.input}" — found ${resolved.matches.length} matches:`);
+    console.error(
+      `Ambiguous filename "${resolved.input}" — found ${resolved.matches.length} matches:`,
+    );
     for (const match of resolved.matches) {
       console.error(`  ${match}`);
     }
@@ -249,7 +267,12 @@ if (args[0] === "sessions") {
       handleAnnotateServerReady(url, isRemote, port);
 
       if (isRemote && sharingEnabled) {
-        await writeRemoteShareLink(markdown, shareBaseUrl, "annotate", "document only").catch(() => {});
+        await writeRemoteShareLink(
+          markdown,
+          shareBaseUrl,
+          "annotate",
+          "document only",
+        ).catch(() => {});
       }
     },
   });
@@ -276,7 +299,6 @@ if (args[0] === "sessions") {
   // Output feedback (captured by slash command)
   console.log(result.feedback || "No feedback provided.");
   process.exit(0);
-
 } else {
   // ============================================
   // PLAN REVIEW MODE (default)
@@ -316,7 +338,12 @@ if (args[0] === "sessions") {
       handleServerReady(url, isRemote, port);
 
       if (isRemote && sharingEnabled) {
-        await writeRemoteShareLink(planContent, shareBaseUrl, "review the plan", "plan only").catch(() => {});
+        await writeRemoteShareLink(
+          planContent,
+          shareBaseUrl,
+          "review the plan",
+          "plan only",
+        ).catch(() => {});
       }
     },
   });
@@ -331,10 +358,18 @@ if (args[0] === "sessions") {
     label: `plan-${planProject}`,
   });
 
-  // Wait for user decision (blocks until approve/deny)
-  const result = await server.waitForDecision();
+  const AFK_TIMEOUT_MS = 10_000;
+  const raced = await Promise.race([
+    server.waitForViewing().then(() => "viewing" as const),
+    new Promise<"afk">((r) => setTimeout(() => r("afk"), AFK_TIMEOUT_MS)),
+  ]);
+  const result =
+    raced === "afk"
+      ? ({ approved: true } as Awaited<
+          ReturnType<typeof server.waitForDecision>
+        >)
+      : await server.waitForDecision();
 
-  // Give browser time to receive response and update UI
   await Bun.sleep(1500);
 
   // Cleanup
@@ -361,7 +396,7 @@ if (args[0] === "sessions") {
             ...(updatedPermissions.length > 0 && { updatedPermissions }),
           },
         },
-      })
+      }),
     );
   } else {
     console.log(
@@ -373,7 +408,7 @@ if (args[0] === "sessions") {
             message: planDenyFeedback(result.feedback || "", "ExitPlanMode"),
           },
         },
-      })
+      }),
     );
   }
 
