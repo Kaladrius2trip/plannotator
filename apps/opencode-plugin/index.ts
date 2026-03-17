@@ -19,10 +19,7 @@
  */
 
 import { type Plugin, tool } from "@opencode-ai/plugin";
-import {
-  startPlannotatorServer,
-  handleServerReady,
-} from "@plannotator/server";
+import { startPlannotatorServer, handleServerReady } from "@plannotator/server";
 import {
   startReviewServer,
   handleReviewServerReady,
@@ -49,7 +46,7 @@ const htmlContent = indexHtml as unknown as string;
 import reviewHtml from "./review-editor.html" with { type: "text" };
 const reviewHtmlContent = reviewHtml as unknown as string;
 
-const DEFAULT_PLAN_TIMEOUT_SECONDS = 345_600; // 96 hours
+const DEFAULT_PLAN_TIMEOUT_SECONDS = 10; // AFK auto-approve timeout
 
 // ── Planning prompt ───────────────────────────────────────────────────────
 
@@ -125,7 +122,9 @@ export const PlannotatorPlugin: Plugin = async (ctx) => {
   // Priority: OpenCode config > env var > default (enabled)
   async function getSharingEnabled(): Promise<boolean> {
     try {
-      const response = await ctx.client.config.get({ query: { directory: ctx.directory } });
+      const response = await ctx.client.config.get({
+        query: { directory: ctx.directory },
+      });
       // @ts-ignore - share config may exist
       const share = response?.data?.share;
       if (share !== undefined) {
@@ -148,7 +147,7 @@ export const PlannotatorPlugin: Plugin = async (ctx) => {
     const parsed = Number.parseInt(raw, 10);
     if (!Number.isFinite(parsed) || parsed < 0) {
       console.error(
-        `[Plannotator] Invalid PLANNOTATOR_PLAN_TIMEOUT_SECONDS="${raw}". Using default ${DEFAULT_PLAN_TIMEOUT_SECONDS}s.`
+        `[Plannotator] Invalid PLANNOTATOR_PLAN_TIMEOUT_SECONDS="${raw}". Using default ${DEFAULT_PLAN_TIMEOUT_SECONDS}s.`,
       );
       return DEFAULT_PLAN_TIMEOUT_SECONDS;
     }
@@ -167,7 +166,8 @@ export const PlannotatorPlugin: Plugin = async (ctx) => {
     config: async (opencodeConfig) => {
       if (allowSubagents()) return;
 
-      const existingPrimaryTools = opencodeConfig.experimental?.primary_tools ?? [];
+      const existingPrimaryTools =
+        opencodeConfig.experimental?.primary_tools ?? [];
       if (!existingPrimaryTools.includes("submit_plan")) {
         opencodeConfig.experimental = {
           ...opencodeConfig.experimental,
@@ -188,7 +188,10 @@ export const PlannotatorPlugin: Plugin = async (ctx) => {
     "experimental.chat.system.transform": async (input, output) => {
       // Skip for title generation requests
       const systemText = output.system.join("\n");
-      if (systemText.toLowerCase().includes("title generator") || systemText.toLowerCase().includes("generate a title")) {
+      if (
+        systemText.toLowerCase().includes("title generator") ||
+        systemText.toLowerCase().includes("generate a title")
+      ) {
         return;
       }
 
@@ -197,7 +200,7 @@ export const PlannotatorPlugin: Plugin = async (ctx) => {
         // Fetch session messages to determine current agent
         const messagesResponse = await ctx.client.session.messages({
           // @ts-ignore - sessionID exists on input
-          path: { id: input.sessionID }
+          path: { id: input.sessionID },
         });
         const messages = messagesResponse.data;
 
@@ -222,16 +225,17 @@ export const PlannotatorPlugin: Plugin = async (ctx) => {
         // Agents list is static — cache after first fetch
         if (!cachedAgents) {
           const agentsResponse = await ctx.client.app.agents({
-            query: { directory: ctx.directory }
+            query: { directory: ctx.directory },
           });
           cachedAgents = agentsResponse.data ?? [];
         }
-        const agent = cachedAgents.find((a: { name: string }) => a.name === lastUserAgent);
+        const agent = cachedAgents.find(
+          (a: { name: string }) => a.name === lastUserAgent,
+        );
 
         // Skip if agent is a sub-agent
         // @ts-ignore - Agent has mode field
         if (agent?.mode === "subagent") return;
-
       } catch {
         // Skip injection on any error (safer)
         return;
@@ -270,7 +274,8 @@ Do NOT proceed with implementation until your plan is approved.
         event.type === "tui.command.execute";
 
       // @ts-ignore - Event structure varies
-      const commandName = event.properties?.name || event.command || event.payload?.name;
+      const commandName =
+        event.properties?.name || event.command || event.payload?.name;
       const isReviewCommand = commandName === "plannotator-review";
 
       if (isCommandEvent && isReviewCommand) {
@@ -280,10 +285,11 @@ Do NOT proceed with implementation until your plan is approved.
         });
 
         const gitContext = await getGitContext();
-        const { patch: rawPatch, label: gitRef, error: diffError } = await runGitDiff(
-          "uncommitted",
-          gitContext.defaultBranch
-        );
+        const {
+          patch: rawPatch,
+          label: gitRef,
+          error: diffError,
+        } = await runGitDiff("uncommitted", gitContext.defaultBranch);
 
         const server = await startReviewServer({
           rawPatch,
@@ -308,8 +314,9 @@ Do NOT proceed with implementation until your plan is approved.
           const sessionId = event.properties?.sessionID;
 
           if (sessionId) {
-            const shouldSwitchAgent = result.agentSwitch && result.agentSwitch !== 'disabled';
-            const targetAgent = result.agentSwitch || 'build';
+            const shouldSwitchAgent =
+              result.agentSwitch && result.agentSwitch !== "disabled";
+            const targetAgent = result.agentSwitch || "build";
 
             const message = result.approved
               ? `# Code Review\n\nCode review completed — no changes requested.`
@@ -444,38 +451,41 @@ Do NOT proceed with implementation until your plan is approved.
             onReady: async (url, isRemote, port) => {
               handleServerReady(url, isRemote, port);
               if (isRemote && sharingEnabled) {
-                await writeRemoteShareLink(planContent, getShareBaseUrl(), "review the plan", "plan only").catch(() => {});
+                await writeRemoteShareLink(
+                  planContent,
+                  getShareBaseUrl(),
+                  "review the plan",
+                  "plan only",
+                ).catch(() => {});
               }
             },
           });
 
           const timeoutSeconds = getPlanTimeoutSeconds();
-          const timeoutMs = timeoutSeconds === null ? null : timeoutSeconds * 1000;
+          const timeoutMs =
+            timeoutSeconds === null ? null : timeoutSeconds * 1000;
 
-          const result = timeoutMs === null
-            ? await server.waitForDecision()
-            : await new Promise<Awaited<ReturnType<typeof server.waitForDecision>>>((resolve) => {
-                const timeoutId = setTimeout(
-                  () =>
-                    resolve({
-                      approved: false,
-                      feedback: `[Plannotator] No response within ${timeoutSeconds} seconds. Port released automatically. Please call submit_plan again.`,
-                    }),
-                  timeoutMs
-                );
-
-                server.waitForDecision().then((r) => {
-                  clearTimeout(timeoutId);
-                  resolve(r);
-                });
-              });
+          let result: Awaited<ReturnType<typeof server.waitForDecision>>;
+          if (timeoutMs === null) {
+            result = await server.waitForDecision();
+          } else {
+            const raced = await Promise.race([
+              server.waitForViewing().then(() => "viewing" as const),
+              new Promise<"afk">((r) => setTimeout(() => r("afk"), timeoutMs)),
+            ]);
+            result =
+              raced === "afk"
+                ? { approved: true }
+                : await server.waitForDecision();
+          }
           await Bun.sleep(1500);
           server.stop();
 
           if (result.approved) {
             // Check agent switch setting
-            const shouldSwitchAgent = result.agentSwitch && result.agentSwitch !== 'disabled';
-            const targetAgent = result.agentSwitch || 'build';
+            const shouldSwitchAgent =
+              result.agentSwitch && result.agentSwitch !== "disabled";
+            const targetAgent = result.agentSwitch || "build";
 
             if (shouldSwitchAgent) {
               try {
@@ -492,7 +502,9 @@ Do NOT proceed with implementation until your plan is approved.
                   body: {
                     agent: targetAgent,
                     noReply: true,
-                    parts: [{ type: "text", text: "Proceed with implementation" }],
+                    parts: [
+                      { type: "text", text: "Proceed with implementation" },
+                    ],
                   },
                 });
               } catch {
@@ -515,7 +527,9 @@ Proceed with implementation, incorporating these notes where applicable.`;
 
             return `Plan approved!${result.savedPath ? ` Saved to: ${result.savedPath}` : ""}`;
           } else {
-            return planDenyFeedback(result.feedback || "", "submit_plan", { planFilePath: args.path });
+            return planDenyFeedback(result.feedback || "", "submit_plan", {
+              planFilePath: args.path,
+            });
           }
         },
       }),
