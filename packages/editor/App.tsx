@@ -456,7 +456,9 @@ const App: React.FC = () => {
             totalVersions: number;
             project: string;
           };
+          afkSeconds?: number;
         }) => {
+          if (data.afkSeconds !== undefined) setAfkTimeout(data.afkSeconds);
           if (data.plan) setMarkdown(data.plan);
           setIsApiMode(true);
           if (data.mode === "annotate") {
@@ -680,20 +682,19 @@ const App: React.FC = () => {
   };
 
   // API mode handlers
-  const handleApprove = async () => {
+  const handleApprove = async (opts?: { saveOnly?: boolean }) => {
     setIsSubmitting(true);
     try {
       const obsidianSettings = getObsidianSettings();
       const bearSettings = getBearSettings();
       const octarineSettings = getOctarineSettings();
-      const agentSwitchSettings = getAgentSwitchSettings();
+      const agentSwitchSettings = getAgentSwitchSettings(repoInfo?.display);
       const planSaveSettings = getPlanSaveSettings();
       const autoSaveResults =
         bearSettings.autoSave && autoSavePromiseRef.current
           ? await autoSavePromiseRef.current
           : autoSaveResultsRef.current;
 
-      // Build request body - include integrations if enabled
       const body: {
         obsidian?: object;
         bear?: object;
@@ -702,7 +703,10 @@ const App: React.FC = () => {
         agentSwitch?: string;
         planSave?: { enabled: boolean; customPath?: string };
         permissionMode?: string;
+        saveOnly?: boolean;
       } = {};
+
+      if (opts?.saveOnly) body.saveOnly = true;
 
       // Include permission mode for Claude Code
       if (origin === "claude-code") {
@@ -1138,16 +1142,27 @@ const App: React.FC = () => {
       document.removeEventListener("pointerdown", handleClickOutside);
   }, [showExportDropdown]);
 
-  const AFK_SECONDS = 10;
+  const [afkTimeout, setAfkTimeout] = useState(10);
   const afkActive =
     isApiMode &&
+    afkTimeout > 0 &&
     !submitted &&
     !isSubmitting &&
     !annotateMode &&
     !linkedDocHook.isActive;
   const [showAfk, setShowAfk] = useState(afkActive);
-  const [afkRemaining, setAfkRemaining] = useState(AFK_SECONDS);
+  const [afkRemaining, setAfkRemaining] = useState(afkTimeout);
   const afkDismissed = useRef(false);
+
+  useEffect(() => {
+    setAfkRemaining(afkTimeout);
+  }, [afkTimeout]);
+
+  const afkSummary = useMemo(() => {
+    if (!markdown) return undefined;
+    const lines = markdown.split("\n").filter((l) => l.trim());
+    return lines.slice(0, 5).join("\n");
+  }, [markdown]);
 
   // Show popup as soon as API mode activates
   useEffect(() => {
@@ -1322,6 +1337,21 @@ const App: React.FC = () => {
                   </div>
                 )}
 
+                {!annotateMode && (
+                  <button
+                    onClick={() => handleApprove({ saveOnly: true })}
+                    disabled={isSubmitting}
+                    className={`hidden md:inline-flex px-2.5 py-1 rounded-md text-xs font-medium transition-all ${
+                      isSubmitting
+                        ? "opacity-50 cursor-not-allowed bg-muted text-muted-foreground"
+                        : "bg-muted text-muted-foreground hover:bg-muted/80 border border-border/50"
+                    }`}
+                    title="Save plan without implementing"
+                  >
+                    Save Only
+                  </button>
+                )}
+
                 <div className="w-px h-5 bg-border/50 mx-1 hidden md:block" />
               </>
             )}
@@ -1338,6 +1368,7 @@ const App: React.FC = () => {
                   onUIPreferencesChange={setUiPrefs}
                   externalOpen={mobileSettingsOpen}
                   onExternalClose={() => setMobileSettingsOpen(false)}
+                  project={repoInfo?.display}
                 />
               )}
 
@@ -1934,7 +1965,8 @@ const App: React.FC = () => {
         <AfkPopup
           isOpen={showAfk}
           remaining={afkRemaining}
-          total={AFK_SECONDS}
+          total={afkTimeout}
+          summary={afkSummary}
           onDismiss={() => {
             afkDismissed.current = true;
             setShowAfk(false);

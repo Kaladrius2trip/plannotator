@@ -62,7 +62,17 @@ const planHtmlContent = planHtml as unknown as string;
 import reviewHtml from "../dist/review.html" with { type: "text" };
 const reviewHtmlContent = reviewHtml as unknown as string;
 
-// Check for subcommand
+const DEFAULT_AFK_SECONDS = 10;
+
+function getAfkSeconds(): number | null {
+  const raw = process.env.PLANNOTATOR_AFK_SECONDS?.trim();
+  if (!raw) return DEFAULT_AFK_SECONDS;
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || parsed < 0) return DEFAULT_AFK_SECONDS;
+  if (parsed === 0) return null;
+  return parsed;
+}
+
 const args = process.argv.slice(2);
 
 // Global flag: --browser <name>
@@ -334,6 +344,7 @@ if (args[0] === "sessions") {
     shareBaseUrl,
     pasteApiUrl,
     htmlContent: planHtmlContent,
+    afkSeconds: getAfkSeconds() ?? undefined,
     onReady: async (url, isRemote, port) => {
       handleServerReady(url, isRemote, port);
 
@@ -358,11 +369,16 @@ if (args[0] === "sessions") {
     label: `plan-${planProject}`,
   });
 
-  const AFK_TIMEOUT_MS = 10_000;
-  const raced = await Promise.race([
-    server.waitForViewing().then(() => "viewing" as const),
-    new Promise<"afk">((r) => setTimeout(() => r("afk"), AFK_TIMEOUT_MS)),
-  ]);
+  const afkSeconds = getAfkSeconds();
+  const raced =
+    afkSeconds === null
+      ? ("viewing" as const)
+      : await Promise.race([
+          server.waitForViewing().then(() => "viewing" as const),
+          new Promise<"afk">((r) =>
+            setTimeout(() => r("afk"), afkSeconds * 1000),
+          ),
+        ]);
   const result =
     raced === "afk"
       ? ({ approved: true } as Awaited<
@@ -376,8 +392,7 @@ if (args[0] === "sessions") {
   server.stop();
 
   // Output JSON for PermissionRequest hook decision control
-  if (result.approved) {
-    // Build updatedPermissions to preserve the current permission mode
+  if (result.approved && !result.saveOnly) {
     const updatedPermissions = [];
     if (result.permissionMode) {
       updatedPermissions.push({
@@ -399,13 +414,16 @@ if (args[0] === "sessions") {
       }),
     );
   } else {
+    const msg = result.saveOnly
+      ? `Plan saved for reference${result.savedPath ? ` at ${result.savedPath}` : ""}. The user chose not to implement this plan. Stay in plan mode and wait for further instructions.`
+      : planDenyFeedback(result.feedback || "", "ExitPlanMode");
     console.log(
       JSON.stringify({
         hookSpecificOutput: {
           hookEventName: "PermissionRequest",
           decision: {
             behavior: "deny",
-            message: planDenyFeedback(result.feedback || "", "ExitPlanMode"),
+            message: msg,
           },
         },
       }),

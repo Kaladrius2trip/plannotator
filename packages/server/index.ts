@@ -84,6 +84,8 @@ export interface ServerOptions {
   onReady?: (url: string, isRemote: boolean, port: number) => void;
   /** OpenCode client for querying available agents (OpenCode only) */
   opencodeClient?: OpencodeClient;
+  /** AFK auto-approve countdown seconds shown in client popup (0 = disabled) */
+  afkSeconds?: number;
 }
 
 export interface ServerResult {
@@ -100,6 +102,7 @@ export interface ServerResult {
     savedPath?: string;
     agentSwitch?: string;
     permissionMode?: string;
+    saveOnly?: boolean;
   }>;
   /** Resolves when the browser first loads the page */
   waitForViewing: () => Promise<void>;
@@ -167,6 +170,7 @@ export async function startPlannotatorServer(
     savedPath?: string;
     agentSwitch?: string;
     permissionMode?: string;
+    saveOnly?: boolean;
   }) => void;
   const decisionPromise = new Promise<{
     approved: boolean;
@@ -174,6 +178,7 @@ export async function startPlannotatorServer(
     savedPath?: string;
     agentSwitch?: string;
     permissionMode?: string;
+    saveOnly?: boolean;
   }>((resolve) => {
     resolveDecision = resolve;
   });
@@ -244,6 +249,7 @@ export async function startPlannotatorServer(
               repoInfo,
               previousPlan,
               versionInfo,
+              afkSeconds: options.afkSeconds,
             });
           }
 
@@ -403,8 +409,9 @@ export async function startPlannotatorServer(
             let feedback: string | undefined;
             let agentSwitch: string | undefined;
             let requestedPermissionMode: string | undefined;
-            let planSaveEnabled = true; // default to enabled for backwards compat
+            let planSaveEnabled = true;
             let planSaveCustomPath: string | undefined;
+            let saveOnly = false;
             try {
               const body = (await req.json().catch(() => ({}))) as {
                 obsidian?: ObsidianConfig;
@@ -414,6 +421,7 @@ export async function startPlannotatorServer(
                 agentSwitch?: string;
                 planSave?: { enabled: boolean; customPath?: string };
                 permissionMode?: string;
+                saveOnly?: boolean;
               };
 
               // Capture feedback if provided (for "approve with notes")
@@ -431,11 +439,12 @@ export async function startPlannotatorServer(
                 requestedPermissionMode = body.permissionMode;
               }
 
-              // Capture plan save settings
               if (body.planSave !== undefined) {
                 planSaveEnabled = body.planSave.enabled;
                 planSaveCustomPath = body.planSave.customPath;
               }
+
+              if (body.saveOnly) saveOnly = true;
 
               // Run integrations in parallel — they're independent
               const integrationResults: Record<string, IntegrationResult> = {};
@@ -505,6 +514,7 @@ export async function startPlannotatorServer(
               savedPath,
               agentSwitch,
               permissionMode: effectivePermissionMode,
+              saveOnly,
             });
             return Response.json({ ok: true, savedPath });
           }

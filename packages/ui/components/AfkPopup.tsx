@@ -1,9 +1,10 @@
-import React from "react";
+import React, { useEffect } from "react";
 
 export interface AfkPopupProps {
   isOpen: boolean;
   remaining: number;
   total: number;
+  summary?: string;
   onDismiss: () => void;
 }
 
@@ -11,8 +12,18 @@ export const AfkPopup: React.FC<AfkPopupProps> = ({
   isOpen,
   remaining,
   total,
+  summary,
   onDismiss,
 }) => {
+  useEffect(() => {
+    if (!isOpen) return;
+    const handler = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onDismiss();
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [isOpen, onDismiss]);
+
   if (!isOpen) return null;
 
   const size = 180;
@@ -130,7 +141,14 @@ export const AfkPopup: React.FC<AfkPopupProps> = ({
           </div>
         </div>
 
-        {/* Actions */}
+        {summary && (
+          <div className="w-full max-h-24 overflow-y-auto rounded-md bg-muted/50 border border-border/50 px-3 py-2">
+            <p className="text-xs text-muted-foreground whitespace-pre-line leading-relaxed">
+              {summary}
+            </p>
+          </div>
+        )}
+
         <div className="text-center flex flex-col gap-3 w-full">
           <p className="text-muted-foreground text-xs">
             Plan will be auto-approved
@@ -141,6 +159,9 @@ export const AfkPopup: React.FC<AfkPopupProps> = ({
           >
             I'm Reviewing
           </button>
+          <span className="text-muted-foreground/60 text-[10px]">
+            Press Esc to dismiss
+          </span>
         </div>
       </div>
     </div>

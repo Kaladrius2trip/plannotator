@@ -46,7 +46,7 @@ const htmlContent = indexHtml as unknown as string;
 import reviewHtml from "./review-editor.html" with { type: "text" };
 const reviewHtmlContent = reviewHtml as unknown as string;
 
-const DEFAULT_PLAN_TIMEOUT_SECONDS = 10; // AFK auto-approve timeout
+const DEFAULT_AFK_SECONDS = 10;
 
 // ── Planning prompt ───────────────────────────────────────────────────────
 
@@ -140,18 +140,14 @@ export const PlannotatorPlugin: Plugin = async (ctx) => {
     return process.env.PLANNOTATOR_SHARE_URL || undefined;
   }
 
-  function getPlanTimeoutSeconds(): number | null {
-    const raw = process.env.PLANNOTATOR_PLAN_TIMEOUT_SECONDS?.trim();
-    if (!raw) return DEFAULT_PLAN_TIMEOUT_SECONDS;
-
+  function getAfkSeconds(): number | null {
+    const raw = (
+      process.env.PLANNOTATOR_AFK_SECONDS ??
+      process.env.PLANNOTATOR_PLAN_TIMEOUT_SECONDS
+    )?.trim();
+    if (!raw) return DEFAULT_AFK_SECONDS;
     const parsed = Number.parseInt(raw, 10);
-    if (!Number.isFinite(parsed) || parsed < 0) {
-      console.error(
-        `[Plannotator] Invalid PLANNOTATOR_PLAN_TIMEOUT_SECONDS="${raw}". Using default ${DEFAULT_PLAN_TIMEOUT_SECONDS}s.`,
-      );
-      return DEFAULT_PLAN_TIMEOUT_SECONDS;
-    }
-
+    if (!Number.isFinite(parsed) || parsed < 0) return DEFAULT_AFK_SECONDS;
     if (parsed === 0) return null;
     return parsed;
   }
@@ -448,6 +444,7 @@ Do NOT proceed with implementation until your plan is approved.
             shareBaseUrl: getShareBaseUrl(),
             htmlContent,
             opencodeClient: ctx.client,
+            afkSeconds: getAfkSeconds() ?? undefined,
             onReady: async (url, isRemote, port) => {
               handleServerReady(url, isRemote, port);
               if (isRemote && sharingEnabled) {
@@ -461,9 +458,8 @@ Do NOT proceed with implementation until your plan is approved.
             },
           });
 
-          const timeoutSeconds = getPlanTimeoutSeconds();
-          const timeoutMs =
-            timeoutSeconds === null ? null : timeoutSeconds * 1000;
+          const afkSeconds = getAfkSeconds();
+          const timeoutMs = afkSeconds === null ? null : afkSeconds * 1000;
 
           let result: Awaited<ReturnType<typeof server.waitForDecision>>;
           if (timeoutMs === null) {
@@ -481,8 +477,11 @@ Do NOT proceed with implementation until your plan is approved.
           await Bun.sleep(1500);
           server.stop();
 
+          if (result.approved && result.saveOnly) {
+            return `Plan saved for reference${result.savedPath ? ` at ${result.savedPath}` : ""}. The user chose not to implement this plan. Wait for further instructions.`;
+          }
+
           if (result.approved) {
-            // Check agent switch setting
             const shouldSwitchAgent =
               result.agentSwitch && result.agentSwitch !== "disabled";
             const targetAgent = result.agentSwitch || "build";
@@ -492,9 +491,7 @@ Do NOT proceed with implementation until your plan is approved.
                 await ctx.client.tui.executeCommand({
                   body: { command: "agent_cycle" },
                 });
-              } catch {
-                // Silently fail
-              }
+              } catch {}
 
               try {
                 await ctx.client.session.prompt({
@@ -507,9 +504,7 @@ Do NOT proceed with implementation until your plan is approved.
                     ],
                   },
                 });
-              } catch {
-                // Silently fail if session is busy
-              }
+              } catch {}
             }
 
             if (result.feedback) {
