@@ -1,24 +1,26 @@
 /**
  * Plannotator Plugin for OpenCode
  *
- * Provides iterative planning with interactive browser-based plan review.
+ * Provides interactive browser-based plan review via a single tool:
+ *   submit_plan(plan) — accepts either markdown text or a file path
  *
- * When the agent is in plan mode:
- * - Injects planning prompt directing the agent to write plans in $XDG_DATA_HOME/opencode/plans/
- * - Agent creates a uniquely-named plan file, revises it on feedback
- * - submit_plan(path) reads the plan from disk and opens browser UI
- * - plan_exit suppressed in favor of submit_plan (experimental mode compatibility)
+ * First submission: agent passes plan as text. On deny, the response includes
+ * the path where the plan was saved, enabling the agent to use Edit for targeted
+ * revisions and resubmit with the file path.
  *
  * Environment variables:
  *   PLANNOTATOR_REMOTE - Set to "1" or "true" for remote mode (devcontainer, SSH)
  *   PLANNOTATOR_PORT   - Fixed port to use (default: random locally, 19432 for remote)
- *   PLANNOTATOR_PLAN_TIMEOUT_SECONDS - Max wait for submit_plan approval (default: 345600, set 0 to disable)
- *   PLANNOTATOR_ALLOW_SUBAGENTS - Set to "1" to allow subagents to see submit_plan tool
+ *   PLANNOTATOR_AFK_SECONDS - AFK auto-approve timeout (default: 10s, set 0 to disable)
+ *   PLANNOTATOR_PLAN_TIMEOUT_SECONDS - Fallback for AFK timeout if PLANNOTATOR_AFK_SECONDS not set
+ *   PLANNOTATOR_ALLOW_SUBAGENTS - Set to "1" to allow subagents to see submit_plan
  *
  * @packageDocumentation
  */
 
 import { type Plugin, tool } from "@opencode-ai/plugin";
+import { existsSync, readFileSync } from "fs";
+import path from "path";
 import { startPlannotatorServer, handleServerReady } from "@plannotator/server";
 import {
   startReviewServer,
@@ -28,15 +30,15 @@ import {
   startAnnotateServer,
   handleAnnotateServerReady,
 } from "@plannotator/server/annotate";
-import { getGitContext, runGitDiff } from "@plannotator/server/git";
 import { writeRemoteShareLink } from "@plannotator/server/share-url";
-import { resolveMarkdownFile } from "@plannotator/server/resolve-file";
-import { planDenyFeedback } from "@plannotator/shared/feedback-templates";
 import {
-  getPlanDirectory,
-  validatePlanPath,
-  stripConflictingPlanModeRules,
-} from "./plan-mode";
+  handleReviewCommand,
+  handleAnnotateCommand,
+  handleAnnotateLastCommand,
+  type CommandDeps,
+} from "./commands";
+import { planDenyFeedback } from "@plannotator/shared/feedback-templates";
+import { stripConflictingPlanModeRules } from "./plan-mode";
 
 // @ts-ignore - Bun import attribute for text
 import indexHtml from "./plannotator.html" with { type: "text" };
@@ -48,78 +50,85 @@ const reviewHtmlContent = reviewHtml as unknown as string;
 
 const DEFAULT_AFK_SECONDS = 10;
 
+// ── Auto-detection ────────────────────────────────────────────────────────
+
+/**
+ * Detect whether the submit_plan argument is a file path.
+ * Must be an absolute path, end in .md, and exist on disk.
+ * Anything that doesn't match is treated as plan text.
+ */
+function isFilePath(value: string): boolean {
+  return path.isAbsolute(value) && value.endsWith(".md") && existsSync(value);
+}
+
+/**
+ * Resolve the plan content from the submit_plan argument.
+ * Returns the markdown text and optionally the source file path.
+ */
+function resolvePlanContent(plan: string): {
+  content: string;
+  filePath?: string;
+} {
+  if (isFilePath(plan)) {
+    const content = readFileSync(plan, "utf-8");
+    if (!content.trim()) {
+      throw new Error(
+        `Plan file at ${plan} is empty. Write your plan content first, then call submit_plan.`,
+      );
+    }
+    return { content, filePath: plan };
+  }
+  // Catch typos: looks like a file path but doesn't exist
+  if (path.isAbsolute(plan) && plan.endsWith(".md")) {
+    throw new Error(`File not found: ${plan}. Check the path and try again.`);
+  }
+  return { content: plan };
+}
+
 // ── Planning prompt ───────────────────────────────────────────────────────
 
-function getPlanningPrompt(planDir: string): string {
-  return `## Plannotator — Iterative Planning
+/**
+ * Unified planning prompt injected for all primary agents.
+ *
+ * Design principles:
+ * - Explain the WHY — the model is smart, give it context
+ * - Keep it lean — every line should pull its weight
+ * - Don't overfit — let the agent and user dictate the workflow
+ * - One tool, two modes — text for first submission, file path for revisions
+ */
+function getPlanningPrompt(): string {
+  return `## Plannotator — Plan Review
 
-Your plan files must live in this directory:
+You have a plan submission tool called \`submit_plan\`. It opens an interactive review UI where the user can annotate, approve, or request changes.
 
-${planDir}
+**How to use it:**
 
-You must not edit the codebase during planning. The only files you may create or edit are plan markdown files inside that directory. Do not run destructive shell commands (rm, git push, npm install, etc.).
+- Pass your plan as markdown text — \`submit_plan(plan: "# My Plan\\n...")\`.
+- Or pass an absolute file path to a .md file — \`submit_plan(plan: "/path/to/plan.md")\`.
 
-### Step 1 — Explore
+The tool auto-detects whether you passed text or a file path. Both open the same review UI.
 
-Before writing anything, understand the task and the code it touches.
+### Before you write a plan
 
-- Read the relevant source files. Trace call paths, data flow, and dependencies.
-- Look at existing patterns, utilities, and conventions in the codebase — your plan should reuse them.
-- Check related tests to understand expected behavior and edge cases.
-- Scale depth to the task: a vague feature request needs deep exploration; a focused bug fix may only need a few files.
+Do not jump straight to writing a plan. First:
 
-Do not jump to writing a plan or asking questions until you have the context you need. If the conversation already provided sufficient context, or the task is greenfield with no code to explore, move on to the next step.
+1. **Explore** — Read the relevant code, trace dependencies, and look at existing patterns. The depth should match the task.
+2. **Ask questions** — If you need information only the user can provide (requirements, preferences, tradeoffs), ask using the \`question\` tool. Don't guess at ambiguous requirements.
 
-### Step 2 — Ask (if needed)
+Only write and submit a plan once you have sufficient context.
 
-If there are things only the user can answer — requirements, preferences, tradeoffs, edge-case priorities — use the \`question\` tool. Do not ask via plain text output.
+### What NOT to do
 
-- Never ask what you could find out by reading the code.
-- Batch related questions into a single \`question\` call.
-- For greenfield tasks, this may be your first step.
-
-### Step 3 — Write the plan
-
-Once you understand the task, create exactly one markdown plan file in the directory above with a unique, descriptive filename (e.g. \`auth-refactor.md\`, \`fix-upload-timeout.md\`). Do not overwrite or reuse filenames from existing plans.
-
-Structure the plan with:
-- **Context** — Why this change is being made.
-- **Approach** — Your recommended approach only, not all alternatives considered.
-- **Files to modify** — List the critical file paths that will be changed.
-- **Reuse** — Reference existing functions and utilities you found, with their file paths.
-- **Steps** — Implementation checklist with \`- [ ]\` items.
-- **Verification** — How to test the changes end-to-end.
-
-Keep it concise enough to scan quickly, but detailed enough to execute effectively.
-
-### Step 4 — Submit
-
-Call \`submit_plan(path: "/absolute/path/to/your-plan.md")\` to open the plan in a visual review UI. Do not submit plan text directly — submit the file path.
-
-### If the user requests changes
-
-1. Read the same plan file you previously submitted.
-2. Edit that same file to address the feedback.
-3. Call \`submit_plan\` again with the same \`path\`.
-4. Never create a new file in response to feedback — always revise the existing one.
-
-### Ending your turn
-
-Your turn should only end by either:
-- Using the question tool to ask the user for information.
-- Calling submit_plan when the plan is ready for review.
-
-Do not end your turn without doing one of these two things.`;
+- Don't proceed with implementation until the plan is approved.
+- Don't use \`plan_exit\` — use \`submit_plan\` instead.
+- Don't end your turn without either submitting a plan or asking the user a question.`;
 }
 
 // ── Plugin ────────────────────────────────────────────────────────────────
 
 export const PlannotatorPlugin: Plugin = async (ctx) => {
-  // Agents list is static for the session lifetime — fetch once and cache
   let cachedAgents: any[] | null = null;
 
-  // Helper to determine if sharing is enabled (lazy evaluation)
-  // Priority: OpenCode config > env var > default (enabled)
   async function getSharingEnabled(): Promise<boolean> {
     try {
       const response = await ctx.client.config.get({
@@ -160,29 +169,60 @@ export const PlannotatorPlugin: Plugin = async (ctx) => {
   return {
     // Register submit_plan as primary-only tool (hidden from sub-agents by default)
     config: async (opencodeConfig) => {
-      if (allowSubagents()) return;
+      if (!allowSubagents()) {
+        const existingPrimaryTools =
+          opencodeConfig.experimental?.primary_tools ?? [];
+        if (!existingPrimaryTools.includes("submit_plan")) {
+          opencodeConfig.experimental = {
+            ...opencodeConfig.experimental,
+            primary_tools: [...existingPrimaryTools, "submit_plan"],
+          };
+        }
+      }
 
-      const existingPrimaryTools =
-        opencodeConfig.experimental?.primary_tools ?? [];
-      if (!existingPrimaryTools.includes("submit_plan")) {
-        opencodeConfig.experimental = {
-          ...opencodeConfig.experimental,
-          primary_tools: [...existingPrimaryTools, "submit_plan"],
-        };
+      // Allow the plan agent to write .md files anywhere.
+      // OpenCode's built-in plan agent uses relative-path globs that break
+      // when worktree != cwd (non-git projects). Per-agent config merges
+      // last, so this only affects the plan agent.
+      opencodeConfig.agent ??= {};
+      opencodeConfig.agent.plan ??= {};
+      opencodeConfig.agent.plan.permission ??= {};
+      opencodeConfig.agent.plan.permission.edit = {
+        ...opencodeConfig.agent.plan.permission.edit,
+        "*.md": "allow",
+      };
+    },
+
+    // Strip OpenCode's "STRICTLY FORBIDDEN" plan mode prompt from synthetic
+    // user messages. OpenCode injects these to prevent file edits in plan mode,
+    // but we need the agent to be able to write plan files.
+    "experimental.chat.messages.transform": async (input, output) => {
+      for (const message of output.messages) {
+        if (message.info.role !== "user") continue;
+        message.parts = message.parts.filter(
+          (part: any) =>
+            !(
+              part.type === "text" && part.text?.includes("STRICTLY FORBIDDEN")
+            ),
+        );
       }
     },
 
-    // Suppress plan_exit in favor of submit_plan
+    // Suppress plan_exit — redirect to submit_plan
+    // Override todowrite — defer to submit_plan during planning
     "tool.definition": async (input, output) => {
       if (input.toolID === "plan_exit") {
         output.description =
           "Do not call this tool. Use submit_plan instead — it opens a visual review UI for plan approval.";
       }
+      if (input.toolID === "todowrite") {
+        output.description =
+          "While actively planning with the user, use submit_plan instead. Only use todos once implementation begins or unless the user explicitly asks.";
+      }
     },
 
     // Inject planning instructions into system prompt
     "experimental.chat.system.transform": async (input, output) => {
-      // Skip for title generation requests
       const systemText = output.system.join("\n");
       if (
         systemText.toLowerCase().includes("title generator") ||
@@ -193,14 +233,12 @@ export const PlannotatorPlugin: Plugin = async (ctx) => {
 
       let lastUserAgent: string | undefined;
       try {
-        // Fetch session messages to determine current agent
         const messagesResponse = await ctx.client.session.messages({
           // @ts-ignore - sessionID exists on input
           path: { id: input.sessionID },
         });
         const messages = messagesResponse.data;
 
-        // Find last user message (reverse iteration)
         if (messages) {
           for (let i = messages.length - 1; i >= 0; i--) {
             const msg = messages[i];
@@ -212,13 +250,12 @@ export const PlannotatorPlugin: Plugin = async (ctx) => {
           }
         }
 
-        // Skip if agent detection fails (safer)
         if (!lastUserAgent) return;
 
-        // Hardcoded exclusion: build agent
+        // Build agent doesn't need planning instructions
         if (lastUserAgent === "build") return;
 
-        // Agents list is static — cache after first fetch
+        // Cache agents list (static per session)
         if (!cachedAgents) {
           const agentsResponse = await ctx.client.app.agents({
             query: { directory: ctx.directory },
@@ -229,213 +266,124 @@ export const PlannotatorPlugin: Plugin = async (ctx) => {
           (a: { name: string }) => a.name === lastUserAgent,
         );
 
-        // Skip if agent is a sub-agent
+        // Skip sub-agents
         // @ts-ignore - Agent has mode field
         if (agent?.mode === "subagent") return;
       } catch {
-        // Skip injection on any error (safer)
         return;
       }
 
-      // Plan agent: inject full iterative planning prompt
+      // Plan agent: strip conflicting OpenCode rules, inject full prompt
       if (lastUserAgent === "plan") {
-        const planDir = getPlanDirectory();
         output.system = stripConflictingPlanModeRules(output.system);
-        output.system.push(getPlanningPrompt(planDir));
+        output.system.push(getPlanningPrompt());
         return;
       }
 
-      // Other primary agents: inject minimal submission reminder
-      output.system.push(`
-## Plan Submission
+      // Other primary agents: minimal reminder about the tool
+      output.system.push(`## Plan Submission
 
-When you have completed your plan, you MUST call the \`submit_plan\` tool to submit it for user review.
-The user will be able to:
-- Review your plan visually in a dedicated UI
-- Annotate specific sections with feedback
-- Approve the plan to proceed with implementation
-- Request changes with detailed feedback
+When you have completed your plan, call the \`submit_plan\` tool to submit it for user review. Pass your plan as markdown text, or pass an absolute file path to a .md file.
 
-If your plan is rejected, you will receive the user's annotated feedback. Revise your plan
-based on their feedback and call submit_plan again.
+The user will review your plan in a visual UI where they can annotate, approve, or request changes. If rejected, revise based on their feedback and call submit_plan again.
 
-Do NOT proceed with implementation until your plan is approved.
-`);
+Do NOT proceed with implementation until your plan is approved.`);
     },
 
-    // Listen for slash commands
+    // Intercept plannotator-last before the agent sees the command
+    "command.execute.before": async (input, output) => {
+      if (input.command !== "plannotator-last") return;
+
+      output.parts = [];
+
+      const deps: CommandDeps = {
+        client: ctx.client,
+        htmlContent,
+        reviewHtmlContent,
+        getSharingEnabled,
+        getShareBaseUrl,
+        directory: ctx.directory,
+      };
+
+      const feedback = await handleAnnotateLastCommand(
+        { properties: { sessionID: input.sessionID } },
+        deps,
+      );
+
+      if (feedback) {
+        try {
+          await ctx.client.session.prompt({
+            path: { id: input.sessionID },
+            body: {
+              parts: [
+                {
+                  type: "text",
+                  text: `# Message Annotations\n\n${feedback}\n\nPlease address the annotation feedback above.`,
+                },
+              ],
+            },
+          });
+        } catch {
+          // Session may not be available
+        }
+      }
+    },
+
+    // Listen for slash commands (review + annotate)
     event: async ({ event }) => {
       const isCommandEvent =
         event.type === "command.executed" ||
         event.type === "tui.command.execute";
 
+      if (!isCommandEvent) return;
+
       // @ts-ignore - Event structure varies
       const commandName =
         event.properties?.name || event.command || event.payload?.name;
-      const isReviewCommand = commandName === "plannotator-review";
 
-      if (isCommandEvent && isReviewCommand) {
-        ctx.client.app.log({
-          level: "info",
-          message: "Opening code review UI...",
-        });
+      const deps: CommandDeps = {
+        client: ctx.client,
+        htmlContent,
+        reviewHtmlContent,
+        getSharingEnabled,
+        getShareBaseUrl,
+        directory: ctx.directory,
+      };
 
-        const gitContext = await getGitContext();
-        const {
-          patch: rawPatch,
-          label: gitRef,
-          error: diffError,
-        } = await runGitDiff("uncommitted", gitContext.defaultBranch);
-
-        const server = await startReviewServer({
-          rawPatch,
-          gitRef,
-          error: diffError,
-          origin: "opencode",
-          diffType: "uncommitted",
-          gitContext,
-          sharingEnabled: await getSharingEnabled(),
-          shareBaseUrl: getShareBaseUrl(),
-          htmlContent: reviewHtmlContent,
-          opencodeClient: ctx.client,
-          onReady: handleReviewServerReady,
-        });
-
-        const result = await server.waitForDecision();
-        await Bun.sleep(1500);
-        server.stop();
-
-        if (result.feedback) {
-          // @ts-ignore - Event properties contain sessionID
-          const sessionId = event.properties?.sessionID;
-
-          if (sessionId) {
-            const shouldSwitchAgent =
-              result.agentSwitch && result.agentSwitch !== "disabled";
-            const targetAgent = result.agentSwitch || "build";
-
-            const message = result.approved
-              ? `# Code Review\n\nCode review completed — no changes requested.`
-              : `# Code Review Feedback\n\n${result.feedback}\n\nPlease address this feedback.`;
-
-            try {
-              await ctx.client.session.prompt({
-                path: { id: sessionId },
-                body: {
-                  ...(shouldSwitchAgent && { agent: targetAgent }),
-                  parts: [{ type: "text", text: message }],
-                },
-              });
-            } catch {
-              // Session may not be available
-            }
-          }
-        }
-      }
-
-      // Handle /plannotator-annotate command
-      const isAnnotateCommand = commandName === "plannotator-annotate";
-
-      if (isCommandEvent && isAnnotateCommand) {
-        // @ts-ignore - Event properties contain arguments
-        const filePath = event.properties?.arguments || event.arguments || "";
-
-        if (!filePath) {
-          ctx.client.app.log({
-            level: "error",
-            message: "Usage: /plannotator-annotate <file.md>",
-          });
-          return;
-        }
-
-        ctx.client.app.log({
-          level: "info",
-          message: `Opening annotation UI for ${filePath}...`,
-        });
-
-        const projectRoot = process.cwd();
-        const resolved = await resolveMarkdownFile(filePath, projectRoot);
-
-        if (resolved.kind === "ambiguous") {
-          ctx.client.app.log({
-            level: "error",
-            message: `Ambiguous filename "${resolved.input}" — found ${resolved.matches.length} matches:\n${resolved.matches.map((m) => `  ${m}`).join("\n")}`,
-          });
-          return;
-        }
-        if (resolved.kind === "not_found") {
-          ctx.client.app.log({
-            level: "error",
-            message: `File not found: ${resolved.input}`,
-          });
-          return;
-        }
-
-        const absolutePath = resolved.path;
-        ctx.client.app.log({
-          level: "info",
-          message: `Resolved: ${absolutePath}`,
-        });
-        const markdown = await Bun.file(absolutePath).text();
-
-        const server = await startAnnotateServer({
-          markdown,
-          filePath: absolutePath,
-          origin: "opencode",
-          sharingEnabled: await getSharingEnabled(),
-          shareBaseUrl: getShareBaseUrl(),
-          htmlContent: htmlContent,
-          onReady: handleAnnotateServerReady,
-        });
-
-        const result = await server.waitForDecision();
-        await Bun.sleep(1500);
-        server.stop();
-
-        if (result.feedback) {
-          // @ts-ignore - Event properties contain sessionID
-          const sessionId = event.properties?.sessionID;
-
-          if (sessionId) {
-            try {
-              await ctx.client.session.prompt({
-                path: { id: sessionId },
-                body: {
-                  parts: [
-                    {
-                      type: "text",
-                      text: `# Markdown Annotations\n\nFile: ${absolutePath}\n\n${result.feedback}\n\nPlease address the annotation feedback above.`,
-                    },
-                  ],
-                },
-              });
-            } catch {
-              // Session may not be available
-            }
-          }
-        }
-      }
+      if (commandName === "plannotator-review")
+        return handleReviewCommand(event, deps);
+      if (commandName === "plannotator-annotate")
+        return handleAnnotateCommand(event, deps);
     },
 
     tool: {
       submit_plan: tool({
         description:
-          "Submit your plan file for interactive user review. The user can annotate, approve, or request changes in a visual browser UI. Pass the absolute path to your plan file.",
+          "Planning tool used to submit a plan to the user for review. Before calling this tool you must conduct interactive and exploratory analysis in order to submit a quality plan. Ask questions. Explore the codebase for context if needed. Only call submit_plan once you have enough details to create a quality plan. Work with the user to get those details. Pass either markdown text or an absolute path to a .md file.",
         args: {
-          path: tool.schema
+          plan: tool.schema
             .string()
-            .describe("Absolute path to the plan markdown file on disk."),
+            .describe(
+              "The plan — either markdown text or an absolute path to a .md file on disk.",
+            ),
         },
 
         async execute(args, context) {
-          const planDir = getPlanDirectory();
-          const validation = validatePlanPath(args.path, planDir);
-
-          if (!validation.ok) {
-            return `Error: ${validation.error}`;
+          // Auto-detect: file path or plan text
+          let planContent: string;
+          let sourceFilePath: string | undefined;
+          try {
+            const resolved = resolvePlanContent(args.plan);
+            planContent = resolved.content;
+            sourceFilePath = resolved.filePath;
+          } catch (err) {
+            return `Error: ${err instanceof Error ? err.message : String(err)}`;
           }
 
-          const planContent = validation.content;
+          if (!planContent.trim()) {
+            return "Error: Plan content is empty. Write your plan first, then call submit_plan.";
+          }
+
           const sharingEnabled = await getSharingEnabled();
           const server = await startPlannotatorServer({
             plan: planContent,
@@ -522,9 +470,12 @@ Proceed with implementation, incorporating these notes where applicable.`;
 
             return `Plan approved!${result.savedPath ? ` Saved to: ${result.savedPath}` : ""}`;
           } else {
-            return planDenyFeedback(result.feedback || "", "submit_plan", {
-              planFilePath: args.path,
-            });
+            return (
+              planDenyFeedback(result.feedback || "", "submit_plan", {
+                planFilePath: sourceFilePath,
+              }) +
+              "\n\nAfter making your revisions, call `submit_plan` again to resubmit for review."
+            );
           }
         },
       }),

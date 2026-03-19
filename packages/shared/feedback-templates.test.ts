@@ -57,7 +57,9 @@ describe("feedback-templates", () => {
       planFilePath: "plans/auth.md",
     });
 
-    expect(result).toContain("Read plans/auth.md to see the current plan before editing it.");
+    expect(result).toContain("plans/auth.md");
+    expect(result).toContain("edit this file");
     expect(result).toContain("exit_plan_mode");
   });
+
 });
