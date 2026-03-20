@@ -878,7 +878,7 @@ const ReviewApp: React.FC = () => {
                 onSelectSearchMatch={handleSelectSearchMatch}
                 onStepSearchMatch={stepSearchMatch}
               />
-              <ResizeHandle {...fileTreeResize.handleProps} />
+              <ResizeHandle {...fileTreeResize.handleProps} side="left" />
             </>
           )}
 
@@ -970,7 +970,7 @@ const ReviewApp: React.FC = () => {
           </main>
 
           {/* Resize Handle */}
-          {isPanelOpen && <ResizeHandle {...panelResize.handleProps} />}
+          {isPanelOpen && <ResizeHandle {...panelResize.handleProps} side="right" />}
 
           {/* Annotations panel */}
           <ReviewPanel

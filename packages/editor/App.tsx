@@ -1236,7 +1236,7 @@ const App: React.FC = () => {
                 onFetchVersions={planDiff.fetchVersions}
                 onFetchProjectPlans={planDiff.fetchProjectPlans}
               />
-              <ResizeHandle {...tocResize.handleProps} className="hidden lg:block" />
+              <ResizeHandle {...tocResize.handleProps} className="hidden lg:block" side="left" />
             </>
           )}
 
@@ -1323,7 +1323,7 @@ const App: React.FC = () => {
           </main>
 
           {/* Resize Handle */}
-          {isPanelOpen && <ResizeHandle {...panelResize.handleProps} className="hidden md:block" />}
+          {isPanelOpen && <ResizeHandle {...panelResize.handleProps} className="hidden md:block" side="right" />}
 
           {/* Annotation Panel */}
           <AnnotationPanel
