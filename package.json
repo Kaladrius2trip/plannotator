@@ -1,6 +1,6 @@
 {
   "name": "plannotator",
-  "version": "0.14.1",
+  "version": "0.14.3",
   "private": true,
   "description": "Interactive Plan Review for Claude Code - annotate plans visually, share with team, automatically send feedback",
   "author": "backnotprop",
@@ -33,6 +33,10 @@
   },
   "dependencies": {
     "@pierre/diffs": "^1.1.0-beta.19",
-    "diff": "^8.0.3"
+    "diff": "^8.0.3",
+    "dompurify": "^3.3.3"
+  },
+  "devDependencies": {
+    "@types/dompurify": "^3.2.0"
   }
 }
