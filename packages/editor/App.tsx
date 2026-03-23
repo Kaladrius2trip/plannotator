@@ -158,6 +158,12 @@ const App: React.FC = () => {
     display: string;
     branch?: string;
   } | null>(null);
+
+  useEffect(() => {
+    document.title = repoInfo
+      ? `${repoInfo.display} · Plannotator`
+      : "Plannotator";
+  }, [repoInfo]);
   const [showExportDropdown, setShowExportDropdown] = useState(false);
   const [initialExportTab, setInitialExportTab] = useState<
     "share" | "annotations" | "notes"
@@ -1708,6 +1714,7 @@ const App: React.FC = () => {
               <ResizeHandle
                 {...tocResize.handleProps}
                 className="hidden lg:block"
+                side="left"
               />
             </>
           )}
@@ -1852,6 +1859,7 @@ const App: React.FC = () => {
             <ResizeHandle
               {...panelResize.handleProps}
               className="hidden md:block"
+              side="right"
             />
           )}
 

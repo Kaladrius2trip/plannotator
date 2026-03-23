@@ -15,7 +15,7 @@ import { getRepoInfo } from "./repo";
 import { handleImage, handleUpload, handleAgents, handleServerReady, handleDraftSave, handleDraftLoad, handleDraftDelete, handleFavicon, type OpencodeClient } from "./shared-handlers";
 import { contentHash, deleteDraft } from "./draft";
 import { createEditorAnnotationHandler } from "./editor-annotations";
-import { type PRMetadata, fetchPRFileContent, fetchPRContext } from "./pr";
+import { type PRMetadata, type PRReviewFileComment, fetchPRFileContent, fetchPRContext, submitPRReview, getUser, prRefFromMetadata, getDisplayRepo, getMRLabel, getMRNumberLabel } from "./pr";
 
 // Re-export utilities
 export { isRemoteSession, getServerPort } from "./remote";
@@ -105,8 +105,12 @@ export async function startReviewServer(
   // Detect repo info (cached for this session)
   // In PR mode, derive from metadata instead of local git
   const repoInfo = isPRMode
-    ? { display: `${prMetadata.owner}/${prMetadata.repo}`, branch: `PR #${prMetadata.number}` }
+    ? { display: getDisplayRepo(prMetadata), branch: `${getMRLabel(prMetadata)} ${getMRNumberLabel(prMetadata)}` }
     : await getRepoInfo();
+
+  // Fetch current platform user (for own-PR/MR detection)
+  const prRef = isPRMode ? prRefFromMetadata(prMetadata) : null;
+  const platformUser = prRef ? await getUser(prRef) : null;
 
   // Decision promise
   let resolveDecision: (result: {
@@ -146,7 +150,7 @@ export async function startReviewServer(
               sharingEnabled,
               shareBaseUrl,
               repoInfo,
-              ...(isPRMode && { prMetadata }),
+              ...(isPRMode && { prMetadata, platformUser }),
               ...(currentError && { error: currentError }),
             });
           }
@@ -204,13 +208,7 @@ export async function startReviewServer(
               );
             }
             try {
-              const ref = {
-                platform: "github" as const,
-                owner: prMetadata!.owner,
-                repo: prMetadata!.repo,
-                number: prMetadata!.number,
-              };
-              const context = await fetchPRContext(ref);
+              const context = await fetchPRContext(prRef!);
               return Response.json(context);
             } catch (err) {
               const message =
@@ -236,11 +234,10 @@ export async function startReviewServer(
             }
 
             if (isPRMode) {
-              // Fetch file content from GitHub API using base/head SHAs
-              const prRef = { platform: prMetadata.platform, owner: prMetadata.owner, repo: prMetadata.repo, number: prMetadata.number } as const;
+              // Fetch file content from platform API using base/head SHAs
               const [oldContent, newContent] = await Promise.all([
-                fetchPRFileContent(prRef, prMetadata.baseSha, oldPath || filePath),
-                fetchPRFileContent(prRef, prMetadata.headSha, filePath),
+                fetchPRFileContent(prRef!, prMetadata.baseSha, oldPath || filePath),
+                fetchPRFileContent(prRef!, prMetadata.headSha, filePath),
               ]);
               return Response.json({ oldContent, newContent });
             }
@@ -342,6 +339,34 @@ export async function startReviewServer(
             } catch (err) {
               const message =
                 err instanceof Error ? err.message : "Failed to process feedback";
+              return Response.json({ error: message }, { status: 500 });
+            }
+          }
+
+          // API: Submit PR review directly to GitHub (PR mode only)
+          if (url.pathname === "/api/pr-action" && req.method === "POST") {
+            if (!isPRMode || !prMetadata) {
+              return Response.json({ error: "Not in PR mode" }, { status: 400 });
+            }
+            try {
+              const body = (await req.json()) as {
+                action: "approve" | "comment";
+                body: string;
+                fileComments: PRReviewFileComment[];
+              };
+
+              await submitPRReview(
+                prRef!,
+                prMetadata.headSha,
+                body.action,
+                body.body,
+                body.fileComments,
+              );
+
+              return Response.json({ ok: true, prUrl: prMetadata.url });
+            } catch (err) {
+              const message =
+                err instanceof Error ? err.message : "Failed to submit PR review";
               return Response.json({ error: message }, { status: 500 });
             }
           }

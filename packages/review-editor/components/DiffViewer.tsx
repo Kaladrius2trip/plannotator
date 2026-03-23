@@ -239,13 +239,14 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
           pre, code { background-color: ${bg} !important; }
           [data-file-info] { background-color: ${muted} !important; }
           [data-column-number] { background-color: ${bg} !important; }
+          [data-diffs-header] [data-title] { display: none !important; }
         `,
       });
     });
   }, [resolvedMode, colorTheme]);
 
   return (
-    <div ref={containerRef} className="h-full overflow-auto relative" onMouseMove={toolbar.handleMouseMove}>
+    <div className="h-full flex flex-col">
       <FileHeader
         filePath={filePath}
         patch={patch}
@@ -259,6 +260,7 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
         onFileComment={setFileCommentAnchor}
       />
 
+      <div ref={containerRef} className="flex-1 overflow-auto relative" onMouseMove={toolbar.handleMouseMove}>
       <div className="p-4">
         <FileDiff
           key={filePath}
@@ -323,6 +325,7 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
           onClose={() => setFileCommentAnchor(null)}
         />
       )}
+      </div>
     </div>
   );
 };
