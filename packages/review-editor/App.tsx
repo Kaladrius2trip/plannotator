@@ -11,12 +11,18 @@ import { GitLabIcon } from '@plannotator/ui/components/GitLabIcon';
 import { RepoIcon } from '@plannotator/ui/components/RepoIcon';
 import { PullRequestIcon } from '@plannotator/ui/components/PullRequestIcon';
 import { getPlatformLabel, getMRLabel, getMRNumberLabel, getDisplayRepo } from '@plannotator/shared/pr-provider';
-import { getIdentity } from '@plannotator/ui/utils/identity';
+import { configStore, useConfigValue } from '@plannotator/ui/config';
 import { getAgentSwitchSettings, getEffectiveAgentName } from '@plannotator/ui/utils/agentSwitch';
+import { getAIProviderSettings, saveAIProviderSettings, getPreferredModel } from '@plannotator/ui/utils/aiProvider';
+import { AISetupDialog } from '@plannotator/ui/components/AISetupDialog';
+import { needsAISetup } from '@plannotator/ui/utils/aiSetup';
 import { CodeAnnotation, CodeAnnotationType, SelectedLineRange } from '@plannotator/ui/types';
 import { useResizablePanel } from '@plannotator/ui/hooks/useResizablePanel';
 import { useCodeAnnotationDraft } from '@plannotator/ui/hooks/useCodeAnnotationDraft';
 import { useGitAdd } from './hooks/useGitAdd';
+import { generateId } from './utils/generateId';
+import { useAIChat } from './hooks/useAIChat';
+import { extractLinesFromPatch } from './utils/patchParser';
 import { isTypingTarget, useReviewSearch } from './hooks/useReviewSearch';
 import { useEditorAnnotations } from '@plannotator/ui/hooks/useEditorAnnotations';
 import { exportEditorAnnotations } from '@plannotator/ui/utils/parser';
@@ -26,21 +32,12 @@ import { ReviewPanel } from './components/ReviewPanel';
 import { FileTree } from './components/FileTree';
 import { DEMO_DIFF } from './demoData';
 import { exportReviewFeedback } from './utils/exportFeedback';
+import type { DiffFile } from './types';
 import type { DiffOption, WorktreeInfo, GitContext } from '@plannotator/shared/types';
 import type { PRMetadata } from '@plannotator/shared/pr-provider';
+import { altKey } from '@plannotator/ui/utils/platform';
 
 declare const __APP_VERSION__: string;
-
-const isMac = typeof navigator !== 'undefined' && /Mac|iPhone|iPad/.test(navigator.platform);
-const altKey = isMac ? '⌥' : 'Alt';
-
-interface DiffFile {
-  path: string;
-  oldPath?: string;
-  patch: string;
-  additions: number;
-  deletions: number;
-}
 
 interface DiffData {
   files: DiffFile[];
@@ -85,11 +82,6 @@ function parseDiffToFiles(rawPatch: string): DiffFile[] {
   return files;
 }
 
-// Generate unique ID
-function generateId(): string {
-  return Math.random().toString(36).substring(2, 9);
-}
-
 const ReviewApp: React.FC = () => {
   const [diffData, setDiffData] = useState<DiffData | null>(null);
   const [files, setFiles] = useState<DiffFile[]>([]);
@@ -108,6 +100,8 @@ const ReviewApp: React.FC = () => {
   const [viewedFiles, setViewedFiles] = useState<Set<string>>(new Set());
   const [hideViewedFiles, setHideViewedFiles] = useState(false);
   const [origin, setOrigin] = useState<'opencode' | 'claude-code' | 'pi' | null>(null);
+  const [gitUser, setGitUser] = useState<string | undefined>();
+  const [isWSL, setIsWSL] = useState(false);
   const [diffType, setDiffType] = useState<string>('uncommitted');
   const [gitContext, setGitContext] = useState<GitContext | null>(null);
   const [isLoadingDiff, setIsLoadingDiff] = useState(false);
@@ -145,7 +139,7 @@ const ReviewApp: React.FC = () => {
   const mrNumberLabel = prMetadata ? getMRNumberLabel(prMetadata) : '';
   const displayRepo = prMetadata ? getDisplayRepo(prMetadata) : '';
 
-  const identity = useMemo(() => getIdentity(), []);
+  const identity = useConfigValue('displayName');
 
   const clearPendingSelection = useCallback(() => {
     setPendingSelection(null);
@@ -189,6 +183,137 @@ const ReviewApp: React.FC = () => {
 
   // VS Code editor annotations (only polls when inside VS Code webview)
   const { editorAnnotations, deleteEditorAnnotation } = useEditorAnnotations();
+
+  // AI Chat
+  const [aiAvailable, setAiAvailable] = useState(false);
+  const [aiProviders, setAiProviders] = useState<Array<{ id: string; name: string; capabilities: Record<string, boolean>; models?: Array<{ id: string; label: string; default?: boolean }> }>>([]);
+  const [aiConfig, setAiConfig] = useState(() => {
+    const saved = getAIProviderSettings();
+    const pid = saved.providerId;
+    return {
+      providerId: pid,
+      model: pid ? (saved.preferredModels[pid] ?? null) : null,
+      reasoningEffort: null as string | null,
+    };
+  });
+  const [showAISetup, setShowAISetup] = useState(false);
+  const [reviewPanelTabOverride, setReviewPanelTabOverride] = useState<'ai' | undefined>(undefined);
+  const aiChat = useAIChat({
+    patch: diffData?.rawPatch ?? '',
+    providerId: aiConfig.providerId,
+    model: aiConfig.model,
+    reasoningEffort: aiConfig.reasoningEffort,
+  });
+
+  // Check AI capabilities on mount
+  useEffect(() => {
+    fetch('/api/ai/capabilities')
+      .then(r => r.ok ? r.json() : null)
+      .then(data => {
+        if (data?.available) {
+          setAiAvailable(true);
+          const providers = data.providers ?? [];
+          setAiProviders(providers);
+          if (providers.length > 0 && needsAISetup()) {
+            setShowAISetup(true);
+          }
+        }
+      })
+      .catch(() => {});
+  }, []);
+
+  const handleAIConfigChange = useCallback((config: { providerId?: string | null; model?: string | null }) => {
+    setAiConfig(prev => {
+      const next = { ...prev, ...config };
+      // If provider changed, load that provider's preferred model
+      if (config.providerId !== undefined && config.providerId !== prev.providerId) {
+        next.model = config.providerId ? getPreferredModel(config.providerId) : null;
+      }
+      // Persist provider selection
+      const saved = getAIProviderSettings();
+      saveAIProviderSettings({ ...saved, providerId: next.providerId });
+      return next;
+    });
+    aiChat.resetSession();
+  }, [aiChat]);
+
+  const handleAskAI = useCallback((question: string) => {
+    if (!pendingSelection || !files[activeFileIndex]) return;
+    const lineStart = Math.min(pendingSelection.start, pendingSelection.end);
+    const lineEnd = Math.max(pendingSelection.start, pendingSelection.end);
+    const side = pendingSelection.side === 'additions' ? 'new' : 'old';
+    const selectedCode = extractLinesFromPatch(files[activeFileIndex].patch, lineStart, lineEnd, side);
+
+    aiChat.ask({
+      prompt: question,
+      filePath: files[activeFileIndex].path,
+      lineStart,
+      lineEnd,
+      side,
+      selectedCode: selectedCode || undefined,
+    });
+  }, [pendingSelection, files, activeFileIndex, aiChat]);
+
+  const handleViewAIResponse = useCallback((questionId?: string) => {
+    setReviewPanelTabOverride('ai');
+    setIsPanelOpen(true);
+    if (questionId) {
+      setScrollToQuestionId(questionId);
+      setTimeout(() => setScrollToQuestionId(null), 500);
+    }
+  }, []);
+
+  const handleScrollToAILines = useCallback((filePath: string, lineStart: number, lineEnd: number, side: 'old' | 'new') => {
+    // Switch to the file containing the referenced lines
+    const fileIndex = files.findIndex(f => f.path === filePath);
+    if (fileIndex !== -1 && fileIndex !== activeFileIndex) {
+      setPendingSelection(null);
+      setActiveFileIndex(fileIndex);
+    }
+    // Set a selection to highlight the lines
+    setPendingSelection({
+      start: lineStart,
+      end: lineEnd,
+      side: side === 'new' ? 'additions' : 'deletions',
+    });
+  }, [files, activeFileIndex]);
+
+  // AI messages for the current file (for inline markers)
+  const aiMessagesForCurrentFile = useMemo(() => {
+    const activeFile = files[activeFileIndex];
+    if (!activeFile) return [];
+    return aiChat.messages.filter(m => m.question.filePath === activeFile.path);
+  }, [aiChat.messages, files, activeFileIndex]);
+
+  // AI messages overlapping the current selection (for toolbar history)
+  const aiHistoryForSelection = useMemo(() => {
+    if (!pendingSelection || !files[activeFileIndex]) return [];
+    const filePath = files[activeFileIndex].path;
+    const selStart = Math.min(pendingSelection.start, pendingSelection.end);
+    const selEnd = Math.max(pendingSelection.start, pendingSelection.end);
+    const side = pendingSelection.side === 'additions' ? 'new' : 'old';
+    return aiChat.messages.filter(m => {
+      const q = m.question;
+      return q.filePath === filePath && q.side === side &&
+        q.lineStart != null && q.lineEnd != null &&
+        q.lineStart <= selEnd && q.lineEnd >= selStart;
+    });
+  }, [pendingSelection, files, activeFileIndex, aiChat.messages]);
+
+  // Click AI marker in diff → scroll sidebar to that Q&A
+  const [scrollToQuestionId, setScrollToQuestionId] = useState<string | null>(null);
+  const handleClickAIMarker = useCallback((questionId: string) => {
+    setScrollToQuestionId(questionId);
+    setReviewPanelTabOverride('ai');
+    setIsPanelOpen(true);
+    // Clear after a tick so it can re-trigger for the same question
+    setTimeout(() => setScrollToQuestionId(null), 500);
+  }, []);
+
+  // General AI question from sidebar input
+  const handleAskGeneral = useCallback((question: string) => {
+    aiChat.ask({ prompt: question });
+  }, [aiChat.ask]);
 
   // Resizable panels
   const panelResize = useResizablePanel({ storageKey: 'plannotator-review-panel-width' });
@@ -263,8 +388,15 @@ const ReviewApp: React.FC = () => {
         repoInfo?: { display: string; branch?: string };
         prMetadata?: PRMetadata;
         platformUser?: string;
+        viewedFiles?: string[];
         error?: string;
+        isWSL?: boolean;
+        serverConfig?: { displayName?: string; gitUser?: string };
       }) => {
+        // Initialize config store with server-provided values (config file > cookie > default)
+        configStore.init(data.serverConfig);
+        // gitUser drives the "Use git name" button in Settings; stays undefined (button hidden) when unavailable
+        setGitUser(data.serverConfig?.gitUser);
         const apiFiles = parseDiffToFiles(data.rawPatch);
         setDiffData({
           files: apiFiles,
@@ -283,7 +415,12 @@ const ReviewApp: React.FC = () => {
         if (data.repoInfo) setRepoInfo(data.repoInfo);
         if (data.prMetadata) setPrMetadata(data.prMetadata);
         if (data.platformUser) setPlatformUser(data.platformUser);
+        // Initialize viewed files from GitHub's state (set before draft restore so draft takes precedence)
+        if (data.viewedFiles && data.viewedFiles.length > 0) {
+          setViewedFiles(new Set(data.viewedFiles));
+        }
         if (data.error) setDiffError(data.error);
+        if (data.isWSL) setIsWSL(true);
       })
       .catch(() => {
         // Not in API mode - use demo content
@@ -405,14 +542,26 @@ const ReviewApp: React.FC = () => {
   const handleToggleViewed = useCallback((filePath: string) => {
     setViewedFiles(prev => {
       const next = new Set(prev);
-      if (next.has(filePath)) {
-        next.delete(filePath);
-      } else {
+      const willBeViewed = !prev.has(filePath);
+      if (willBeViewed) {
         next.add(filePath);
+      } else {
+        next.delete(filePath);
+      }
+      // Sync viewed state to GitHub (fire and forget — best effort)
+      // Capture willBeViewed inside the callback to ensure correctness with React batching
+      if (prMetadata && prMetadata.platform === 'github') {
+        fetch('/api/pr-viewed', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ filePaths: [filePath], viewed: willBeViewed }),
+        }).catch(() => {
+          // Silently ignore — viewed sync is best-effort
+        });
       }
       return next;
     });
-  }, []);
+  }, [prMetadata]);
 
   // Derive worktree path and base diff type from the composite diffType string
   const { activeWorktreePath, activeDiffBase } = useMemo(() => {
@@ -1129,6 +1278,8 @@ const ReviewApp: React.FC = () => {
               onIdentityChange={handleIdentityChange}
               origin={origin}
               mode="review"
+              aiProviders={aiProviders}
+              gitUser={gitUser}
             />
 
             {/* Panel toggle */}
@@ -1242,6 +1393,13 @@ const ReviewApp: React.FC = () => {
                 searchMatches={activeFileSearchMatches}
                 activeSearchMatchId={activeSearchMatchId}
                 activeSearchMatch={activeSearchMatch?.filePath === activeFile.path ? activeSearchMatch : null}
+                aiAvailable={aiAvailable}
+                onAskAI={handleAskAI}
+                isAILoading={aiChat.isCreatingSession || aiChat.isStreaming}
+                onViewAIResponse={handleViewAIResponse}
+                aiMessages={aiMessagesForCurrentFile}
+                onClickAIMarker={handleClickAIMarker}
+                aiHistoryMessages={aiHistoryForSelection}
               />
             ) : (
               <div className="h-full flex items-center justify-center">
@@ -1303,6 +1461,22 @@ const ReviewApp: React.FC = () => {
             editorAnnotations={editorAnnotations}
             onDeleteEditorAnnotation={deleteEditorAnnotation}
             prMetadata={prMetadata}
+            aiAvailable={aiAvailable}
+            aiMessages={aiChat.messages}
+            isAICreatingSession={aiChat.isCreatingSession}
+            isAIStreaming={aiChat.isStreaming}
+            onScrollToAILines={handleScrollToAILines}
+            activeTabOverride={reviewPanelTabOverride}
+            onTabChange={() => setReviewPanelTabOverride(undefined)}
+            activeFilePath={files[activeFileIndex]?.path}
+            scrollToQuestionId={scrollToQuestionId}
+            onAskGeneral={handleAskGeneral}
+            aiPermissionRequests={aiChat.permissionRequests}
+            onRespondToPermission={aiChat.respondToPermission}
+            aiProviders={aiProviders}
+            aiConfig={aiConfig}
+            onAIConfigChange={handleAIConfigChange}
+            hasAISession={!!aiChat.sessionId}
           />
         </div>
 
@@ -1369,6 +1543,16 @@ const ReviewApp: React.FC = () => {
           showCancel
         />
 
+        {/* AI setup dialog — first-run only */}
+        <AISetupDialog
+          isOpen={showAISetup}
+          providers={aiProviders}
+          onComplete={(providerId) => {
+            setShowAISetup(false);
+            handleAIConfigChange({ providerId });
+          }}
+        />
+
         {/* Completion overlay - shown after approve/feedback */}
         <CompletionOverlay
           submitted={submitted}
@@ -1386,7 +1570,7 @@ const ReviewApp: React.FC = () => {
         />
 
         {/* Update notification */}
-        <UpdateBanner origin={origin} />
+        <UpdateBanner origin={origin} isWSL={isWSL} />
 
         {/* GitHub general comment dialog */}
         {platformCommentDialog && (

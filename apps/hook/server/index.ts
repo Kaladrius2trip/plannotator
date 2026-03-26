@@ -1,7 +1,7 @@
 /**
  * Plannotator CLI for Claude Code
  *
- * Supports four modes:
+ * Supports five modes:
  *
  * 1. Plan Review (default, no args):
  *    - Spawned by ExitPlanMode hook
@@ -18,7 +18,12 @@
  *    - Opens any markdown file in the annotation UI
  *    - Outputs structured feedback to stdout
  *
- * 4. Sessions (`plannotator sessions`):
+ * 4. Archive (`plannotator archive`):
+ *    - Opens read-only browser for saved plan decisions
+ *    - Lists plans from ~/.plannotator/plans/ with status badges
+ *    - Done button closes the browser
+ *
+ * 5. Sessions (`plannotator sessions`):
  *    - Lists active Plannotator server sessions
  *    - `--open [N]` reopens a session in the browser
  *    - `--clean` removes stale session files
@@ -43,7 +48,7 @@ import {
 import { getGitContext, runGitDiff } from "@plannotator/server/git";
 import {
   parsePRUrl,
-  checkAuth,
+  checkPRAuth,
   fetchPR,
   getCliName,
   getCliInstallUrl,
@@ -52,7 +57,12 @@ import {
   getDisplayRepo,
 } from "@plannotator/server/pr";
 import { writeRemoteShareLink } from "@plannotator/server/share-url";
-import { resolveMarkdownFile } from "@plannotator/server/resolve-file";
+import {
+  resolveMarkdownFile,
+  hasMarkdownFiles,
+} from "@plannotator/shared/resolve-file";
+import { FILE_BROWSER_EXCLUDED } from "@plannotator/shared/reference-common";
+import { statSync } from "fs";
 import {
   registerSession,
   unregisterSession,
@@ -200,7 +210,7 @@ if (args[0] === "sessions") {
     const cliUrl = getCliInstallUrl(prRef);
 
     try {
-      await checkAuth(prRef);
+      await checkPRAuth(prRef);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       if (msg.includes("not found") || msg.includes("ENOENT")) {
@@ -306,7 +316,7 @@ if (args[0] === "sessions") {
 
   let filePath = args[1];
   if (!filePath) {
-    console.error("Usage: plannotator annotate <file.md>");
+    console.error("Usage: plannotator annotate <file.md | folder/>");
     process.exit(1);
   }
 
@@ -323,26 +333,53 @@ if (args[0] === "sessions") {
     console.error(`[DEBUG] File path arg: ${filePath}`);
   }
 
-  // Smart file resolution: exact path, case-insensitive relative, or bare filename search
-  const resolved = await resolveMarkdownFile(filePath, projectRoot);
+  // Check if the argument is a directory (folder annotation mode)
+  const resolvedArg = path.resolve(projectRoot, filePath);
+  let isFolder = false;
+  try {
+    isFolder = statSync(resolvedArg).isDirectory();
+  } catch {
+    // Not a directory, fall through to file resolution
+  }
 
-  if (resolved.kind === "ambiguous") {
-    console.error(
-      `Ambiguous filename "${resolved.input}" — found ${resolved.matches.length} matches:`,
-    );
-    for (const match of resolved.matches) {
-      console.error(`  ${match}`);
+  let markdown: string;
+  let absolutePath: string;
+  let folderPath: string | undefined;
+  let annotateMode: "annotate" | "annotate-folder" = "annotate";
+
+  if (isFolder) {
+    // Folder annotation mode
+    if (!hasMarkdownFiles(resolvedArg, FILE_BROWSER_EXCLUDED)) {
+      console.error(`No markdown files found in ${resolvedArg}`);
+      process.exit(1);
     }
-    process.exit(1);
-  }
-  if (resolved.kind === "not_found") {
-    console.error(`File not found: ${resolved.input}`);
-    process.exit(1);
-  }
+    folderPath = resolvedArg;
+    absolutePath = resolvedArg;
+    markdown = "";
+    annotateMode = "annotate-folder";
+    console.error(`Folder: ${resolvedArg}`);
+  } else {
+    // Single file annotation mode
+    const resolved = resolveMarkdownFile(filePath, projectRoot);
 
-  const absolutePath = resolved.path;
-  console.error(`Resolved: ${absolutePath}`);
-  const markdown = await Bun.file(absolutePath).text();
+    if (resolved.kind === "ambiguous") {
+      console.error(
+        `Ambiguous filename "${resolved.input}" — found ${resolved.matches.length} matches:`,
+      );
+      for (const match of resolved.matches) {
+        console.error(`  ${match}`);
+      }
+      process.exit(1);
+    }
+    if (resolved.kind === "not_found") {
+      console.error(`File not found: ${resolved.input}`);
+      process.exit(1);
+    }
+
+    absolutePath = resolved.path;
+    markdown = await Bun.file(absolutePath).text();
+    console.error(`Resolved: ${absolutePath}`);
+  }
 
   const annotateProject = (await detectProjectName()) ?? "_unknown";
 
@@ -351,13 +388,16 @@ if (args[0] === "sessions") {
     markdown,
     filePath: absolutePath,
     origin: "claude-code",
+    mode: annotateMode,
+    folderPath,
     sharingEnabled,
     shareBaseUrl,
+    pasteApiUrl,
     htmlContent: planHtmlContent,
     onReady: async (url, isRemote, port) => {
       handleAnnotateServerReady(url, isRemote, port);
 
-      if (isRemote && sharingEnabled) {
+      if (isRemote && sharingEnabled && markdown) {
         await writeRemoteShareLink(
           markdown,
           shareBaseUrl,
@@ -375,7 +415,9 @@ if (args[0] === "sessions") {
     mode: "annotate",
     project: annotateProject,
     startedAt: new Date().toISOString(),
-    label: `annotate-${path.basename(absolutePath)}`,
+    label: folderPath
+      ? `annotate-${path.basename(folderPath)}`
+      : `annotate-${path.basename(absolutePath)}`,
   });
 
   // Wait for user feedback
@@ -486,6 +528,7 @@ if (args[0] === "sessions") {
     mode: "annotate-last",
     sharingEnabled,
     shareBaseUrl,
+    pasteApiUrl,
     htmlContent: planHtmlContent,
     onReady: async (url, isRemote, port) => {
       handleAnnotateServerReady(url, isRemote, port);
@@ -518,6 +561,40 @@ if (args[0] === "sessions") {
   server.stop();
 
   console.log(result.feedback || "No feedback provided.");
+  process.exit(0);
+} else if (args[0] === "archive") {
+  // ============================================
+  // ARCHIVE BROWSER MODE
+  // ============================================
+
+  const archiveProject = (await detectProjectName()) ?? "_unknown";
+
+  const server = await startPlannotatorServer({
+    plan: "",
+    origin: "claude-code",
+    mode: "archive",
+    sharingEnabled,
+    shareBaseUrl,
+    htmlContent: planHtmlContent,
+    onReady: (url, isRemote, port) => {
+      handleServerReady(url, isRemote, port);
+    },
+  });
+
+  registerSession({
+    pid: process.pid,
+    port: server.port,
+    url: server.url,
+    mode: "archive",
+    project: archiveProject,
+    startedAt: new Date().toISOString(),
+    label: `archive-${archiveProject}`,
+  });
+
+  await server.waitForDone!();
+
+  await Bun.sleep(500);
+  server.stop();
   process.exit(0);
 } else {
   // ============================================
@@ -596,13 +673,14 @@ if (args[0] === "sessions") {
         >)
       : await server.waitForDecision();
 
+  // Give browser time to receive response and update UI
   await Bun.sleep(1500);
 
   // Cleanup
   server.stop();
 
-  // Output JSON for PermissionRequest hook decision control
   if (result.approved && !result.saveOnly) {
+    // Build updatedPermissions to preserve the current permission mode
     const updatedPermissions = [];
     if (result.permissionMode) {
       updatedPermissions.push({

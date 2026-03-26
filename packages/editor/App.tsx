@@ -31,6 +31,7 @@ import { useSharing } from "@plannotator/ui/hooks/useSharing";
 import { useAgents } from "@plannotator/ui/hooks/useAgents";
 import { useActiveSection } from "@plannotator/ui/hooks/useActiveSection";
 import { storage } from "@plannotator/ui/utils/storage";
+import { configStore } from "@plannotator/ui/config";
 import { CompletionOverlay } from "@plannotator/ui/components/CompletionOverlay";
 import { UpdateBanner } from "@plannotator/ui/components/UpdateBanner";
 import {
@@ -83,10 +84,17 @@ import {
 import { useLinkedDoc } from "@plannotator/ui/hooks/useLinkedDoc";
 import { useVaultBrowser } from "@plannotator/ui/hooks/useVaultBrowser";
 import { useAnnotationDraft } from "@plannotator/ui/hooks/useAnnotationDraft";
+import { useArchive } from "@plannotator/ui/hooks/useArchive";
 import { useEditorAnnotations } from "@plannotator/ui/hooks/useEditorAnnotations";
+import { useFileBrowser } from "@plannotator/ui/hooks/useFileBrowser";
 import { isVaultBrowserEnabled } from "@plannotator/ui/utils/obsidian";
+import {
+  isFileBrowserEnabled,
+  getFileBrowserSettings,
+} from "@plannotator/ui/utils/fileBrowser";
 import { SidebarTabs } from "@plannotator/ui/components/sidebar/SidebarTabs";
 import { SidebarContainer } from "@plannotator/ui/components/sidebar/SidebarContainer";
+import type { ArchivedPlan } from "@plannotator/ui/components/sidebar/ArchiveBrowser";
 import { PlanDiffViewer } from "@plannotator/ui/components/plan-diff/PlanDiffViewer";
 import type { PlanDiffMode } from "@plannotator/ui/components/plan-diff/PlanDiffModeSwitcher";
 import { DEMO_PLAN_CONTENT } from "./demoPlan";
@@ -126,12 +134,14 @@ const App: React.FC = () => {
   const [origin, setOrigin] = useState<
     "claude-code" | "opencode" | "pi" | "codex" | null
   >(null);
+  const [gitUser, setGitUser] = useState<string | undefined>();
+  const [isWSL, setIsWSL] = useState(false);
   const [globalAttachments, setGlobalAttachments] = useState<ImageAttachment[]>(
     [],
   );
   const [annotateMode, setAnnotateMode] = useState(false);
   const [annotateSource, setAnnotateSource] = useState<
-    "file" | "message" | null
+    "file" | "message" | "folder" | null
   >(null);
   const [imageBaseDir, setImageBaseDir] = useState<string | undefined>(
     undefined,
@@ -158,12 +168,15 @@ const App: React.FC = () => {
     display: string;
     branch?: string;
   } | null>(null);
+  const [projectRoot, setProjectRoot] = useState<string | null>(null);
+  const [afkTimeout, setAfkTimeout] = useState(10);
 
   useEffect(() => {
     document.title = repoInfo
       ? `${repoInfo.display} · Plannotator`
       : "Plannotator";
   }, [repoInfo]);
+
   const [showExportDropdown, setShowExportDropdown] = useState(false);
   const [initialExportTab, setInitialExportTab] = useState<
     "share" | "annotations" | "notes"
@@ -250,6 +263,17 @@ const App: React.FC = () => {
     sidebar,
   });
 
+  // Archive browser
+  const archive = useArchive({
+    markdown,
+    viewerRef,
+    linkedDocHook,
+    setMarkdown,
+    setAnnotations,
+    setSelectedAnnotationId,
+    setSubmitted,
+  });
+
   // Obsidian vault browser
   const vaultBrowser = useVaultBrowser();
 
@@ -293,11 +317,68 @@ const App: React.FC = () => {
     [vaultPath, linkedDocHook, vaultBrowser, buildVaultDocUrl],
   );
 
-  // Route linked doc opens through vault endpoint when viewing a vault file
+  // Markdown file browser
+  const fileBrowser = useFileBrowser();
+  const showFilesTab = useMemo(
+    () => !!projectRoot || isFileBrowserEnabled(),
+    [projectRoot, uiPrefs],
+  );
+  const fileBrowserDirs = useMemo(() => {
+    const projectDirs = projectRoot ? [projectRoot] : [];
+    const userDirs = isFileBrowserEnabled()
+      ? getFileBrowserSettings().directories
+      : [];
+    return [...new Set([...projectDirs, ...userDirs])];
+  }, [projectRoot, uiPrefs]);
+
+  // Clear active file when file browser is disabled
+  useEffect(() => {
+    if (!showFilesTab) fileBrowser.setActiveFile(null);
+  }, [showFilesTab]);
+
+  useEffect(() => {
+    if (
+      sidebar.activeTab === "files" &&
+      showFilesTab &&
+      fileBrowserDirs.length > 0
+    ) {
+      const loadedPaths = fileBrowser.dirs.map((d) => d.path);
+      const needsFetch =
+        fileBrowserDirs.length !== loadedPaths.length ||
+        fileBrowserDirs.some((d) => !loadedPaths.includes(d));
+      if (needsFetch) {
+        fileBrowser.fetchAll(fileBrowserDirs);
+      }
+    }
+  }, [sidebar.activeTab, showFilesTab, fileBrowserDirs]);
+
+  // File browser file selection: open via linked doc system
+  const handleFileBrowserSelect = React.useCallback(
+    (absolutePath: string, dirPath: string) => {
+      const buildUrl = (path: string) =>
+        `/api/doc?path=${encodeURIComponent(path)}&base=${encodeURIComponent(dirPath)}`;
+      linkedDocHook.open(absolutePath, buildUrl, "files");
+      fileBrowser.setActiveFile(absolutePath);
+      vaultBrowser.setActiveFile(null);
+    },
+    [linkedDocHook, fileBrowser],
+  );
+
+  // Route linked doc opens through vault/file browser endpoint when viewing one of those files
   const handleOpenLinkedDoc = React.useCallback(
     (docPath: string) => {
       if (vaultBrowser.activeFile && vaultPath) {
         linkedDocHook.open(docPath, buildVaultDocUrl(vaultPath));
+      } else if (fileBrowser.activeFile && fileBrowser.activeDirPath) {
+        // When viewing a file browser doc, resolve links relative to current file's directory
+        const baseDir =
+          linkedDocHook.filepath?.replace(/\/[^/]+$/, "") ||
+          fileBrowser.activeDirPath;
+        linkedDocHook.open(
+          docPath,
+          (path) =>
+            `/api/doc?path=${encodeURIComponent(path)}&base=${encodeURIComponent(baseDir)}`,
+        );
       } else {
         // Pass the current file's directory as base for relative path resolution
         const baseDir = linkedDocHook.filepath
@@ -317,17 +398,21 @@ const App: React.FC = () => {
     [
       vaultBrowser.activeFile,
       vaultPath,
+      fileBrowser.activeFile,
+      fileBrowser.activeDirPath,
       linkedDocHook,
       buildVaultDocUrl,
       imageBaseDir,
     ],
   );
 
-  // Wrap linked doc back to also clear vault active file
+  // Wrap linked doc back to also clear vault/file browser active file
   const handleLinkedDocBack = React.useCallback(() => {
     linkedDocHook.back();
     vaultBrowser.setActiveFile(null);
-  }, [linkedDocHook, vaultBrowser]);
+    fileBrowser.setActiveFile(null);
+    archive.clearSelection();
+  }, [linkedDocHook, vaultBrowser, fileBrowser, archive]);
 
   const handleVaultFetchTree = React.useCallback(() => {
     vaultBrowser.fetchTree(vaultPath);
@@ -453,7 +538,7 @@ const App: React.FC = () => {
         (data: {
           plan: string;
           origin?: "claude-code" | "opencode" | "pi" | "codex";
-          mode?: "annotate" | "annotate-last";
+          mode?: "annotate" | "annotate-last" | "annotate-folder" | "archive";
           filePath?: string;
           sharingEnabled?: boolean;
           shareBaseUrl?: string;
@@ -465,21 +550,55 @@ const App: React.FC = () => {
             totalVersions: number;
             project: string;
           };
+          archivePlans?: ArchivedPlan[];
+          projectRoot?: string;
+          isWSL?: boolean;
           afkSeconds?: number;
+          serverConfig?: { displayName?: string; gitUser?: string };
         }) => {
-          if (data.afkSeconds !== undefined) setAfkTimeout(data.afkSeconds);
-          if (data.plan) setMarkdown(data.plan);
+          // Initialize config store with server-provided values (config file > cookie > default)
+          configStore.init(data.serverConfig);
+          // gitUser drives the "Use git name" button in Settings; stays undefined (button hidden) when unavailable
+          setGitUser(data.serverConfig?.gitUser);
+          if (data.mode === "archive") {
+            // Archive mode: show first archived plan or clear demo content
+            setMarkdown(data.plan || "");
+            if (data.archivePlans) archive.init(data.archivePlans);
+            archive.fetchPlans();
+            setSharingEnabled(false);
+            sidebar.open("archive");
+          } else if (data.mode === "annotate-folder") {
+            // Folder annotation mode: clear demo content, let user pick a file
+            setMarkdown("");
+          } else if (data.plan) {
+            setMarkdown(data.plan);
+          }
           setIsApiMode(true);
-          if (data.mode === "annotate" || data.mode === "annotate-last") {
+          if (
+            data.mode === "annotate" ||
+            data.mode === "annotate-last" ||
+            data.mode === "annotate-folder"
+          ) {
             setAnnotateMode(true);
           }
-          if (data.mode) {
+          if (data.mode === "annotate-folder") {
+            sidebar.open("files");
+          }
+          if (data.mode && data.mode !== "archive") {
             setAnnotateSource(
-              data.mode === "annotate-last" ? "message" : "file",
+              data.mode === "annotate-last"
+                ? "message"
+                : data.mode === "annotate-folder"
+                  ? "folder"
+                  : "file",
             );
           }
           if (data.filePath) {
-            setImageBaseDir(data.filePath.replace(/\/[^/]+$/, ""));
+            setImageBaseDir(
+              data.mode === "annotate-folder"
+                ? data.filePath
+                : data.filePath.replace(/\/[^/]+$/, ""),
+            );
           }
           if (data.sharingEnabled !== undefined) {
             setSharingEnabled(data.sharingEnabled);
@@ -492,6 +611,12 @@ const App: React.FC = () => {
           }
           if (data.repoInfo) {
             setRepoInfo(data.repoInfo);
+          }
+          if (data.afkSeconds !== undefined) {
+            setAfkTimeout(data.afkSeconds);
+          }
+          if (data.projectRoot) {
+            setProjectRoot(data.projectRoot);
           }
           // Capture plan version history data
           if (data.previousPlan !== undefined) {
@@ -508,6 +633,9 @@ const App: React.FC = () => {
             }
             // Load saved permission mode preference
             setPermissionMode(getPermissionModeSettings().mode);
+          }
+          if (data.isWSL) {
+            setIsWSL(true);
           }
         },
       )
@@ -536,7 +664,14 @@ const App: React.FC = () => {
   }, [markdown]);
 
   useEffect(() => {
-    if (!isApiMode || !markdown || isSharedSession || annotateMode) return;
+    if (
+      !isApiMode ||
+      !markdown ||
+      isSharedSession ||
+      annotateMode ||
+      archive.archiveMode
+    )
+      return;
     if (autoSaveAttempted.current) return;
 
     const body: { obsidian?: object; bear?: object; octarine?: object } = {};
@@ -709,6 +844,7 @@ const App: React.FC = () => {
           ? await autoSavePromiseRef.current
           : autoSaveResultsRef.current;
 
+      // Build request body - include integrations if enabled
       const body: {
         obsidian?: object;
         bear?: object;
@@ -720,7 +856,9 @@ const App: React.FC = () => {
         saveOnly?: boolean;
       } = {};
 
-      if (opts?.saveOnly) body.saveOnly = true;
+      if (opts?.saveOnly) {
+        body.saveOnly = true;
+      }
 
       // Include permission mode for Claude Code
       if (origin === "claude-code") {
@@ -876,18 +1014,22 @@ const App: React.FC = () => {
 
       e.preventDefault();
 
-      // Annotate mode: always send feedback
+      // Annotate mode: always send feedback (empty = "no feedback" message)
       if (annotateMode) {
-        if (annotations.length === 0) {
-          setShowFeedbackPrompt(true);
-        } else {
-          handleAnnotateFeedback();
-        }
+        handleAnnotateFeedback();
         return;
       }
 
       // No annotations → Approve, otherwise → Send Feedback
-      if (annotations.length === 0 && editorAnnotations.length === 0) {
+      const docAnnotations = linkedDocHook.getDocAnnotations();
+      const hasDocAnnotations = Array.from(docAnnotations.values()).some(
+        (d) => d.annotations.length > 0 || d.globalAttachments.length > 0,
+      );
+      if (
+        annotations.length === 0 &&
+        editorAnnotations.length === 0 &&
+        !hasDocAnnotations
+      ) {
         // Check if agent exists for OpenCode users
         if (origin === "opencode") {
           const warning = getAgentWarning();
@@ -978,7 +1120,7 @@ const App: React.FC = () => {
     const hasEditorAnnotations = editorAnnotations.length > 0;
 
     if (!hasPlanAnnotations && !hasDocAnnotations && !hasEditorAnnotations) {
-      return "No changes detected.";
+      return "User reviewed the document and has no feedback.";
     }
 
     let output = hasPlanAnnotations
@@ -988,9 +1130,11 @@ const App: React.FC = () => {
           globalAttachments,
           annotateSource === "message"
             ? "Message Feedback"
-            : annotateSource === "file"
-              ? "File Feedback"
-              : "Plan Feedback",
+            : annotateSource === "folder"
+              ? "Folder Feedback"
+              : annotateSource === "file"
+                ? "File Feedback"
+                : "Plan Feedback",
           annotateSource ?? "plan",
         )
       : "";
@@ -1166,7 +1310,23 @@ const App: React.FC = () => {
       document.removeEventListener("pointerdown", handleClickOutside);
   }, [showExportDropdown]);
 
-  const [afkTimeout, setAfkTimeout] = useState(10);
+  const agentName = useMemo(() => {
+    if (origin === "opencode") return "OpenCode";
+    if (origin === "claude-code") return "Claude Code";
+    if (origin === "pi") return "Pi";
+    if (origin === "codex") return "Codex";
+    return "Coding Agent";
+  }, [origin]);
+
+  const planMaxWidth = useMemo(() => {
+    const widths: Record<PlanWidth, number> = {
+      compact: 832,
+      default: 1040,
+      wide: 1280,
+    };
+    return widths[uiPrefs.planWidth] ?? 832;
+  }, [uiPrefs.planWidth]);
+
   const afkActive =
     isApiMode &&
     afkTimeout > 0 &&
@@ -1184,16 +1344,14 @@ const App: React.FC = () => {
 
   const afkSummary = useMemo(() => {
     if (!markdown) return undefined;
-    const lines = markdown.split("\n").filter((l) => l.trim());
+    const lines = markdown.split("\n").filter((line) => line.trim());
     return lines.slice(0, 5).join("\n");
   }, [markdown]);
 
-  // Show popup as soon as API mode activates
   useEffect(() => {
     if (afkActive && !afkDismissed.current) setShowAfk(true);
   }, [afkActive]);
 
-  // Countdown + auto-approve
   useEffect(() => {
     if (!showAfk) return;
     if (afkRemaining <= 0) {
@@ -1201,26 +1359,12 @@ const App: React.FC = () => {
       handleApprove();
       return;
     }
-    const id = setTimeout(() => setAfkRemaining((r) => r - 1), 1000);
+    const id = setTimeout(
+      () => setAfkRemaining((remaining) => remaining - 1),
+      1000,
+    );
     return () => clearTimeout(id);
   }, [showAfk, afkRemaining]);
-
-  const agentName = useMemo(() => {
-    if (origin === "opencode") return "OpenCode";
-    if (origin === "claude-code") return "Claude Code";
-    if (origin === "pi") return "Pi";
-    if (origin === "codex") return "Codex";
-    return "Coding Agent";
-  }, [origin]);
-
-  const planMaxWidth = useMemo(() => {
-    const widths: Record<PlanWidth, number> = {
-      compact: 832,
-      default: 1040,
-      wide: 1280,
-    };
-    return widths[uiPrefs.planWidth] ?? 832;
-  }, [uiPrefs.planWidth]);
 
   return (
     <ThemeProvider defaultTheme="dark">
@@ -1265,17 +1409,60 @@ const App: React.FC = () => {
           </div>
 
           <div className="flex items-center gap-1 md:gap-2">
-            {isApiMode && !linkedDocHook.isActive && (
+            {isApiMode && !linkedDocHook.isActive && archive.archiveMode && (
+              <>
+                <button
+                  onClick={archive.copy}
+                  className="px-2.5 py-1 rounded-md text-xs font-medium transition-all bg-muted text-foreground hover:bg-muted/80 border border-border"
+                  title="Copy plan content"
+                >
+                  <span className="hidden md:inline">Copy</span>
+                  <svg
+                    className="w-4 h-4 md:hidden"
+                    fill="none"
+                    viewBox="0 0 24 24"
+                    stroke="currentColor"
+                    strokeWidth={2}
+                  >
+                    <path
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"
+                    />
+                  </svg>
+                </button>
+                <button
+                  onClick={archive.done}
+                  className="px-2.5 py-1 rounded-md text-xs font-medium transition-all bg-success text-success-foreground hover:opacity-90"
+                  title="Close archive"
+                >
+                  Done
+                </button>
+              </>
+            )}
+
+            {isApiMode && !linkedDocHook.isActive && !archive.archiveMode && (
               <>
                 <button
                   onClick={() => {
+                    if (annotateMode) {
+                      handleAnnotateFeedback();
+                      return;
+                    }
+                    const docAnnotations = linkedDocHook.getDocAnnotations();
+                    const hasDocAnnotations = Array.from(
+                      docAnnotations.values(),
+                    ).some(
+                      (d) =>
+                        d.annotations.length > 0 ||
+                        d.globalAttachments.length > 0,
+                    );
                     if (
                       annotations.length === 0 &&
-                      editorAnnotations.length === 0
+                      editorAnnotations.length === 0 &&
+                      !hasDocAnnotations
                     ) {
                       setShowFeedbackPrompt(true);
-                    } else if (annotateMode) {
-                      handleAnnotateFeedback();
                     } else {
                       handleDeny();
                     }
@@ -1286,7 +1473,15 @@ const App: React.FC = () => {
                       ? "opacity-50 cursor-not-allowed bg-muted text-muted-foreground"
                       : "bg-accent/15 text-accent hover:bg-accent/25 border border-accent/30"
                   }`}
-                  title="Send Feedback"
+                  title={
+                    annotateMode
+                      ? annotations.length > 0 ||
+                        editorAnnotations.length > 0 ||
+                        linkedDocHook.docAnnotationCount > 0
+                        ? "Send Annotations"
+                        : "Done"
+                      : "Send Feedback"
+                  }
                 >
                   <svg
                     className="w-4 h-4 md:hidden"
@@ -1305,7 +1500,11 @@ const App: React.FC = () => {
                     {isSubmitting
                       ? "Sending..."
                       : annotateMode
-                        ? "Send Annotations"
+                        ? annotations.length > 0 ||
+                          editorAnnotations.length > 0 ||
+                          linkedDocHook.docAnnotationCount > 0
+                          ? "Send Annotations"
+                          : "Done"
                         : "Send Feedback"}
                   </span>
                 </button>
@@ -1393,6 +1592,7 @@ const App: React.FC = () => {
                   onUIPreferencesChange={setUiPrefs}
                   externalOpen={mobileSettingsOpen}
                   onExternalClose={() => setMobileSettingsOpen(false)}
+                  gitUser={gitUser}
                   project={repoInfo?.display}
                 />
               )}
@@ -1671,6 +1871,7 @@ const App: React.FC = () => {
               activeTab={sidebar.activeTab}
               onToggleTab={sidebar.toggleTab}
               hasDiff={planDiff.hasPreviousVersion}
+              showFilesTab={showFilesTab && !archive.archiveMode}
               showVaultTab={showVaultTab}
               className="hidden lg:flex"
             />
@@ -1681,7 +1882,11 @@ const App: React.FC = () => {
             <>
               <SidebarContainer
                 activeTab={sidebar.activeTab}
-                onTabChange={sidebar.toggleTab}
+                onTabChange={(tab) => {
+                  sidebar.toggleTab(tab);
+                  if (tab === "archive" && !archive.archiveMode)
+                    archive.fetchPlans();
+                }}
                 onClose={sidebar.close}
                 width={tocResize.width}
                 blocks={blocks}
@@ -1692,14 +1897,17 @@ const App: React.FC = () => {
                 onLinkedDocBack={
                   linkedDocHook.isActive ? handleLinkedDocBack : undefined
                 }
-                showVaultTab={showVaultTab}
+                showFilesTab={showFilesTab && !archive.archiveMode}
+                fileBrowser={fileBrowser}
+                onFilesSelectFile={handleFileBrowserSelect}
+                onFilesFetchAll={() => fileBrowser.fetchAll(fileBrowserDirs)}
+                showVaultTab={showVaultTab && !archive.archiveMode}
                 vaultPath={vaultPath}
                 vaultBrowser={vaultBrowser}
                 onVaultSelectFile={handleVaultFileSelect}
                 onVaultFetchTree={handleVaultFetchTree}
                 versionInfo={versionInfo}
                 versions={planDiff.versions}
-                projectPlans={planDiff.projectPlans}
                 selectedBaseVersion={planDiff.diffBaseVersion}
                 onSelectBaseVersion={planDiff.selectBaseVersion}
                 isPlanDiffActive={isPlanDiffActive}
@@ -1709,7 +1917,11 @@ const App: React.FC = () => {
                 isSelectingVersion={planDiff.isSelectingVersion}
                 fetchingVersion={planDiff.fetchingVersion}
                 onFetchVersions={planDiff.fetchVersions}
-                onFetchProjectPlans={planDiff.fetchProjectPlans}
+                showArchiveTab={isApiMode && !annotateMode}
+                archivePlans={archive.plans}
+                selectedArchiveFile={archive.selectedFile}
+                onArchiveSelect={archive.select}
+                isLoadingArchive={archive.isLoading}
               />
               <ResizeHandle
                 {...tocResize.handleProps}
@@ -1739,8 +1951,8 @@ const App: React.FC = () => {
               showCancel
             />
             <div className="min-h-full flex flex-col items-center px-2 py-3 md:px-10 md:py-8 xl:px-16 relative z-10">
-              {/* Annotation Toolstrip (hidden during plan diff) */}
-              {!isPlanDiffActive && (
+              {/* Annotation Toolstrip (hidden during plan diff and archive mode) */}
+              {!isPlanDiffActive && !archive.archiveMode && (
                 <div
                   className="w-full mb-3 md:mb-4 flex items-center justify-start"
                   style={{ maxWidth: planMaxWidth }}
@@ -1783,12 +1995,30 @@ const App: React.FC = () => {
                   />
                 </div>
               )}
+              {/* Folder annotation empty state — shown before user picks a file */}
+              {annotateSource === "folder" &&
+                !markdown &&
+                !linkedDocHook.isActive && (
+                  <div className="w-full flex justify-center">
+                    <div className="w-full max-w-3xl p-12 text-center text-muted-foreground">
+                      <p className="text-lg font-medium mb-2">
+                        Select a file to annotate
+                      </p>
+                      <p className="text-sm">
+                        Pick a markdown file from the sidebar to begin.
+                      </p>
+                    </div>
+                  </div>
+                )}
               {/* Normal Plan View — always mounted, hidden during diff mode */}
               <div
                 className="w-full flex justify-center"
                 style={{
                   display:
-                    isPlanDiffActive && planDiff.diffBlocks
+                    (isPlanDiffActive && planDiff.diffBlocks) ||
+                    (annotateSource === "folder" &&
+                      !markdown &&
+                      !linkedDocHook.isActive)
                       ? "none"
                       : undefined,
                 }}
@@ -1837,7 +2067,9 @@ const App: React.FC = () => {
                           onBack: handleLinkedDocBack,
                           label: vaultBrowser.activeFile
                             ? "Vault File"
-                            : undefined,
+                            : fileBrowser.activeFile
+                              ? "File"
+                              : undefined,
                         }
                       : null
                   }
@@ -1845,10 +2077,11 @@ const App: React.FC = () => {
                   copyLabel={
                     annotateSource === "message"
                       ? "Copy message"
-                      : annotateSource === "file"
+                      : annotateSource === "file" || annotateSource === "folder"
                         ? "Copy file"
                         : undefined
                   }
+                  archiveInfo={archive.currentInfo}
                 />
               </div>
             </div>
@@ -1995,7 +2228,6 @@ const App: React.FC = () => {
           showCancel
         />
 
-        {/* AFK auto-approve popup */}
         <AfkPopup
           isOpen={showAfk}
           remaining={afkRemaining}
@@ -2034,24 +2266,28 @@ const App: React.FC = () => {
         <CompletionOverlay
           submitted={submitted}
           title={
-            submitted === "approved"
-              ? "Plan Approved"
-              : annotateMode
-                ? "Annotations Sent"
-                : "Feedback Sent"
+            archive.archiveMode
+              ? "Archive Closed"
+              : submitted === "approved"
+                ? "Plan Approved"
+                : annotateMode
+                  ? "Annotations Sent"
+                  : "Feedback Sent"
           }
           subtitle={
-            submitted === "approved"
-              ? `${agentName} will proceed with the implementation.`
-              : annotateMode
-                ? `${agentName} will address your annotations on the ${annotateSource === "message" ? "message" : "file"}.`
-                : `${agentName} will revise the plan based on your annotations.`
+            archive.archiveMode
+              ? "You can reopen with plannotator archive."
+              : submitted === "approved"
+                ? `${agentName} will proceed with the implementation.`
+                : annotateMode
+                  ? `${agentName} will address your annotations on the ${annotateSource === "message" ? "message" : annotateSource === "folder" ? "files" : "file"}.`
+                  : `${agentName} will revise the plan based on your annotations.`
           }
           agentLabel={agentName}
         />
 
         {/* Update notification */}
-        <UpdateBanner origin={origin} />
+        <UpdateBanner origin={origin} isWSL={isWSL} />
 
         {/* Image Annotator for pasted images */}
         <ImageAnnotator

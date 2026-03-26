@@ -4,14 +4,7 @@ import type { DiffOption, WorktreeInfo } from '@plannotator/shared/types';
 import { buildFileTree, getAncestorPaths, getAllFolderPaths } from '../utils/buildFileTree';
 import { FileTreeNodeItem } from './FileTreeNode';
 import { getReviewSearchSideLabel, type ReviewSearchFileGroup, type ReviewSearchMatch } from '../utils/reviewSearch';
-
-interface DiffFile {
-  path: string;
-  oldPath?: string;
-  patch: string;
-  additions: number;
-  deletions: number;
-}
+import type { DiffFile } from '../types';
 
 interface FileTreeProps {
   files: DiffFile[];
@@ -187,24 +180,26 @@ export const FileTree: React.FC<FileTreeProps> = ({
                 }
               }}
               placeholder="Search diff..."
-              className="w-full pl-7 pr-7 py-1.5 bg-muted rounded-md text-xs text-foreground placeholder:text-muted-foreground/50 focus:outline-none focus:ring-1 focus:ring-primary/50"
+              className={`w-full pl-7 py-1.5 bg-muted rounded-md text-xs text-foreground placeholder:text-muted-foreground/50 focus:outline-none focus:ring-1 focus:ring-primary/50 ${searchQuery ? 'pr-14' : 'pr-7'}`}
             />
             {searchQuery && (
-              <button
-                onClick={onSearchClear}
-                className="absolute right-2 top-1/2 -translate-y-1/2 p-0.5 rounded hover:bg-background/50 text-muted-foreground hover:text-foreground transition-colors"
-              >
-                <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                  <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
-                </svg>
-              </button>
+              <div className="absolute right-2 top-1/2 -translate-y-1/2 flex items-center gap-1">
+                {searchQuery.trim() && (
+                  <span className="text-[10px] text-muted-foreground/40 tabular-nums">
+                    {searchMatches.length}
+                  </span>
+                )}
+                <button
+                  onClick={onSearchClear}
+                  className="p-0.5 rounded hover:bg-background/50 text-muted-foreground hover:text-foreground transition-colors"
+                >
+                  <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+                  </svg>
+                </button>
+              </div>
             )}
           </div>
-          {searchQuery.trim() && (
-            <div className="mt-1 text-[10px] text-muted-foreground/60 px-0.5">
-              {searchMatches.length} result{searchMatches.length !== 1 ? 's' : ''}
-            </div>
-          )}
         </div>
       )}
 
@@ -226,6 +221,26 @@ export const FileTree: React.FC<FileTreeProps> = ({
             <span className="text-xs text-muted-foreground">
               {viewedFiles.size}/{files.length}
             </span>
+            <button
+              onClick={() => setExpandedFolders(new Set(getAllFolderPaths(tree)))}
+              className="p-1 rounded transition-colors hover:bg-muted text-muted-foreground"
+              title="Expand all folders"
+            >
+              <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M5 8l7-6 7 6" />
+                <path strokeLinecap="round" strokeLinejoin="round" d="M5 16l7 6 7-6" />
+              </svg>
+            </button>
+            <button
+              onClick={() => setExpandedFolders(new Set())}
+              className="p-1 rounded transition-colors hover:bg-muted text-muted-foreground"
+              title="Collapse all folders"
+            >
+              <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M5 2l7 6 7-6" />
+                <path strokeLinecap="round" strokeLinejoin="round" d="M5 22l7-6 7 6" />
+              </svg>
+            </button>
             {onToggleHideViewed && (
               <button
                 onClick={onToggleHideViewed}

@@ -1,7 +1,12 @@
 import React, { useState, useEffect, useMemo } from "react";
 import { createPortal } from "react-dom";
 import { TaterSpritePullup } from "./TaterSpritePullup";
-import { getIdentity, regenerateIdentity } from "../utils/identity";
+import {
+  getIdentity,
+  regenerateIdentity,
+  setCustomIdentity,
+} from "../utils/identity";
+import { GitUser } from "../icons/GitUser";
 import {
   getObsidianSettings,
   saveObsidianSettings,
@@ -69,6 +74,14 @@ import {
 } from "../utils/quickLabels";
 import { hasNewSettings, markNewSettingsSeen } from "../utils/newSettingsHint";
 import { ThemeTab } from "./ThemeTab";
+import { isMac, modKey, altKey } from "../utils/platform";
+import { getAIProviderSettings } from "../utils/aiProvider";
+import { AISettingsTab } from "./AISettingsTab";
+import {
+  getFileBrowserSettings,
+  saveFileBrowserSettings,
+  type FileBrowserSettings,
+} from "../utils/fileBrowser";
 
 type SettingsTab =
   | "general"
@@ -77,6 +90,8 @@ type SettingsTab =
   | "saving"
   | "labels"
   | "shortcuts"
+  | "ai"
+  | "files"
   | "obsidian"
   | "bear"
   | "octarine";
@@ -89,8 +104,17 @@ interface SettingsProps {
   /** Mode determines which settings are shown. 'plan' shows all, 'review' shows only identity + agent switching */
   mode?: "plan" | "review";
   onUIPreferencesChange?: (prefs: UIPreferences) => void;
+  /** Externally controlled open state (for mobile menu integration) */
   externalOpen?: boolean;
   onExternalClose?: () => void;
+  /** Available AI providers (from /api/ai/capabilities). */
+  aiProviders?: Array<{
+    id: string;
+    name: string;
+    capabilities: Record<string, boolean>;
+  }>;
+  /** Git user name from `git config user.name`, for quick identity set */
+  gitUser?: string;
   project?: string;
 }
 
@@ -103,6 +127,8 @@ export const Settings: React.FC<SettingsProps> = ({
   onUIPreferencesChange,
   externalOpen,
   onExternalClose,
+  aiProviders = [],
+  gitUser,
   project,
 }) => {
   const [showDialog, setShowDialog] = useState(false);
@@ -149,6 +175,10 @@ export const Settings: React.FC<SettingsProps> = ({
   const [editingTipIndex, setEditingTipIndex] = useState<number | null>(null);
   const [editingTipValue, setEditingTipValue] = useState("");
   const [showNewHints, setShowNewHints] = useState(() => hasNewSettings());
+  const [aiProvider, setAiProvider] = useState<string | null>(null);
+  const [fileBrowserSettings, setFileBrowserSettings] =
+    useState<FileBrowserSettings>({ enabled: false, directories: [] });
+  const [newDirPath, setNewDirPath] = useState("");
 
   // Fetch available agents for OpenCode
   const {
@@ -167,18 +197,23 @@ export const Settings: React.FC<SettingsProps> = ({
       t.push({ id: "saving", label: "Saving" });
       t.push({ id: "labels", label: "Labels" });
     }
+    if (mode === "review" && aiProviders.length > 0) {
+      t.push({ id: "ai", label: "AI" });
+    }
     t.push({ id: "shortcuts", label: "Shortcuts" });
     return t;
-  }, [mode]);
+  }, [mode, aiProviders.length]);
 
-  const integrationTabs: { id: SettingsTab; label: string }[] =
-    mode === "plan"
+  const integrationTabs: { id: SettingsTab; label: string }[] = [
+    { id: "files", label: "Files" },
+    ...(mode === "plan"
       ? [
-          { id: "obsidian", label: "Obsidian" },
-          { id: "bear", label: "Bear" },
-          { id: "octarine", label: "Octarine" },
+          { id: "obsidian" as SettingsTab, label: "Obsidian" },
+          { id: "bear" as SettingsTab, label: "Bear" },
+          { id: "octarine" as SettingsTab, label: "Octarine" },
         ]
-      : [];
+      : []),
+  ];
   const obsidianDefaultSaveAvailable =
     obsidian.enabled && getEffectiveVaultPath(obsidian).trim().length > 0;
   const bearDefaultSaveAvailable = bear.enabled;
@@ -207,6 +242,8 @@ export const Settings: React.FC<SettingsProps> = ({
       setAutoCloseDelayState(getAutoCloseDelay());
       setDefaultNotesApp(getDefaultNotesApp());
       setQuickLabelsState(getQuickLabels());
+      setAiProvider(getAIProviderSettings().providerId);
+      setFileBrowserSettings(getFileBrowserSettings());
 
       // Validate agent setting when dialog opens
       if (origin === "opencode") {
@@ -254,6 +291,23 @@ export const Settings: React.FC<SettingsProps> = ({
         .finally(() => setVaultsLoading(false));
     }
   }, [obsidian.enabled]);
+
+  const handleFileBrowserChange = (updates: Partial<FileBrowserSettings>) => {
+    const newSettings = { ...fileBrowserSettings, ...updates };
+    setFileBrowserSettings(newSettings);
+    saveFileBrowserSettings(newSettings);
+    if (onUIPreferencesChange) onUIPreferencesChange({ ...uiPrefs });
+  };
+
+  const addDirectory = () => {
+    const trimmed = newDirPath.trim();
+    if (trimmed && !fileBrowserSettings.directories.includes(trimmed)) {
+      handleFileBrowserChange({
+        directories: [...fileBrowserSettings.directories, trimmed],
+      });
+    }
+    setNewDirPath("");
+  };
 
   const handleObsidianChange = (updates: Partial<ObsidianSettings>) => {
     const newSettings = { ...obsidian, ...updates };
@@ -308,11 +362,27 @@ export const Settings: React.FC<SettingsProps> = ({
     saveDefaultNotesApp(app);
   };
 
+  // Server write-back is handled automatically by configStore.set() (debounced POST /api/config)
+
   const handleRegenerateIdentity = () => {
     const oldIdentity = identity;
     const newIdentity = regenerateIdentity();
     setIdentity(newIdentity);
     onIdentityChange?.(oldIdentity, newIdentity);
+  };
+
+  const handleIdentitySave = (newName: string) => {
+    const trimmed = newName.trim();
+    if (!trimmed || trimmed === identity) return;
+    const oldIdentity = identity;
+    const saved = setCustomIdentity(trimmed);
+    setIdentity(saved);
+    onIdentityChange?.(oldIdentity, saved);
+  };
+
+  const handleUseGitName = () => {
+    if (!gitUser) return;
+    handleIdentitySave(gitUser);
   };
 
   return (
@@ -355,7 +425,7 @@ export const Settings: React.FC<SettingsProps> = ({
             onClick={() => setShowDialog(false)}
           >
             <div
-              className="bg-card border border-border rounded-xl w-full max-w-2xl shadow-2xl relative"
+              className="bg-card border border-border rounded-xl w-full max-w-2xl max-h-[85vh] flex flex-col shadow-2xl relative overflow-hidden"
               onClick={(e) => e.stopPropagation()}
             >
               {taterMode && <TaterSpritePullup />}
@@ -381,7 +451,7 @@ export const Settings: React.FC<SettingsProps> = ({
                 </button>
               </div>
 
-              <div className="flex flex-col md:flex-row md:min-h-[420px]">
+              <div className="flex flex-col md:flex-row md:min-h-[420px] flex-1 min-h-0 overflow-hidden">
                 {/* Mobile: horizontal tab bar */}
                 <nav className="md:hidden flex overflow-x-auto border-b border-border px-2 py-1.5 gap-1 flex-shrink-0">
                   {[...mainTabs, ...integrationTabs].map((tab) => (
@@ -454,7 +524,7 @@ export const Settings: React.FC<SettingsProps> = ({
                 </nav>
 
                 {/* Content — scrollable */}
-                <div className="flex-1 p-4 space-y-4 overflow-y-auto max-h-[85vh]">
+                <div className="flex-1 p-4 space-y-4 overflow-y-auto min-h-0">
                   {/* === GENERAL TAB === */}
                   {activeTab === "general" && (
                     <>
@@ -465,13 +535,37 @@ export const Settings: React.FC<SettingsProps> = ({
                           Used when sharing annotations with others
                         </div>
                         <div className="flex items-center gap-2">
-                          <div className="flex-1 px-3 py-2 bg-muted rounded-lg text-xs font-mono truncate">
-                            {identity}
-                          </div>
+                          <input
+                            key={identity}
+                            type="text"
+                            defaultValue={identity}
+                            onBlur={(e) => handleIdentitySave(e.target.value)}
+                            onKeyDown={(e) => {
+                              if (e.key === "Enter") {
+                                handleIdentitySave(
+                                  (e.target as HTMLInputElement).value,
+                                );
+                                (e.target as HTMLInputElement).blur();
+                              }
+                            }}
+                            className="flex-1 px-3 py-2 bg-muted rounded-lg text-xs font-mono truncate border border-transparent focus:border-primary/50 focus:outline-none transition-colors"
+                            placeholder="Enter your name..."
+                          />
+                          {gitUser && (
+                            <button
+                              onClick={handleUseGitName}
+                              onMouseDown={(e) => e.preventDefault()}
+                              className="p-2 rounded-lg bg-muted hover:bg-muted/80 text-muted-foreground hover:text-foreground transition-colors"
+                              title={`Use git identity: ${gitUser}`}
+                            >
+                              <GitUser className="w-5 h-5" />
+                            </button>
+                          )}
                           <button
                             onClick={handleRegenerateIdentity}
+                            onMouseDown={(e) => e.preventDefault()}
                             className="p-2 rounded-lg bg-muted hover:bg-muted/80 text-muted-foreground hover:text-foreground transition-colors"
-                            title="Regenerate identity"
+                            title="Regenerate random identity"
                           >
                             <svg
                               className="w-4 h-4"
@@ -971,11 +1065,7 @@ export const Settings: React.FC<SettingsProps> = ({
                             Default Save Action
                           </div>
                           <div className="text-xs text-muted-foreground">
-                            Used for keyboard shortcut (
-                            {navigator.platform?.includes("Mac")
-                              ? "Cmd"
-                              : "Ctrl"}
-                            +S)
+                            Used for keyboard shortcut ({modKey}+S)
                           </div>
                         </div>
                         <select
@@ -1003,8 +1093,8 @@ export const Settings: React.FC<SettingsProps> = ({
                           {defaultNotesApp === "ask"
                             ? "Opens Export dialog with Notes tab"
                             : defaultNotesApp === "download"
-                              ? `${navigator.platform?.includes("Mac") ? "Cmd" : "Ctrl"}+S downloads the annotations file`
-                              : `${navigator.platform?.includes("Mac") ? "Cmd" : "Ctrl"}+S saves directly to ${{ obsidian: "Obsidian", bear: "Bear", octarine: "Octarine" }[defaultNotesApp] ?? defaultNotesApp}`}
+                              ? `${modKey}+S downloads the annotations file`
+                              : `${modKey}+S saves directly to ${{ obsidian: "Obsidian", bear: "Bear", octarine: "Octarine" }[defaultNotesApp] ?? defaultNotesApp}`}
                         </div>
                       </div>
 
@@ -1224,7 +1314,7 @@ export const Settings: React.FC<SettingsProps> = ({
                                 </select>
                                 <span className="text-[10px] text-muted-foreground/50 font-mono w-8 text-center flex-shrink-0">
                                   {index < 10
-                                    ? `${navigator.platform?.includes("Mac") ? "⌥" : "Alt+"}${index === 9 ? "0" : index + 1}`
+                                    ? `${altKey}${isMac ? "" : "+"}${index === 9 ? "0" : index + 1}`
                                     : ""}
                                 </span>
                                 <button
@@ -1359,11 +1449,10 @@ export const Settings: React.FC<SettingsProps> = ({
                       )}
 
                       <div className="text-[10px] text-muted-foreground/70">
-                        Use {navigator.platform?.includes("Mac") ? "⌥" : "Alt+"}
-                        1 through{" "}
-                        {navigator.platform?.includes("Mac") ? "⌥" : "Alt+"}0
-                        when the annotation toolbar is visible to apply a label
-                        instantly.
+                        Use {altKey}
+                        {isMac ? "" : "+"}1 through {altKey}
+                        {isMac ? "" : "+"}0 when the annotation toolbar is
+                        visible to apply a label instantly.
                       </div>
                     </>
                   )}
@@ -1371,6 +1460,138 @@ export const Settings: React.FC<SettingsProps> = ({
                   {/* === SHORTCUTS TAB === */}
                   {activeTab === "shortcuts" && (
                     <KeyboardShortcuts mode={mode} />
+                  )}
+
+                  {/* === AI TAB === */}
+                  {activeTab === "ai" && (
+                    <AISettingsTab
+                      providers={aiProviders}
+                      selectedProviderId={aiProvider}
+                      onProviderChange={setAiProvider}
+                    />
+                  )}
+
+                  {/* === FILES TAB === */}
+                  {activeTab === "files" && (
+                    <>
+                      <div className="flex items-center justify-between">
+                        <div>
+                          <div className="text-sm font-medium">
+                            File Browser
+                          </div>
+                          <div className="text-xs text-muted-foreground">
+                            Your project files are shown automatically. Add
+                            extra directories below.
+                          </div>
+                        </div>
+                        <button
+                          role="switch"
+                          aria-checked={fileBrowserSettings.enabled}
+                          onClick={() =>
+                            handleFileBrowserChange({
+                              enabled: !fileBrowserSettings.enabled,
+                            })
+                          }
+                          className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
+                            fileBrowserSettings.enabled
+                              ? "bg-primary"
+                              : "bg-muted"
+                          }`}
+                        >
+                          <span
+                            className={`inline-block h-4 w-4 transform rounded-full bg-white shadow-sm transition-transform ${
+                              fileBrowserSettings.enabled
+                                ? "translate-x-6"
+                                : "translate-x-1"
+                            }`}
+                          />
+                        </button>
+                      </div>
+
+                      {fileBrowserSettings.enabled && (
+                        <>
+                          <div className="border-t border-border" />
+
+                          {/* Directory list */}
+                          {fileBrowserSettings.directories.length > 0 && (
+                            <div className="space-y-1">
+                              <label className="text-xs text-muted-foreground">
+                                Directories
+                              </label>
+                              {fileBrowserSettings.directories.map((dir) => (
+                                <div
+                                  key={dir}
+                                  className="flex items-center gap-2 group"
+                                >
+                                  <div
+                                    className="flex-1 px-3 py-2 bg-muted rounded-lg text-xs font-mono truncate"
+                                    title={dir}
+                                  >
+                                    {dir}
+                                  </div>
+                                  <button
+                                    onClick={() =>
+                                      handleFileBrowserChange({
+                                        directories:
+                                          fileBrowserSettings.directories.filter(
+                                            (d) => d !== dir,
+                                          ),
+                                      })
+                                    }
+                                    className="p-1.5 rounded text-muted-foreground hover:text-destructive hover:bg-destructive/10 transition-colors opacity-0 group-hover:opacity-100"
+                                    title="Remove directory"
+                                  >
+                                    <svg
+                                      className="w-3.5 h-3.5"
+                                      fill="none"
+                                      viewBox="0 0 24 24"
+                                      stroke="currentColor"
+                                      strokeWidth={2}
+                                    >
+                                      <path
+                                        strokeLinecap="round"
+                                        strokeLinejoin="round"
+                                        d="M6 18L18 6M6 6l12 12"
+                                      />
+                                    </svg>
+                                  </button>
+                                </div>
+                              ))}
+                            </div>
+                          )}
+
+                          {/* Add directory */}
+                          <div className="space-y-1.5">
+                            <label className="text-xs text-muted-foreground">
+                              Add Directory
+                            </label>
+                            <div className="flex gap-2">
+                              <input
+                                type="text"
+                                value={newDirPath}
+                                onChange={(e) => setNewDirPath(e.target.value)}
+                                onKeyDown={(e) => {
+                                  if (e.key === "Enter") addDirectory();
+                                }}
+                                placeholder="/path/to/directory"
+                                className="flex-1 px-3 py-2 bg-muted rounded-lg text-xs font-mono placeholder:text-muted-foreground/50 focus:outline-none focus:ring-1 focus:ring-primary/50"
+                              />
+                              <button
+                                onClick={addDirectory}
+                                disabled={!newDirPath.trim()}
+                                className="px-3 py-2 bg-primary text-primary-foreground rounded-lg text-xs font-medium hover:opacity-90 transition-opacity disabled:opacity-50"
+                              >
+                                Add
+                              </button>
+                            </div>
+                            <div className="text-[10px] text-muted-foreground/70">
+                              Add directories outside your project that contain
+                              markdown files.
+                            </div>
+                          </div>
+                        </>
+                      )}
+                    </>
                   )}
 
                   {/* === OBSIDIAN TAB === */}
