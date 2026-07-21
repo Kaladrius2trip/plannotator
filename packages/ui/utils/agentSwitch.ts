@@ -70,6 +70,16 @@ export function getAgentSwitchSettings(project?: string): AgentSwitchSettings {
 }
 
 /**
+ * True when the user explicitly saved an agent-switch choice (per-repo or global).
+ * When nothing is stored, callers should omit agentSwitch so the plugin's
+ * agentRouting can decide the handoff.
+ */
+export function hasStoredAgentSwitchSettings(project?: string): boolean {
+  return storage.getItem(key(STORAGE_KEY, project)) != null
+    || storage.getItem(STORAGE_KEY) != null;
+}
+
+/**
  * Save agent switch settings to storage
  */
 export function saveAgentSwitchSettings(

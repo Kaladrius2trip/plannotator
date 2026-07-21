@@ -35,7 +35,7 @@ import { getObsidianSettings, getEffectiveVaultPath, isObsidianConfigured, CUSTO
 import { getBearSettings } from '@plannotator/ui/utils/bear';
 import { getOctarineSettings, isOctarineConfigured } from '@plannotator/ui/utils/octarine';
 import { getDefaultNotesApp } from '@plannotator/ui/utils/defaultNotesApp';
-import { getAgentSwitchSettings, getEffectiveAgentName } from '@plannotator/ui/utils/agentSwitch';
+import { getAgentSwitchSettings, getEffectiveAgentName, hasStoredAgentSwitchSettings } from '@plannotator/ui/utils/agentSwitch';
 import { getPlanSaveSettings } from '@plannotator/ui/utils/planSave';
 import { type AIProviderOption } from '@plannotator/ui/utils/aiProvider';
 import { useAIProviderConfig } from '@plannotator/ui/hooks/useAIProviderConfig';
@@ -2662,9 +2662,12 @@ const App: React.FC = () => {
         body.permissionMode = permissionMode;
       }
 
-      const effectiveAgent = getEffectiveAgentName(getAgentSwitchSettings(repoInfo?.display));
-      if (effectiveAgent) {
-        body.agentSwitch = effectiveAgent;
+      // Only send an explicit user choice — when nothing is stored, the
+      // plugin's agentRouting decides the handoff (fork feature). Explicit
+      // "disabled" is sent as-is so routing cannot override it.
+      if (hasStoredAgentSwitchSettings(repoInfo?.display)) {
+        const effectiveAgent = getEffectiveAgentName(getAgentSwitchSettings(repoInfo?.display));
+        body.agentSwitch = effectiveAgent ?? 'disabled';
       }
 
       // Include plan save settings
