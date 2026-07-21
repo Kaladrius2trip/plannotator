@@ -12,6 +12,8 @@ export interface EmbeddedPlanReviewInput {
   pasteApiUrl?: string;
   htmlContent: string;
   timeoutSeconds: number | null;
+  /** AFK auto-approve countdown in seconds (null/0 disables) */
+  afkSeconds?: number | null;
   abortSignal: AbortSignal;
   logReady: (url: string, isRemote: boolean, port: number) => void;
 }
@@ -21,6 +23,7 @@ export interface EmbeddedPlanReviewResult {
   feedback?: string;
   savedPath?: string;
   agentSwitch?: string;
+  saveOnly?: boolean;
 }
 
 async function loadPlanServer() {
@@ -46,6 +49,7 @@ export async function runEmbeddedPlanReview(
     pasteApiUrl: input.pasteApiUrl,
     htmlContent: input.htmlContent,
     opencodeClient: input.client,
+    afkSeconds: input.afkSeconds && input.afkSeconds > 0 ? input.afkSeconds : undefined,
     onReady: async (url, isRemote, port) => {
       await handleServerReady(url, isRemote, port);
       input.logReady(url, isRemote, port);
@@ -54,6 +58,26 @@ export async function runEmbeddedPlanReview(
 
   const timeoutMs = input.timeoutSeconds === null ? null : input.timeoutSeconds * 1000;
   try {
+    // AFK auto-approve: if the browser never loads the UI within afkSeconds,
+    // the user is away — approve automatically. Once the UI is viewed, the
+    // normal decision flow owns the outcome (the UI runs its own countdown).
+    if (input.afkSeconds && input.afkSeconds > 0) {
+      let afkTimer: ReturnType<typeof setTimeout> | undefined;
+      let onAbort: (() => void) | undefined;
+      const raced = await new Promise<"viewing" | "afk" | "abort">((resolve) => {
+        onAbort = () => resolve("abort");
+        input.abortSignal.addEventListener("abort", onAbort, { once: true });
+        afkTimer = setTimeout(() => resolve("afk"), input.afkSeconds! * 1000);
+        void server.waitForViewing().then(() => resolve("viewing"));
+      });
+      clearTimeout(afkTimer);
+      if (onAbort) input.abortSignal.removeEventListener("abort", onAbort);
+      input.abortSignal.throwIfAborted();
+      if (raced === "afk") {
+        return { approved: true };
+      }
+    }
+
     const result = await waitForPlanReviewDecision({
       waitForDecision: server.waitForDecision,
       timeoutMs,

@@ -10,6 +10,7 @@
  *   PLANNOTATOR_REMOTE - Set to "1"/"true" for remote, "0"/"false" for local
  *   PLANNOTATOR_PORT   - Fixed port to use (default: random locally, 19432 for remote)
  *   PLANNOTATOR_PLAN_TIMEOUT_SECONDS - Max wait for approval (default: 345600, set 0 to disable)
+ *   PLANNOTATOR_AFK_SECONDS - AFK auto-approve countdown in seconds (default: 10, set 0 to disable; embedded runtime only)
  *   PLANNOTATOR_ALLOW_SUBAGENTS - Set to "1" to allow subagents to see submit_plan
  *
  * @packageDocumentation
@@ -98,6 +99,7 @@ function getReviewHtml(): string {
 }
 
 const DEFAULT_PLAN_TIMEOUT_SECONDS = 345_600; // 96 hours
+const DEFAULT_AFK_SECONDS = 10;
 const MAX_PLAN_SIZE = 5 * 1024 * 1024; // 5MB
 
 // ── Planning prompt ───────────────────────────────────────────────────────
@@ -216,6 +218,7 @@ type EmbeddedRuntimeModule = {
     pasteApiUrl?: string;
     htmlContent: string;
     timeoutSeconds: number | null;
+    afkSeconds?: number | null;
     abortSignal: AbortSignal;
     logReady: (url: string, isRemote: boolean, port: number) => void;
   }) => Promise<OpenCodePlanReviewResult>;
@@ -253,6 +256,7 @@ async function runPlanReview(input: {
   pasteApiUrl?: string;
   htmlContent: string;
   timeoutSeconds: number | null;
+  afkSeconds?: number | null;
   abortSignal: AbortSignal;
   cwd?: string;
   bridge: OpenCodeBridgeContext;
@@ -273,6 +277,7 @@ async function runPlanReview(input: {
         pasteApiUrl: input.pasteApiUrl,
         htmlContent: input.htmlContent,
         timeoutSeconds: input.timeoutSeconds,
+        afkSeconds: input.afkSeconds,
         abortSignal: input.abortSignal,
         logReady: (url) => logPlannotatorReady(input.client, "plan review", url),
       });
@@ -364,6 +369,16 @@ const PlannotatorPlugin: Plugin = async (ctx, rawOptions?: PlannotatorOpenCodeOp
       return DEFAULT_PLAN_TIMEOUT_SECONDS;
     }
 
+    if (parsed === 0) return null;
+    return parsed;
+  }
+
+  /** AFK auto-approve countdown (fork feature): default 10s, 0 disables. Embedded runtime only. */
+  function getAfkSeconds(): number | null {
+    const raw = process.env.PLANNOTATOR_AFK_SECONDS?.trim();
+    if (!raw) return DEFAULT_AFK_SECONDS;
+    const parsed = Number.parseInt(raw, 10);
+    if (!Number.isFinite(parsed) || parsed < 0) return DEFAULT_AFK_SECONDS;
     if (parsed === 0) return null;
     return parsed;
   }
@@ -669,6 +684,7 @@ Use /plannotator-last or /plannotator-annotate for manual review, or set workflo
               pasteApiUrl: getPasteApiUrl(),
               htmlContent: getPlanHtml(),
               timeoutSeconds,
+              afkSeconds: getAfkSeconds(),
               abortSignal: context.abort,
               cwd: ctx.directory,
               bridge: await getBridgeContext(),
@@ -681,6 +697,11 @@ Use /plannotator-last or /plannotator-annotate for manual review, or set workflo
           if (result.approved) {
             // Clean up backing file after approval
             try { unlinkSync(backingPath); } catch { /* already gone */ }
+
+            // "Save Only": the user saved the plan for reference — no implementation.
+            if (result.saveOnly) {
+              return `Plan saved for reference${result.savedPath ? ` at ${result.savedPath}` : ""}. The user chose not to implement this plan. Do not start implementation; wait for further instructions.`;
+            }
 
             const shouldSwitchAgent = result.agentSwitch && result.agentSwitch !== 'disabled';
             const targetAgent = result.agentSwitch || 'build';

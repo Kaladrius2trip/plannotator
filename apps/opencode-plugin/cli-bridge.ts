@@ -28,6 +28,8 @@ export interface OpenCodePlanReviewResult {
   feedback?: string;
   savedPath?: string;
   agentSwitch?: string;
+  /** "Save Only" — user saved the plan for reference; no implementation handoff */
+  saveOnly?: boolean;
 }
 
 export interface OpenCodeBridgeAgent {
