@@ -7,6 +7,16 @@ export interface PlannotatorOpenCodeOptions {
   workflow?: unknown;
   planningAgents?: unknown;
   runtime?: unknown;
+  /** Per-planner default handoff: { "<invoking agent>": { executor: "self" | "<agent>", message?: string } } */
+  agentRouting?: unknown;
+}
+
+/** Default post-approval handoff for a specific invoking (planning) agent. */
+export interface AgentRoute {
+  /** "self" = stay on the invoking agent (planner is also the executor). */
+  executor: string;
+  /** Handoff prompt sent to the executor agent (default: "Proceed with implementation"). */
+  message?: string;
 }
 
 export interface NormalizedWorkflowOptions {
@@ -14,6 +24,7 @@ export interface NormalizedWorkflowOptions {
   planningAgents: string[];
   planningAgentSet: Set<string>;
   runtime: RuntimeMode;
+  agentRouting: Record<string, AgentRoute>;
 }
 
 const WORKFLOWS = new Set<WorkflowMode>(["manual", "user-managed", "plan-agent", "all-agents"]);
@@ -50,12 +61,35 @@ export function normalizeWorkflowOptions(
 
   const planningAgents = normalizePlanningAgents(rawOptions?.planningAgents);
   const runtime = normalizeRuntime(rawOptions?.runtime);
+  const agentRouting = normalizeAgentRouting(rawOptions?.agentRouting);
   return {
     workflow,
     planningAgents,
     planningAgentSet: new Set(planningAgents),
     runtime,
+    agentRouting,
   };
+}
+
+function normalizeAgentRouting(value: unknown): Record<string, AgentRoute> {
+  const routing: Record<string, AgentRoute> = {};
+  if (!value || typeof value !== "object" || Array.isArray(value)) return routing;
+
+  for (const [agent, raw] of Object.entries(value as Record<string, unknown>)) {
+    const agentKey = agent.trim();
+    if (!agentKey || !raw || typeof raw !== "object" || Array.isArray(raw)) continue;
+    const route = raw as { executor?: unknown; message?: unknown };
+    const executor = typeof route.executor === "string" ? route.executor.trim() : "";
+    if (!executor) continue;
+    routing[agentKey] = {
+      executor,
+      ...(typeof route.message === "string" && route.message.trim()
+        ? { message: route.message }
+        : {}),
+    };
+  }
+
+  return routing;
 }
 
 function normalizeRuntime(value: unknown): RuntimeMode {
@@ -104,6 +138,41 @@ export function isPlanningAgent(
   options: NormalizedWorkflowOptions,
 ): boolean {
   return !!agentName && options.planningAgentSet.has(agentName);
+}
+
+export interface ApprovalHandoff {
+  /** Agent to switch the session to; undefined = stay on the invoking agent. */
+  targetAgent?: string;
+  /** Prompt sent to the target agent when switching. */
+  message: string;
+}
+
+export const DEFAULT_HANDOFF_MESSAGE = "Proceed with implementation";
+
+/**
+ * Resolve the post-approval handoff.
+ *
+ * Priority: explicit UI agent-switch choice > configured agentRouting for the
+ * invoking agent > no switch. "disabled" from the UI always means stay.
+ * Routing lets one config serve mixed teams: a plan-and-build agent
+ * (executor "self") stays put; a pure planner hands off to its executor.
+ */
+export function resolveApprovalHandoff(input: {
+  invokingAgent: string | undefined;
+  uiAgentSwitch: string | undefined;
+  options: NormalizedWorkflowOptions;
+}): ApprovalHandoff {
+  const { invokingAgent, uiAgentSwitch, options } = input;
+
+  if (uiAgentSwitch === "disabled") return { message: DEFAULT_HANDOFF_MESSAGE };
+  if (uiAgentSwitch) return { targetAgent: uiAgentSwitch, message: DEFAULT_HANDOFF_MESSAGE };
+
+  const route = invokingAgent ? options.agentRouting[invokingAgent] : undefined;
+  if (!route || route.executor === "self" || route.executor === invokingAgent) {
+    return { message: DEFAULT_HANDOFF_MESSAGE };
+  }
+
+  return { targetAgent: route.executor, message: route.message ?? DEFAULT_HANDOFF_MESSAGE };
 }
 
 /** A planning agent reviews plans; only non-planning agents receive an implementation handoff. */

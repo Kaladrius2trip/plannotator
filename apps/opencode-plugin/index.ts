@@ -39,6 +39,7 @@ import {
   applyWorkflowConfig,
   isPlanningAgent,
   normalizeWorkflowOptions,
+  resolveApprovalHandoff,
   shouldApplyToolDefinitionRewrites,
   shouldInjectFullPlanningPrompt,
   shouldInjectGenericPlanReminder,
@@ -703,12 +704,19 @@ Use /plannotator-last or /plannotator-annotate for manual review, or set workflo
               return `Plan saved for reference${result.savedPath ? ` at ${result.savedPath}` : ""}. The user chose not to implement this plan. Do not start implementation; wait for further instructions.`;
             }
 
-            const shouldSwitchAgent = result.agentSwitch && result.agentSwitch !== 'disabled';
-            const targetAgent = result.agentSwitch || 'build';
-            const shouldStartImplementation = shouldSwitchAgent
+            // Explicit UI choice wins; otherwise agentRouting decides
+            // (planner-executor pairs like prometheus -> atlas, or "self"
+            // for plan-and-build agents like sisyphus).
+            const handoff = resolveApprovalHandoff({
+              invokingAgent,
+              uiAgentSwitch: result.agentSwitch,
+              options: workflowOptions,
+            });
+            const targetAgent = handoff.targetAgent;
+            const shouldStartImplementation = !!targetAgent
               && shouldStartImplementationForAgent(targetAgent, workflowOptions);
 
-            if (shouldSwitchAgent) {
+            if (targetAgent) {
               try {
                 await ctx.client.session.prompt({
                   path: { id: context.sessionID },
@@ -718,7 +726,7 @@ Use /plannotator-last or /plannotator-annotate for manual review, or set workflo
                     parts: [{
                       type: "text",
                       text: shouldStartImplementation
-                        ? "Proceed with implementation"
+                        ? handoff.message
                         : "Plan approved. Plan mode remains active; no implementation has been requested.",
                     }],
                   },
