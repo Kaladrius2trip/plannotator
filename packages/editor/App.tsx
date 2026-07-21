@@ -31,7 +31,7 @@ import { useSharing } from "@plannotator/ui/hooks/useSharing";
 import { useAgents } from "@plannotator/ui/hooks/useAgents";
 import { useActiveSection } from "@plannotator/ui/hooks/useActiveSection";
 import { storage } from "@plannotator/ui/utils/storage";
-import { configStore } from "@plannotator/ui/config";
+import { configStore } from "../ui/config/index";
 import { CompletionOverlay } from "@plannotator/ui/components/CompletionOverlay";
 import { UpdateBanner } from "@plannotator/ui/components/UpdateBanner";
 import {
@@ -74,7 +74,7 @@ import {
   type PermissionMode,
 } from "@plannotator/ui/utils/permissionMode";
 import { PermissionModeSetup } from "@plannotator/ui/components/PermissionModeSetup";
-import { ImageAnnotator } from "@plannotator/ui/components/ImageAnnotator";
+import { ImageAnnotator } from "@plannotator/ui/components/ImageAnnotator/index";
 import { deriveImageName } from "@plannotator/ui/components/AttachmentsButton";
 import { useSidebar } from "@plannotator/ui/hooks/useSidebar";
 import {
@@ -104,6 +104,8 @@ type NoteAutoSaveResults = {
   bear?: boolean;
   octarine?: boolean;
 };
+
+declare const __APP_VERSION__: string | undefined;
 
 const App: React.FC = () => {
   const [markdown, setMarkdown] = useState(DEMO_PLAN_CONTENT);
@@ -260,7 +262,7 @@ const App: React.FC = () => {
     setSelectedAnnotationId,
     setGlobalAttachments,
     viewerRef,
-    sidebar,
+    sidebar: { open: (tab: string) => sidebar.open(tab as never) },
   });
 
   // Archive browser
