@@ -88,6 +88,8 @@ export interface ServerOptions {
   mode?: "archive";
   /** Custom plan save path — used by archive mode to find saved plans */
   customPlanPath?: string | null;
+  /** AFK auto-approve countdown in seconds — sent to the UI and paired with waitForViewing for caller-side races */
+  afkSeconds?: number;
 }
 
 export interface ServerResult {
@@ -104,7 +106,10 @@ export interface ServerResult {
     savedPath?: string;
     agentSwitch?: string;
     permissionMode?: string;
+    saveOnly?: boolean;
   }>;
+  /** Resolves the first time the browser loads the UI (used for AFK auto-approve races) */
+  waitForViewing: () => Promise<void>;
   /** Wait for user to close (archive mode only) */
   waitForDone?: () => Promise<void>;
   /** Stop the server and close active browser connections. */
@@ -168,6 +173,7 @@ export async function startPlannotatorServer(
     savedPath?: string;
     agentSwitch?: string;
     permissionMode?: string;
+    saveOnly?: boolean;
   }) => void;
   let decisionPromise: Promise<{
     approved: boolean;
@@ -175,7 +181,16 @@ export async function startPlannotatorServer(
     savedPath?: string;
     agentSwitch?: string;
     permissionMode?: string;
+    saveOnly?: boolean;
   }>;
+
+  // AFK auto-approve support: resolves on the first SPA load so callers can
+  // race "browser opened" against an AFK countdown.
+  let viewed = false;
+  let resolveViewing: () => void = () => {};
+  const viewingPromise = new Promise<void>((resolve) => {
+    resolveViewing = resolve;
+  });
 
   if (mode !== "archive") {
     repoInfo = await getRepoInfo();
@@ -279,7 +294,7 @@ export async function startPlannotatorServer(
                 serverConfig: getServerConfig(gitUser),
               });
             }
-            return Response.json({ plan, origin, permissionMode, sharingEnabled, shareBaseUrl, pasteApiUrl, repoInfo, previousPlan, versionInfo, projectRoot: process.cwd(), isWSL: wslFlag, serverConfig: getServerConfig(gitUser) });
+            return Response.json({ plan, origin, permissionMode, sharingEnabled, shareBaseUrl, pasteApiUrl, repoInfo, previousPlan, versionInfo, projectRoot: process.cwd(), isWSL: wslFlag, serverConfig: getServerConfig(gitUser), afkSeconds: options.afkSeconds });
           }
 
           // API: Serve a linked markdown document
@@ -445,6 +460,7 @@ export async function startPlannotatorServer(
             let feedback: string | undefined;
             let agentSwitch: string | undefined;
             let requestedPermissionMode: string | undefined;
+            let saveOnly = false;
             let planSaveEnabled = true; // default to enabled for backwards compat
             let planSaveCustomPath: string | undefined;
             let draftGeneration: number | undefined;
@@ -458,8 +474,12 @@ export async function startPlannotatorServer(
                 planSave?: { enabled: boolean; customPath?: string };
                 permissionMode?: string;
                 draftGeneration?: number;
+                saveOnly?: boolean;
               };
               draftGeneration = readDraftGenerationFromBody(body);
+
+              // "Save Only" — approve without implementation handoff
+              if (body.saveOnly) saveOnly = true;
 
               // Capture feedback if provided (for "approve with notes")
               if (body.feedback) {
@@ -521,7 +541,7 @@ export async function startPlannotatorServer(
 
             // Use permission mode from client request if provided, otherwise fall back to hook input
             const effectivePermissionMode = requestedPermissionMode || permissionMode;
-            resolveDecision({ approved: true, feedback, savedPath, agentSwitch, permissionMode: effectivePermissionMode });
+            resolveDecision({ approved: true, feedback, savedPath, agentSwitch, permissionMode: effectivePermissionMode, ...(saveOnly && { saveOnly: true }) });
             return Response.json({ ok: true, savedPath });
           }
 
@@ -570,6 +590,10 @@ export async function startPlannotatorServer(
           }
 
           // Serve embedded HTML for all other routes (SPA)
+          if (!viewed) {
+            viewed = true;
+            resolveViewing();
+          }
           return new Response(htmlContent, {
             headers: { "Content-Type": "text/html" },
           });
@@ -618,6 +642,7 @@ export async function startPlannotatorServer(
     url: serverUrl,
     isRemote,
     waitForDecision: () => decisionPromise,
+    waitForViewing: () => viewingPromise,
     ...(donePromise && { waitForDone: () => donePromise }),
     stop,
   };
