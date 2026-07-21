@@ -25,7 +25,7 @@ export interface UseAgentsResult {
  * Fetch available agents from OpenCode API
  * Only fetches when origin is 'opencode'
  */
-export function useAgents(origin: Origin | null): UseAgentsResult {
+export function useAgents(origin: Origin | null, project?: string): UseAgentsResult {
   const [agents, setAgents] = useState<Agent[]>([]);
   const [isLoading, setIsLoading] = useState(false);
 
@@ -56,7 +56,7 @@ export function useAgents(origin: Origin | null): UseAgentsResult {
   const getAgentWarning = useCallback((): string | null => {
     if (agents.length === 0) return null; // Can't validate without agents
 
-    const settings = getAgentSwitchSettings();
+    const settings = getAgentSwitchSettings(project);
 
     if (settings.switchTo === 'disabled') {
       return null;
@@ -79,7 +79,7 @@ export function useAgents(origin: Origin | null): UseAgentsResult {
     }
 
     return null;
-  }, [agents, validateAgent]);
+  }, [agents, validateAgent, project]);
 
   return {
     agents,

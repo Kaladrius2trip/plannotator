@@ -62,6 +62,8 @@ interface AppHeaderProps {
   onAnnotateApprove: () => void;
   onFeedback: () => void;
   onApprove: () => void;
+  /** "Save Only" — approve without implementation handoff (plan mode only) */
+  onSaveOnly?: () => void;
   onAnnotationPanelToggle: () => void;
   onAIChatToggle: () => void;
   onArchiveCopy: () => void;
@@ -89,6 +91,9 @@ interface AppHeaderProps {
   obsidianConfigured: boolean;
   bearConfigured: boolean;
   octarineConfigured: boolean;
+
+  /** Per-repo agent-switch scope key (fork feature) */
+  agentSwitchProject?: string;
 }
 
 export const AppHeader = React.memo<AppHeaderProps>(({
@@ -123,6 +128,7 @@ export const AppHeader = React.memo<AppHeaderProps>(({
   taterMode,
   mobileSettingsOpen,
   gitUser,
+  agentSwitchProject,
   onCallbackFeedback,
   onCallbackApprove,
   onAnnotateExit,
@@ -132,6 +138,7 @@ export const AppHeader = React.memo<AppHeaderProps>(({
   onAnnotateApprove,
   onFeedback,
   onApprove,
+  onSaveOnly,
   onAnnotationPanelToggle,
   onAIChatToggle,
   onArchiveCopy,
@@ -273,6 +280,7 @@ export const AppHeader = React.memo<AppHeaderProps>(({
                   agents={availableAgents}
                   disabled={isSubmitting}
                   isLoading={isSubmitting}
+                  project={agentSwitchProject}
                 />
               ) : (
                 <div className="relative group/approve">
@@ -292,6 +300,21 @@ export const AppHeader = React.memo<AppHeaderProps>(({
                   )}
                 </div>
               )
+            )}
+
+            {!annotateMode && onSaveOnly && (
+              <button
+                onClick={onSaveOnly}
+                disabled={isSubmitting}
+                className={`hidden md:inline-flex px-2.5 py-1 rounded-md text-xs font-medium transition-all ${
+                  isSubmitting
+                    ? 'opacity-50 cursor-not-allowed bg-muted text-muted-foreground'
+                    : 'bg-muted text-muted-foreground hover:bg-muted/80 border border-border/50'
+                }`}
+                title="Save plan without implementing"
+              >
+                Save Only
+              </button>
             )}
 
             <div className="w-px h-5 bg-border/50 mx-1 hidden md:block" />
@@ -349,6 +372,7 @@ export const AppHeader = React.memo<AppHeaderProps>(({
             externalOpen={mobileSettingsOpen}
             onExternalClose={onCloseSettings}
             gitUser={gitUser}
+            agentSwitchProject={agentSwitchProject}
           />
         </div>
 

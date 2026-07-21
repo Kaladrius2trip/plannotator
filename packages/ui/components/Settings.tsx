@@ -93,6 +93,8 @@ interface SettingsProps {
   sinceBaseUnavailable?: boolean;
   /** Override Obsidian vault detection (default = GET /api/obsidian/vaults). */
   onDetectObsidianVaults?: () => Promise<string[]>;
+  /** Per-repo agent-switch scope key (fork feature) — settings persist per project */
+  agentSwitchProject?: string;
 }
 
 // --- Review-mode Display tab (diff display options) ---
@@ -651,7 +653,7 @@ const CommentsTab: React.FC = () => {
   );
 };
 
-export const Settings: React.FC<SettingsProps> = ({ taterMode, onTaterModeChange, onIdentityChange, origin, mode = 'plan', onUIPreferencesChange, externalOpen, onExternalClose, aiProviders = [], gitUser, sinceBaseUnavailable, onDetectObsidianVaults }) => {
+export const Settings: React.FC<SettingsProps> = ({ taterMode, onTaterModeChange, onIdentityChange, origin, mode = 'plan', onUIPreferencesChange, externalOpen, onExternalClose, aiProviders = [], gitUser, sinceBaseUnavailable, onDetectObsidianVaults, agentSwitchProject }) => {
   const [showDialog, setShowDialog] = useState(false);
   const [themePreview, setThemePreview] = useState(false);
 
@@ -693,7 +695,7 @@ export const Settings: React.FC<SettingsProps> = ({ taterMode, onTaterModeChange
   const [newDirPath, setNewDirPath] = useState('');
 
   // Fetch available agents for OpenCode
-  const { agents: availableAgents, validateAgent, getAgentWarning } = useAgents(origin ?? null);
+  const { agents: availableAgents, validateAgent, getAgentWarning } = useAgents(origin ?? null, agentSwitchProject);
 
   const mainTabs = useMemo(() => {
     const t: { id: SettingsTab; label: string }[] = [{ id: 'general', label: 'General' }];
@@ -742,7 +744,7 @@ export const Settings: React.FC<SettingsProps> = ({ taterMode, onTaterModeChange
       setObsidian(getObsidianSettings());
       setBear(getBearSettings());
       setOctarine(getOctarineSettings());
-      setAgent(getAgentSwitchSettings());
+      setAgent(getAgentSwitchSettings(agentSwitchProject));
       setPlanSave(getPlanSaveSettings());
       setUiPrefs(getUIPreferences());
       setPermissionMode(getPermissionModeSettings().mode);
@@ -839,7 +841,7 @@ export const Settings: React.FC<SettingsProps> = ({ taterMode, onTaterModeChange
   const handleAgentChange = (switchTo: AgentSwitchSettings['switchTo'], customName?: string) => {
     const newSettings = { switchTo, customName: customName ?? agent.customName };
     setAgent(newSettings);
-    saveAgentSwitchSettings(newSettings);
+    saveAgentSwitchSettings(newSettings, agentSwitchProject);
   };
 
   const handlePlanSaveChange = (updates: Partial<PlanSaveSettings>) => {

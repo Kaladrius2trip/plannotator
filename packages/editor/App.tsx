@@ -27,6 +27,7 @@ import { useActiveSection } from '@plannotator/ui/hooks/useActiveSection';
 import { storage } from '@plannotator/ui/utils/storage';
 import { configStore, useConfigValue } from '@plannotator/ui/config';
 import { CompletionOverlay } from '@plannotator/ui/components/CompletionOverlay';
+import { AfkPopup } from '@plannotator/ui/components/AfkPopup';
 import { useUpdateCheck } from '@plannotator/ui/hooks/useUpdateCheck';
 import { PlanAIAnnouncementDialog } from '@plannotator/ui/components/PlanAIAnnouncementDialog';
 import { LookAndFeelAnnouncementDialog } from '@plannotator/ui/components/LookAndFeelAnnouncementDialog';
@@ -410,6 +411,8 @@ const App: React.FC = () => {
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [isExiting, setIsExiting] = useState(false);
   const [submitted, setSubmitted] = useState<'approved' | 'denied' | 'exited' | null>(null);
+  // AFK auto-approve countdown (fork feature): 0 = disabled, server-provided via /api/plan
+  const [afkTimeout, setAfkTimeout] = useState(0);
   const [pendingPasteImage, setPendingPasteImage] = useState<{ file: File; blobUrl: string; initialName: string } | null>(null);
   const [showPermissionModeSetup, setShowPermissionModeSetup] = useState(false);
   const [permissionMode, setPermissionMode] = useState<PermissionMode>('bypassPermissions');
@@ -1523,7 +1526,7 @@ const App: React.FC = () => {
   });
 
   // Fetch available agents for OpenCode (for validation on approve)
-  const { agents: availableAgents, validateAgent, getAgentWarning } = useAgents(origin);
+  const { agents: availableAgents, validateAgent, getAgentWarning } = useAgents(origin, repoInfo?.display);
 
   // Apply shared annotations to DOM after they're loaded
   useEffect(() => {
@@ -2356,6 +2359,10 @@ const App: React.FC = () => {
         if (data.isWSL) {
           setIsWSL(true);
         }
+        // AFK auto-approve countdown (plan review mode only)
+        if (typeof (data as { afkSeconds?: number }).afkSeconds === 'number') {
+          setAfkTimeout((data as { afkSeconds?: number }).afkSeconds!);
+        }
       })
       .catch(() => {
         // Not in API mode - use default content
@@ -2624,7 +2631,7 @@ const App: React.FC = () => {
     !isCurrentFeedbackDeliveredToAgent;
 
   // API mode handlers
-  const handleApprove = async () => {
+  const handleApprove = async (opts?: { saveOnly?: boolean }) => {
     setIsSubmitting(true);
     try {
       // Integrations must describe the same document the feedback diff does —
@@ -2641,16 +2648,21 @@ const App: React.FC = () => {
         : autoSaveResultsRef.current;
 
       // Build request body - include integrations if enabled
-      const body: { draftGeneration: number; obsidian?: object; bear?: object; octarine?: object; feedback?: string; agentSwitch?: string; planSave?: { enabled: boolean; customPath?: string }; permissionMode?: string } = {
+      const body: { draftGeneration: number; obsidian?: object; bear?: object; octarine?: object; feedback?: string; agentSwitch?: string; planSave?: { enabled: boolean; customPath?: string }; permissionMode?: string; saveOnly?: boolean } = {
         draftGeneration: getDraftGeneration(),
       };
+
+      // "Save Only" — approve without implementation handoff
+      if (opts?.saveOnly) {
+        body.saveOnly = true;
+      }
 
       // Include permission mode for Claude Code
       if (origin === 'claude-code') {
         body.permissionMode = permissionMode;
       }
 
-      const effectiveAgent = getEffectiveAgentName(getAgentSwitchSettings());
+      const effectiveAgent = getEffectiveAgentName(getAgentSwitchSettings(repoInfo?.display));
       if (effectiveAgent) {
         body.agentSwitch = effectiveAgent;
       }
@@ -2744,6 +2756,56 @@ const App: React.FC = () => {
       setIsSubmitting(false);
     }
   };
+
+  // ── AFK auto-approve (fork feature) ─────────────────────────────────────
+  // Server sends afkSeconds when PLANNOTATOR_AFK_SECONDS is active. A countdown
+  // popup appears on load; any user interaction (or Escape) cancels it
+  // permanently. Reaching zero auto-approves the plan.
+  const afkActive =
+    isApiMode &&
+    afkTimeout > 0 &&
+    !submitted &&
+    !isSubmitting &&
+    !annotateMode &&
+    !archive.archiveMode &&
+    !goalSetupMode &&
+    !linkedDocHook.isActive;
+  const [showAfk, setShowAfk] = useState(false);
+  const [afkRemaining, setAfkRemaining] = useState(afkTimeout);
+  const afkDismissed = useRef(false);
+
+  useEffect(() => {
+    setAfkRemaining(afkTimeout);
+  }, [afkTimeout]);
+
+  const afkSummary = useMemo(() => {
+    if (!markdown) return undefined;
+    const lines = markdown.split('\n').filter((line) => line.trim());
+    return lines.slice(0, 5).join('\n');
+  }, [markdown]);
+
+  useEffect(() => {
+    if (afkActive && !afkDismissed.current) setShowAfk(true);
+  }, [afkActive]);
+
+  useEffect(() => {
+    if (!showAfk) return;
+    if (afkRemaining <= 0) {
+      setShowAfk(false);
+      handleApprove();
+      return;
+    }
+    const id = setTimeout(
+      () => setAfkRemaining((remaining) => remaining - 1),
+      1000,
+    );
+    return () => clearTimeout(id);
+  }, [showAfk, afkRemaining]);
+
+  const dismissAfk = useCallback(() => {
+    afkDismissed.current = true;
+    setShowAfk(false);
+  }, []);
 
   // Annotate mode handler — sends feedback to the running terminal agent when
   // available, otherwise through the original server feedback channel.
@@ -3782,6 +3844,13 @@ const App: React.FC = () => {
     approve();
   }, [annotateMode, hasFeedbackToSend, maybeConfirmUnsavedSourceFileEdits, origin]);
 
+  // "Save Only" — approve without implementation handoff (fork feature)
+  const handleHeaderSaveOnly = useCallback(() => {
+    const saveOnly = () => headerHandlersRef.current.handleApprove({ saveOnly: true });
+    if (maybeConfirmUnsavedSourceFileEdits('approve', saveOnly)) return;
+    saveOnly();
+  }, [maybeConfirmUnsavedSourceFileEdits]);
+
   const handleHeaderAnnotateFeedback = useCallback(() => {
     const sendFeedback = () => headerHandlersRef.current.handleAnnotateFeedback();
     if (maybeConfirmUnsavedSourceFileEdits('send-feedback', sendFeedback)) return;
@@ -3895,6 +3964,8 @@ const App: React.FC = () => {
           onAnnotateApprove={handleHeaderAnnotateApprove}
           onFeedback={handleHeaderFeedback}
           onApprove={handleHeaderApprove}
+          onSaveOnly={isApiMode && !isSharedSession && !annotateMode && !archive.archiveMode && !goalSetupMode ? handleHeaderSaveOnly : undefined}
+          agentSwitchProject={repoInfo?.display}
           onAnnotationPanelToggle={handleAnnotationPanelToggle}
           onAIChatToggle={handleAIChatToggle}
           onArchiveCopy={archive.copy}
@@ -4719,6 +4790,15 @@ const App: React.FC = () => {
               '--error-text': 'var(--destructive)',
             } as React.CSSProperties,
           }}
+        />
+
+        {/* AFK auto-approve countdown (fork feature) */}
+        <AfkPopup
+          isOpen={showAfk}
+          remaining={afkRemaining}
+          total={afkTimeout}
+          summary={afkSummary}
+          onDismiss={dismissAfk}
         />
 
         {/* Completion overlay - shown after approve/deny */}

@@ -7,6 +7,8 @@ interface ApproveDropdownProps {
   agents: Agent[];
   disabled?: boolean;
   isLoading?: boolean;
+  /** Per-repo agent-switch scope key (fork feature) */
+  project?: string;
 }
 
 function getSelectedLabel(setting: AgentSwitchSettings, agents: Agent[]): string | null {
@@ -35,10 +37,16 @@ export const ApproveDropdown: React.FC<ApproveDropdownProps> = ({
   agents,
   disabled = false,
   isLoading = false,
+  project,
 }) => {
-  const [setting, setSetting] = useState<AgentSwitchSettings>(() => getAgentSwitchSettings());
+  const [setting, setSetting] = useState<AgentSwitchSettings>(() => getAgentSwitchSettings(project));
   const [isOpen, setIsOpen] = useState(false);
   const dropdownRef = useRef<HTMLDivElement>(null);
+
+  // Re-read when the per-repo scope arrives (repoInfo loads async)
+  useEffect(() => {
+    setSetting(getAgentSwitchSettings(project));
+  }, [project]);
 
   useEffect(() => {
     const handleClickOutside = (event: PointerEvent) => {
@@ -59,7 +67,7 @@ export const ApproveDropdown: React.FC<ApproveDropdownProps> = ({
 
   const handleSelect = (newSetting: AgentSwitchSettings) => {
     setSetting(newSetting);
-    saveAgentSwitchSettings(newSetting);
+    saveAgentSwitchSettings(newSetting, project);
     setIsOpen(false);
   };
 
