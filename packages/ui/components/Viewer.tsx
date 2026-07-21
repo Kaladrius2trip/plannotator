@@ -1,9 +1,16 @@
-import React, { useRef, useState, useEffect, forwardRef, useImperativeHandle, useCallback } from 'react';
+import React, { useRef, useState, useEffect, useMemo, forwardRef, useImperativeHandle, useCallback } from 'react';
 import { createPortal } from 'react-dom';
 import hljs from 'highlight.js';
-import 'highlight.js/styles/github-dark.css';
-import { Block, Annotation, AnnotationType, EditorMode, type InputMethod, type ImageAttachment } from '../types';
-import { Frontmatter } from '../utils/parser';
+import { AnnotationType, type Block, type Annotation, type EditorMode, type InputMethod, type ImageAttachment, type ActionsLabelMode } from '../types';
+import { computeListIndices, groupBlocks, type Frontmatter } from '../utils/parser';
+import { buildHeadingSlugMap } from '../utils/slugify';
+import { BlockRenderer } from './BlockRenderer';
+import { CodeBlock } from './blocks/CodeBlock';
+import { TableBlock } from './blocks/TableBlock';
+import { TableToolbar } from './blocks/TableToolbar';
+import { TablePopout } from './blocks/TablePopout';
+import { CodePathValidationContext } from './CodePathValidationContext';
+import { useValidatedCodePaths } from '../hooks/useValidatedCodePaths';
 import { AnnotationToolbar } from './AnnotationToolbar';
 import { FloatingQuickLabelPicker } from './FloatingQuickLabelPicker';
 
@@ -24,19 +31,22 @@ class ToolbarErrorBoundary extends React.Component<
     return this.props.children;
   }
 }
-import { CommentPopover } from './CommentPopover';
+
+import { CommentPopover, type CommentAskAIHandler } from './CommentPopover';
 import { TaterSpriteSitting } from './TaterSpriteSitting';
 import { AttachmentsButton } from './AttachmentsButton';
+import { MessagesIcon } from './icons/MessagesIcon';
 import { GraphvizBlock } from './GraphvizBlock';
 import { MermaidBlock } from './MermaidBlock';
-import { getImageSrc } from './ImageThumbnail';
 import { isGraphvizLanguage, isMermaidLanguage } from './diagramLanguages';
 import { getIdentity } from '../utils/identity';
 import { type QuickLabel } from '../utils/quickLabels';
-import { PlanDiffBadge } from './plan-diff/PlanDiffBadge';
+import { DocBadges, type LinkedDocBadgeInfo } from './DocBadges';
 import { PinpointOverlay } from './PinpointOverlay';
 import { usePinpoint } from '../hooks/usePinpoint';
 import { useAnnotationHighlighter } from '../hooks/useAnnotationHighlighter';
+import { useScrollViewport } from '../hooks/useScrollViewport';
+import { decodeAnchorHash } from '../utils/anchors';
 
 interface ViewerProps {
   blocks: Block[];
@@ -52,11 +62,21 @@ interface ViewerProps {
   globalAttachments?: ImageAttachment[];
   onAddGlobalAttachment?: (image: ImageAttachment) => void;
   onRemoveGlobalAttachment?: (path: string) => void;
-  repoInfo?: { display: string; branch?: string } | null;
+  repoInfo?: { display: string; branch?: string; host?: string } | null;
   stickyActions?: boolean;
+  /** Render the plan as a floating card on a grid background (shadow/border/padding). Default false. */
+  gridEnabled?: boolean;
   onOpenLinkedDoc?: (path: string) => void;
+  onOpenCodeFile?: (path: string) => void;
   imageBaseDir?: string;
-  linkedDocInfo?: { filepath: string; onBack: () => void; label?: string } | null;
+  /** Directory the active document lives in — used by the code-path validator
+   *  so out-of-tree relative references (e.g. `../foo.ts` in a linked doc)
+   *  resolve against the doc's own directory rather than only cwd. */
+  codePathBaseDir?: string;
+  /** Opt out of `/api/doc/exists` code-path validation (host without that
+   *  endpoint). Default undefined for Plannotator => validation stays on. */
+  disableCodePathValidation?: boolean;
+  linkedDocInfo?: LinkedDocBadgeInfo | null;
   // Plan diff props
   planDiffStats?: { additions: number; deletions: number; modifications: number } | null;
   isPlanDiffActive?: boolean;
@@ -64,11 +84,41 @@ interface ViewerProps {
   hasPreviousVersion?: boolean;
   /** Show amber "Demo" badge (portal mode, no shared content loaded) */
   showDemoBadge?: boolean;
-  /** Max width in px for the plan card (from plan width setting) */
-  maxWidth?: number;
+  /** Max width in px for the plan card; null removes the cap entirely. */
+  maxWidth?: number | null;
   /** Label for the copy button (default: "Copy plan") */
   copyLabel?: string;
+  /**
+   * Compactness of the action button labels. See ActionsLabelMode in
+   * types.ts. Defaults to 'full' to preserve the original look for
+   * callers that don't measure plan-area width.
+   */
+  actionsLabelMode?: ActionsLabelMode;
   archiveInfo?: { status: 'approved' | 'denied' | 'unknown'; timestamp: string; title: string } | null;
+  /** Source attribution for HTML/URL annotations (e.g. URL or filename) */
+  sourceInfo?: string;
+  /** Absolute path of the annotated source file for the Open-in-app control. */
+  openInAppPath?: string | null;
+  /**
+   * Message picker affordance — annotate-last mode only. Shown as a button in
+   * the sticky-top action bar so the user can switch to a different recent
+   * assistant message. Clicking opens the full picker in the left sidebar's
+   * Messages tab.
+   */
+  messagePickerInfo?: { current: number; total: number; onOpen: () => void };
+  // Checkbox toggle props
+  onToggleCheckbox?: (blockId: string, checked: boolean) => void;
+  checkboxOverrides?: Map<string, boolean>;
+  onAskAI?: CommentAskAIHandler;
+  /** Whether comment popovers offer image attachments. Hosts without an
+   *  uploadTransport pass false so the attach affordance never dead-ends.
+   *  Default true — today's behavior. */
+  allowImages?: boolean;
+  /** View-only mode: suppresses every annotation-creation entry point
+   *  (selection toolbar, comment popovers, quick labels, pinpoint, global
+   *  comment, attachments, checkbox toggles). Existing annotations still
+   *  render and remain selectable. Default false — today's behavior. */
+  readOnly?: boolean;
 }
 
 export interface ViewerHandle {
@@ -126,6 +176,7 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(({
   onRemoveGlobalAttachment,
   repoInfo,
   stickyActions = true,
+  gridEnabled = false,
   planDiffStats,
   isPlanDiffActive,
   onPlanDiffToggle,
@@ -133,13 +184,26 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(({
   showDemoBadge,
   maxWidth,
   onOpenLinkedDoc,
+  onOpenCodeFile,
   linkedDocInfo,
   imageBaseDir,
+  codePathBaseDir,
+  disableCodePathValidation,
   copyLabel,
+  actionsLabelMode = 'full',
   archiveInfo,
+  sourceInfo,
+  openInAppPath,
+  messagePickerInfo,
+  onToggleCheckbox,
+  checkboxOverrides,
+  onAskAI,
+  allowImages = true,
+  readOnly = false,
 }, ref) => {
   const [copied, setCopied] = useState(false);
   const [lightbox, setLightbox] = useState<{ src: string; alt: string } | null>(null);
+  const [locationHash, setLocationHash] = useState(() => window.location.hash);
   const globalCommentButtonRef = useRef<HTMLButtonElement>(null);
 
   const handleCopyPlan = async () => {
@@ -152,12 +216,44 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(({
     }
   };
   const containerRef = useRef<HTMLDivElement>(null);
+  // The badge cluster (repo chips / diff badge) is absolutely positioned in the
+  // card's top padding. One row fits; a second row (diff badge) or mobile
+  // wrapping outgrows the padding and lands on the document's first heading.
+  // Measure the cluster and insert exactly the clearance it needs (0 when it fits).
+  const docBadgesRef = useRef<HTMLDivElement | null>(null);
+  const [badgeClearance, setBadgeClearance] = useState(0);
+  useEffect(() => {
+    const el = docBadgesRef.current;
+    const article = containerRef.current;
+    if (!el || !article) { setBadgeClearance(0); return; }
+    const measure = () => {
+      const pad = parseFloat(getComputedStyle(article).paddingTop) || 0;
+      const overflow = el.offsetTop + el.offsetHeight - pad;
+      setBadgeClearance(overflow > 1 ? overflow + 4 : 0);
+    };
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    window.addEventListener('resize', measure);
+    return () => { ro.disconnect(); window.removeEventListener('resize', measure); };
+  }, [repoInfo, hasPreviousVersion, showDemoBadge, linkedDocInfo, archiveInfo, sourceInfo, planDiffStats, openInAppPath]);
+
+  // Per-doc heading slug map with dedup — computed once per blocks array so
+  // anchor ids stay stable across re-renders and duplicate heading texts get
+  // `-1`/`-2`/... suffixes rather than colliding on the same id.
+  const headingSlugMap = useMemo(() => buildHeadingSlugMap(blocks), [blocks]);
+  const isTouchDevice = useMemo(() => window.matchMedia('(pointer: coarse)').matches, []);
   const [hoveredCodeBlock, setHoveredCodeBlock] = useState<{ block: Block; element: HTMLElement } | null>(null);
   const [isCodeBlockToolbarExiting, setIsCodeBlockToolbarExiting] = useState(false);
+  const [hoveredTable, setHoveredTable] = useState<{ block: Block; element: HTMLElement } | null>(null);
+  const [isTableToolbarExiting, setIsTableToolbarExiting] = useState(false);
+  const tableHoverTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [popoutTable, setPopoutTable] = useState<Block | null>(null);
   // Viewer-specific comment popover state (global comments + code blocks)
   const [viewerCommentPopover, setViewerCommentPopover] = useState<{
     anchorEl: HTMLElement;
     contextText: string;
+    selectedText?: string;
     initialText?: string;
     isGlobal: boolean;
     codeBlock?: { block: Block; element: HTMLElement };
@@ -167,8 +263,9 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(({
     anchorEl: HTMLElement;
     codeBlock: { block: Block; element: HTMLElement };
   } | null>(null);
-  const hoverTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const hoverTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const stickySentinelRef = useRef<HTMLDivElement>(null);
+  const lastAutoScrolledHashRef = useRef<string | null>(null);
   const [isStuck, setIsStuck] = useState(false);
 
   // Shared annotation infrastructure via hook
@@ -195,6 +292,7 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(({
     onSelectAnnotation,
     selectedAnnotationId,
     mode,
+    enabled: !readOnly,
   });
 
   // Refs for code block annotation path
@@ -220,6 +318,7 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(({
       setViewerCommentPopover({
         anchorEl: element,
         contextText: (codeEl.textContent || '').slice(0, 80),
+        selectedText: codeEl.textContent || '',
         isGlobal: false,
         codeBlock: { block: blocks.find(b => b.id === blockId)!, element },
       });
@@ -230,16 +329,14 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(({
     containerRef,
     highlighterRef,
     inputMethod,
-    enabled: !toolbarState && !hookCommentPopover && !viewerCommentPopover && !hookQuickLabelPicker && !codeBlockQuickLabelPicker && !(isPlanDiffActive ?? false),
+    enabled: !readOnly && !toolbarState && !hookCommentPopover && !viewerCommentPopover && !hookQuickLabelPicker && !codeBlockQuickLabelPicker && !(isPlanDiffActive ?? false),
     onCodeBlockClick: handlePinpointCodeBlockClick,
   });
 
   // Suppress native context menu on touch devices (prevents cut/copy/paste overlay on mobile)
   useEffect(() => {
     const container = containerRef.current;
-    if (!container) return;
-    const isTouchPrimary = window.matchMedia('(pointer: coarse)').matches;
-    if (!isTouchPrimary) return;
+    if (!container || !isTouchDevice) return;
 
     const handleContextMenu = (e: Event) => {
       e.preventDefault();
@@ -249,42 +346,86 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(({
     return () => container.removeEventListener('contextmenu', handleContextMenu);
   }, []);
 
-  // Detect when sticky action bar is "stuck" to show card background
+  // Detect when sticky action bar is "stuck" to show card background.
+  // The IntersectionObserver root must be the actual scroll element — the
+  // OverlayScrollArea viewport — not the <main> host, which doesn't scroll.
+  const stickyScrollViewport = useScrollViewport();
   useEffect(() => {
-    if (!stickyActions || !stickySentinelRef.current) return;
-    const scrollContainer = document.querySelector('main');
+    if (!stickyActions || !stickySentinelRef.current || !stickyScrollViewport) return;
     const observer = new IntersectionObserver(
       ([entry]) => setIsStuck(!entry.isIntersecting),
-      { root: scrollContainer, threshold: 0 }
+      { root: stickyScrollViewport, threshold: 0 }
     );
     observer.observe(stickySentinelRef.current);
     return () => observer.disconnect();
-  }, [stickyActions]);
+  }, [stickyActions, stickyScrollViewport]);
 
-  // Cmd+C / Ctrl+C keyboard shortcut for copying selected text
   useEffect(() => {
-    const handleKeyDown = async (e: KeyboardEvent) => {
-      // Check for Cmd+C (Mac) or Ctrl+C (Windows/Linux)
-      if ((e.metaKey || e.ctrlKey) && e.key === 'c') {
-        // Don't intercept if typing in an input/textarea
-        const tag = (e.target as HTMLElement)?.tagName;
-        if (tag === 'INPUT' || tag === 'TEXTAREA') return;
+    const handleHashChange = () => {
+      lastAutoScrolledHashRef.current = null;
+      setLocationHash(window.location.hash);
+    };
 
-        // If we have an active selection with captured text, use that
-        if (toolbarState?.selectionText) {
-          e.preventDefault();
-          try {
-            await navigator.clipboard.writeText(toolbarState.selectionText);
-          } catch (err) {
-            console.error('Failed to copy:', err);
-          }
-        }
-        // Otherwise let the browser handle default copy behavior
+    window.addEventListener('hashchange', handleHashChange);
+    return () => window.removeEventListener('hashchange', handleHashChange);
+  }, []);
+
+  const scrollToAnchor = useCallback((hash: string) => {
+    const anchor = decodeAnchorHash(hash);
+    if (!anchor) return false;
+
+    const container = containerRef.current;
+    if (!container || !stickyScrollViewport) return false;
+
+    const target = document.getElementById(anchor);
+    if (!target || !container.contains(target)) return false;
+
+    const stickyActionsEl = container.querySelector<HTMLElement>('[data-sticky-actions]');
+    const stickyTop = stickyActionsEl
+      ? Number.parseFloat(window.getComputedStyle(stickyActionsEl).top || '0') || 0
+      : 0;
+    const headerOffset = stickyActionsEl
+      ? stickyActionsEl.getBoundingClientRect().height + stickyTop
+      : 0;
+    const containerRect = stickyScrollViewport.getBoundingClientRect();
+    const targetRect = target.getBoundingClientRect();
+    const relativeTop = targetRect.top - containerRect.top;
+    const offsetPosition = stickyScrollViewport.scrollTop + relativeTop - headerOffset;
+
+    stickyScrollViewport.scrollTo({
+      top: Math.max(0, offsetPosition),
+      behavior: 'smooth',
+    });
+    return true;
+  }, [stickyScrollViewport]);
+
+  useEffect(() => {
+    if (!stickyScrollViewport || !locationHash || lastAutoScrolledHashRef.current === locationHash) return;
+    const timer = window.setTimeout(() => {
+      if (scrollToAnchor(locationHash)) {
+        lastAutoScrolledHashRef.current = locationHash;
+      }
+    }, 0);
+    return () => window.clearTimeout(timer);
+  }, [blocks, locationHash, scrollToAnchor, stickyScrollViewport]);
+
+  // Use the native copy event so clipboard writes are synchronous (Safari
+  // rejects the async navigator.clipboard API outside the user-gesture window).
+  // web-highlighter clears the DOM selection on mouseup, so the browser has
+  // nothing to copy by the time Cmd+C fires — we inject the captured text here.
+  useEffect(() => {
+    const handleCopy = (e: ClipboardEvent) => {
+      const tag = (e.target as HTMLElement)?.tagName;
+      if (tag === 'INPUT' || tag === 'TEXTAREA') return;
+
+      if (toolbarState?.selectionText) {
+        e.preventDefault();
+        e.clipboardData?.setData('text/plain', toolbarState.selectionText);
       }
     };
 
-    document.addEventListener('keydown', handleKeyDown);
-    return () => document.removeEventListener('keydown', handleKeyDown);
+    document.addEventListener('copy', handleCopy);
+    return () => document.removeEventListener('copy', handleCopy);
   }, [toolbarState]);
 
   // Imperative handle — delegates to hook, extends removeHighlight for code blocks
@@ -385,6 +526,7 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(({
     setViewerCommentPopover({
       anchorEl: hoveredCodeBlock.element,
       contextText: codeText.slice(0, 80),
+      selectedText: codeText,
       initialText: initialChar,
       isGlobal: false,
       codeBlock: hoveredCodeBlock,
@@ -423,108 +565,75 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(({
     setViewerCommentPopover(null);
   }, []);
 
+  const codePathValidation = useValidatedCodePaths(markdown, codePathBaseDir, disableCodePathValidation);
+
   return (
-    <div className="relative z-50 w-full" style={maxWidth ? { maxWidth } : { maxWidth: 832 }}>
+    <CodePathValidationContext.Provider value={codePathValidation}>
+    <div className="relative z-50 w-full" style={maxWidth === null ? undefined : { maxWidth: maxWidth ?? 832 }}>
       {taterMode && <TaterSpriteSitting />}
       <article
         ref={containerRef}
-        className={`w-full bg-card rounded-xl shadow-xl p-5 md:p-8 lg:p-10 xl:p-12 relative ${
-          linkedDocInfo ? 'border border-primary/40' : 'border border-border/50'
-        } ${inputMethod === 'pinpoint' ? 'cursor-crosshair' : ''}`}
+        data-print-region="article"
+        className={`w-full bg-card rounded-xl py-5 md:py-8 lg:py-10 xl:py-12 relative ${gridEnabled ? 'px-5 md:px-8 lg:px-10 xl:px-12 shadow-xl border border-border/50' : ''} ${inputMethod === 'pinpoint' ? 'cursor-pointer' : ''}`}
         style={{ WebkitTouchCallout: 'none' } as React.CSSProperties}
       >
         {/* Repo info + plan diff badge + demo badge + linked doc badge + archive badge - top left */}
-        {(repoInfo || hasPreviousVersion || showDemoBadge || linkedDocInfo || archiveInfo) && (
-          <div className="absolute top-3 left-3 md:top-4 md:left-5 flex flex-col items-start gap-1 text-[9px] text-muted-foreground/50 font-mono">
-            {repoInfo && !linkedDocInfo && (
-              <div className="flex items-center gap-1.5">
-                <span className="px-1.5 py-0.5 bg-muted/50 rounded truncate max-w-[140px]" title={repoInfo.display}>
-                  {repoInfo.display}
-                </span>
-                {repoInfo.branch && (
-                  <span className="px-1.5 py-0.5 bg-muted/30 rounded max-w-[120px] flex items-center gap-1 overflow-hidden" title={repoInfo.branch}>
-                    <svg className="w-2.5 h-2.5 flex-shrink-0" viewBox="0 0 16 16" fill="currentColor">
-                      <path d="M9.5 3.25a2.25 2.25 0 1 1 3 2.122V6A2.5 2.5 0 0 1 10 8.5H6a1 1 0 0 0-1 1v1.128a2.251 2.251 0 1 1-1.5 0V5.372a2.25 2.25 0 1 1 1.5 0v1.836A2.493 2.493 0 0 1 6 7h4a1 1 0 0 0 1-1v-.628A2.25 2.25 0 0 1 9.5 3.25Zm-6 0a.75.75 0 1 0 1.5 0 .75.75 0 0 0-1.5 0Zm8.25-.75a.75.75 0 1 0 0 1.5.75.75 0 0 0 0-1.5ZM4.25 12a.75.75 0 1 0 0 1.5.75.75 0 0 0 0-1.5Z" />
-                    </svg>
-                    <span className="truncate">{repoInfo.branch}</span>
-                  </span>
-                )}
-              </div>
-            )}
-            {onPlanDiffToggle && !linkedDocInfo && (
-              <PlanDiffBadge
-                stats={planDiffStats ?? null}
-                isActive={isPlanDiffActive ?? false}
-                onToggle={onPlanDiffToggle}
-                hasPreviousVersion={hasPreviousVersion ?? false}
-              />
-            )}
-            {showDemoBadge && !linkedDocInfo && (
-              <span className="px-1.5 py-0.5 rounded text-[9px] font-mono bg-amber-500/15 text-amber-600 dark:text-amber-400">
-                Demo
-              </span>
-            )}
-            {archiveInfo && !linkedDocInfo && (
-              <div className="flex items-center gap-1.5">
-                <span className={`px-1.5 py-0.5 rounded ${
-                  archiveInfo.status === 'approved'
-                    ? 'bg-green-500/15 text-green-600 dark:text-green-400'
-                    : archiveInfo.status === 'denied'
-                      ? 'bg-red-500/15 text-red-600 dark:text-red-400'
-                      : 'bg-muted/50 text-muted-foreground'
-                }`}>
-                  {archiveInfo.status === 'approved' ? 'Approved' : archiveInfo.status === 'denied' ? 'Denied' : 'Unknown'}
-                </span>
-                {archiveInfo.timestamp && (
-                  <span className="px-1.5 py-0.5 bg-muted/50 rounded" title={archiveInfo.timestamp}>
-                    {new Date(archiveInfo.timestamp).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' })}
-                    {' '}
-                    {new Date(archiveInfo.timestamp).toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })}
-                  </span>
-                )}
-              </div>
-            )}
-            {linkedDocInfo && (
-              <div className="flex items-center gap-1.5">
-                <button
-                  onClick={linkedDocInfo.onBack}
-                  className="px-1.5 py-0.5 bg-primary/10 text-primary rounded hover:bg-primary/20 transition-colors flex items-center gap-1"
-                >
-                  <svg className="w-2.5 h-2.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
-                    <path strokeLinecap="round" strokeLinejoin="round" d="M10.5 19.5L3 12m0 0l7.5-7.5M3 12h18" />
-                  </svg>
-                  plan
-                </button>
-                <span className="px-1.5 py-0.5 bg-primary/10 text-primary/80 rounded">
-                  {linkedDocInfo.label || 'Linked File'}
-                </span>
-                <span
-                  className="px-1.5 py-0.5 bg-muted/50 text-muted-foreground rounded truncate max-w-[200px]"
-                  title={linkedDocInfo.filepath}
-                >
-                  {linkedDocInfo.filepath.split('/').pop()}
-                </span>
-              </div>
-            )}
+        {(repoInfo || hasPreviousVersion || showDemoBadge || linkedDocInfo || archiveInfo || sourceInfo || openInAppPath) && (
+          <div ref={docBadgesRef} data-print-hide className={`absolute top-3 md:top-4 ${gridEnabled ? 'left-3 md:left-5' : 'left-0'}`}>
+            <DocBadges
+              layout="column"
+              repoInfo={repoInfo}
+              planDiffStats={planDiffStats}
+              isPlanDiffActive={isPlanDiffActive}
+              hasPreviousVersion={hasPreviousVersion}
+              onPlanDiffToggle={onPlanDiffToggle}
+              showDemoBadge={showDemoBadge}
+              archiveInfo={archiveInfo}
+              linkedDocInfo={linkedDocInfo}
+              sourceInfo={sourceInfo}
+              openInAppPath={openInAppPath}
+            />
           </div>
         )}
+
+        {/* Clearance so document content starts below the (absolute) badge cluster
+            when it outgrows the card's top padding — see the measuring effect above. */}
+        {badgeClearance > 0 && <div data-print-hide style={{ height: badgeClearance }} aria-hidden="true" />}
 
         {/* Sentinel for sticky detection */}
         {stickyActions && <div ref={stickySentinelRef} className="h-0 w-0 float-right" aria-hidden="true" />}
 
         {/* Header buttons - top right */}
-        <div className={`${stickyActions ? 'sticky top-3' : ''} z-30 float-right flex items-start gap-1 md:gap-2 rounded-lg p-1 md:p-2 transition-colors duration-150 ${isStuck ? 'bg-card/95 backdrop-blur-sm shadow-sm' : ''} -mr-3 mt-6 md:-mr-5 md:-mt-5 lg:-mr-7 lg:-mt-7 xl:-mr-9 xl:-mt-9`}>
+        <div data-print-hide data-sticky-actions className={`${stickyActions ? 'sticky top-3' : ''} z-30 float-right flex items-start gap-1 md:gap-2 rounded-lg p-1 md:p-2 transition-colors duration-150 ${isStuck ? 'bg-card/95 backdrop-blur-sm shadow-sm' : ''} ${gridEnabled ? '-mr-3 md:-mr-5 lg:-mr-7 xl:-mr-9' : '-mr-1 md:-mr-2'} mt-6 md:-mt-5 lg:-mt-7 xl:-mt-9`}>
+          {messagePickerInfo && (
+            <button
+              onClick={messagePickerInfo.onOpen}
+              className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium text-muted-foreground hover:text-foreground bg-muted/50 hover:bg-muted rounded-md transition-colors"
+              title="Pick a different message to annotate"
+            >
+              <MessagesIcon />
+              {actionsLabelMode === 'full' && (
+                <span>Message {messagePickerInfo.current} of {messagePickerInfo.total}</span>
+              )}
+              {actionsLabelMode === 'short' && (
+                <span>{messagePickerInfo.current}/{messagePickerInfo.total}</span>
+              )}
+            </button>
+          )}
+
           {/* Attachments button */}
-          {onAddGlobalAttachment && onRemoveGlobalAttachment && (
+          {!readOnly && onAddGlobalAttachment && onRemoveGlobalAttachment && (
             <AttachmentsButton
               images={globalAttachments}
               onAdd={onAddGlobalAttachment}
               onRemove={onRemoveGlobalAttachment}
               variant="toolbar"
+              hideLabel={actionsLabelMode === 'icon'}
             />
           )}
 
           {/* <span className="md:hidden">Comment</span><span className="hidden md:inline">Global comment</span> button */}
+          {!readOnly && (
           <button
             ref={globalCommentButtonRef}
             onClick={() => {
@@ -540,8 +649,10 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(({
             <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
               <path strokeLinecap="round" strokeLinejoin="round" d="M12 21a9.004 9.004 0 008.716-6.747M12 21a9.004 9.004 0 01-8.716-6.747M12 21c2.485 0 4.5-4.03 4.5-9S14.485 3 12 3m0 18c-2.485 0-4.5-4.03-4.5-9S9.515 3 12 3m0 0a8.997 8.997 0 017.843 4.582M12 3a8.997 8.997 0 00-7.843 4.582m15.686 0A11.953 11.953 0 0112 10.5c-2.998 0-5.74-1.1-7.843-2.918m15.686 0A8.959 8.959 0 0121 12c0 .778-.099 1.533-.284 2.253m0 0A17.919 17.919 0 0112 16.5c-3.162 0-6.133-.815-8.716-2.247m0 0A9.015 9.015 0 013 12c0-1.605.42-3.113 1.157-4.418" />
             </svg>
-            <span className="md:hidden">Comment</span><span className="hidden md:inline">Global comment</span>
+            {actionsLabelMode === 'full' && <span>Global comment</span>}
+            {actionsLabelMode === 'short' && <span>Comment</span>}
           </button>
+          )}
 
           {/* Copy plan/file button */}
           <button
@@ -561,7 +672,8 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(({
                 <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
                   <path strokeLinecap="round" strokeLinejoin="round" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
                 </svg>
-                <span className="md:hidden">Copy</span><span className="hidden md:inline">{copyLabel || (linkedDocInfo ? 'Copy file' : 'Copy plan')}</span>
+                {actionsLabelMode === 'full' && <span>{copyLabel || (linkedDocInfo ? 'Copy file' : 'Copy plan')}</span>}
+                {actionsLabelMode === 'short' && <span>Copy</span>}
               </>
             )}
           </button>
@@ -570,15 +682,63 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(({
         {!frontmatter && blocks.length > 0 && blocks[0].type !== 'heading' && <div className="mt-4" />}
         {groupBlocks(blocks).map(group =>
           group.type === 'list-group' ? (
-            <div key={group.key} data-pinpoint-group="list" className="py-1 -mx-2 px-2">
-              {group.blocks.map(block => (
-                <BlockRenderer imageBaseDir={imageBaseDir} onImageClick={(src, alt) => setLightbox({ src, alt })} key={block.id} block={block} onOpenLinkedDoc={onOpenLinkedDoc} />
-              ))}
-            </div>
+            (() => {
+              const indices = computeListIndices(group.blocks);
+              return (
+                <div key={group.key} data-pinpoint-group="list" className="py-1 -mx-2 px-2">
+                  {group.blocks.map((block, i) => (
+                    <BlockRenderer
+                      imageBaseDir={imageBaseDir}
+                      onImageClick={(src, alt) => setLightbox({ src, alt })}
+                      key={block.id}
+                      block={block}
+                      orderedIndex={indices[i]}
+                      onOpenLinkedDoc={onOpenLinkedDoc}
+                      onOpenCodeFile={onOpenCodeFile}
+                      onToggleCheckbox={readOnly ? undefined : onToggleCheckbox}
+                      checkboxOverrides={checkboxOverrides}
+                      githubRepo={repoInfo?.display}
+                      headingAnchorId={headingSlugMap.get(block.id)}
+                      onNavigateAnchor={scrollToAnchor}
+                    />
+                  ))}
+                </div>
+              );
+            })()
           ) : group.block.type === 'code' && isMermaidLanguage(group.block.language) ? (
             <MermaidBlock key={group.block.id} block={group.block} />
           ) : group.block.type === 'code' && isGraphvizLanguage(group.block.language) ? (
             <GraphvizBlock key={group.block.id} block={group.block} />
+          ) : group.block.type === 'table' ? (
+            <TableBlock
+              key={group.block.id}
+              block={group.block}
+              imageBaseDir={imageBaseDir}
+              onImageClick={(src, alt) => setLightbox({ src, alt })}
+              onOpenLinkedDoc={onOpenLinkedDoc}
+              onOpenCodeFile={onOpenCodeFile}
+              githubRepo={repoInfo?.display}
+              onNavigateAnchor={scrollToAnchor}
+              onHover={(element) => {
+                if (tableHoverTimeoutRef.current) {
+                  clearTimeout(tableHoverTimeoutRef.current);
+                  tableHoverTimeoutRef.current = null;
+                }
+                setIsTableToolbarExiting(false);
+                if (!toolbarState) {
+                  setHoveredTable({ block: group.block, element });
+                }
+              }}
+              onLeave={() => {
+                tableHoverTimeoutRef.current = setTimeout(() => {
+                  setIsTableToolbarExiting(true);
+                  setTimeout(() => {
+                    setHoveredTable(null);
+                    setIsTableToolbarExiting(false);
+                  }, 150);
+                }, 100);
+              }}
+            />
           ) : group.block.type === 'code' ? (
             <CodeBlock
               key={group.block.id}
@@ -610,7 +770,7 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(({
               isHovered={inputMethod !== 'pinpoint' && hoveredCodeBlock?.block.id === group.block.id}
             />
           ) : (
-            <BlockRenderer imageBaseDir={imageBaseDir} onImageClick={(src, alt) => setLightbox({ src, alt })} key={group.block.id} block={group.block} onOpenLinkedDoc={onOpenLinkedDoc} />
+            <BlockRenderer imageBaseDir={imageBaseDir} onImageClick={(src, alt) => setLightbox({ src, alt })} key={group.block.id} block={group.block} onOpenLinkedDoc={onOpenLinkedDoc} onOpenCodeFile={onOpenCodeFile} onNavigateAnchor={scrollToAnchor} onToggleCheckbox={readOnly ? undefined : onToggleCheckbox} checkboxOverrides={checkboxOverrides} githubRepo={repoInfo?.display} headingAnchorId={headingSlugMap.get(group.block.id)} />
           )
         )}
 
@@ -625,9 +785,44 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(({
               onRequestComment={handleRequestComment}
               onQuickLabel={handleQuickLabel}
               copyText={toolbarState.selectionText}
+              hideCopyButton={!isTouchDevice}
               closeOnScrollOut
             />
           </ToolbarErrorBoundary>
+        )}
+
+        {/* Table hover toolbar */}
+        {hoveredTable && !toolbarState && (
+          <TableToolbar
+            element={hoveredTable.element}
+            markdown={hoveredTable.block.content}
+            isExiting={isTableToolbarExiting}
+            onExpand={() => {
+              setPopoutTable(hoveredTable.block);
+              setHoveredTable(null);
+              setIsTableToolbarExiting(false);
+              if (tableHoverTimeoutRef.current) {
+                clearTimeout(tableHoverTimeoutRef.current);
+                tableHoverTimeoutRef.current = null;
+              }
+            }}
+            onMouseEnter={() => {
+              if (tableHoverTimeoutRef.current) {
+                clearTimeout(tableHoverTimeoutRef.current);
+                tableHoverTimeoutRef.current = null;
+              }
+              setIsTableToolbarExiting(false);
+            }}
+            onMouseLeave={() => {
+              tableHoverTimeoutRef.current = setTimeout(() => {
+                setIsTableToolbarExiting(true);
+                setTimeout(() => {
+                  setHoveredTable(null);
+                  setIsTableToolbarExiting(false);
+                }, 150);
+              }, 100);
+            }}
+          />
         )}
 
         {/* Code block hover toolbar */}
@@ -661,6 +856,23 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(({
           </ToolbarErrorBoundary>
         )}
 
+        {/* Table popout dialog — portaled into containerRef so annotations */}
+        {/* can walk into its text nodes the same way they do the inline table. */}
+        {popoutTable && (
+          <TablePopout
+            block={popoutTable}
+            open={!!popoutTable}
+            onClose={() => setPopoutTable(null)}
+            container={containerRef.current}
+            imageBaseDir={imageBaseDir}
+            onImageClick={(src, alt) => setLightbox({ src, alt })}
+            onOpenLinkedDoc={onOpenLinkedDoc}
+            onOpenCodeFile={onOpenCodeFile}
+            githubRepo={repoInfo?.display}
+            onNavigateAnchor={scrollToAnchor}
+          />
+        )}
+
         {/* Pinpoint hover overlay */}
         {inputMethod === 'pinpoint' && (
           <PinpointOverlay target={hoverTarget} containerRef={containerRef} />
@@ -668,15 +880,23 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(({
 
         {/* Comment popover — hook handles text selection, Viewer handles global + code block */}
         {hookCommentPopover && (
-          <CommentPopover
-            anchorEl={hookCommentPopover.anchorEl}
-            contextText={hookCommentPopover.contextText}
-            isGlobal={false}
-            initialText={hookCommentPopover.initialText}
-            onSubmit={hookCommentSubmit}
-            onClose={hookCommentClose}
-          />
-        )}
+            <CommentPopover
+              anchorEl={hookCommentPopover.anchorEl}
+              contextText={hookCommentPopover.contextText}
+              isGlobal={false}
+              initialText={hookCommentPopover.initialText}
+              onSubmit={hookCommentSubmit}
+              onClose={hookCommentClose}
+              allowImages={allowImages}
+              onAskAI={onAskAI}
+              askAIContext={{
+                kind: 'selection',
+                label: 'Selected text',
+                text: hookCommentPopover.selectedText ?? hookCommentPopover.contextText,
+                sourcePath: linkedDocInfo?.filepath ?? sourceInfo,
+              }}
+            />
+          )}
         {viewerCommentPopover && (
           <CommentPopover
             anchorEl={viewerCommentPopover.anchorEl}
@@ -685,6 +905,14 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(({
             initialText={viewerCommentPopover.initialText}
             onSubmit={handleViewerCommentSubmit}
             onClose={handleViewerCommentClose}
+            allowImages={allowImages}
+            onAskAI={onAskAI}
+            askAIContext={{
+              kind: viewerCommentPopover.isGlobal ? 'general' : 'selection',
+              label: viewerCommentPopover.isGlobal ? 'Document' : 'Code block',
+              text: viewerCommentPopover.selectedText,
+              sourcePath: linkedDocInfo?.filepath ?? sourceInfo,
+            }}
           />
         )}
 
@@ -725,6 +953,7 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(({
         document.body
       )}
     </div>
+    </CodePathValidationContext.Provider>
   );
 });
 
@@ -756,390 +985,6 @@ const ImageLightbox: React.FC<{ src: string; alt: string; onClose: () => void }>
   );
 };
 
-/**
- * Renders inline markdown: **bold**, *italic*, `code`, [links](url)
- */
-const InlineMarkdown: React.FC<{ text: string; onOpenLinkedDoc?: (path: string) => void; imageBaseDir?: string; onImageClick?: (src: string, alt: string) => void }> = ({ text, onOpenLinkedDoc, imageBaseDir, onImageClick }) => {
-  const parts: React.ReactNode[] = [];
-  let remaining = text;
-  let key = 0;
 
-  while (remaining.length > 0) {
-    // Bold: **text**
-    let match = remaining.match(/^\*\*(.+?)\*\*/);
-    if (match) {
-      parts.push(<strong key={key++} className="font-semibold"><InlineMarkdown imageBaseDir={imageBaseDir} onImageClick={onImageClick} text={match[1]} onOpenLinkedDoc={onOpenLinkedDoc} /></strong>);
-      remaining = remaining.slice(match[0].length);
-      continue;
-    }
 
-    // Italic: *text*
-    match = remaining.match(/^\*(.+?)\*/);
-    if (match) {
-      parts.push(<em key={key++}><InlineMarkdown imageBaseDir={imageBaseDir} onImageClick={onImageClick} text={match[1]} onOpenLinkedDoc={onOpenLinkedDoc} /></em>);
-      remaining = remaining.slice(match[0].length);
-      continue;
-    }
 
-    // Inline code: `code`
-    match = remaining.match(/^`([^`]+)`/);
-    if (match) {
-      parts.push(
-        <code key={key++} className="px-1.5 py-0.5 rounded bg-muted text-sm font-mono">
-          {match[1]}
-        </code>
-      );
-      remaining = remaining.slice(match[0].length);
-      continue;
-    }
-
-    // Wikilinks: [[filename]] or [[filename|display text]]
-    match = remaining.match(/^\[\[([^\]|]+)(?:\|([^\]]+))?\]\]/);
-    if (match) {
-      const target = match[1].trim();
-      const display = match[2]?.trim() || target;
-      const targetPath = /\.mdx?$/i.test(target) ? target : `${target}.md`;
-
-      if (onOpenLinkedDoc) {
-        parts.push(
-          <a
-            key={key++}
-            href={targetPath}
-            onClick={(e) => {
-              e.preventDefault();
-              onOpenLinkedDoc(targetPath);
-            }}
-            className="text-primary underline underline-offset-2 hover:text-primary/80 inline-flex items-center gap-1 cursor-pointer"
-            title={`Open: ${target}`}
-          >
-            {display}
-            <svg className="w-3 h-3 opacity-50 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2} aria-hidden="true">
-              <path strokeLinecap="round" strokeLinejoin="round" d="M19.5 14.25v-2.625a3.375 3.375 0 00-3.375-3.375h-1.5A1.125 1.125 0 0113.5 7.125v-1.5a3.375 3.375 0 00-3.375-3.375H8.25m2.25 0H5.625c-.621 0-1.125.504-1.125 1.125v17.25c0 .621.504 1.125 1.125 1.125h12.75c.621 0 1.125-.504 1.125-1.125V11.25a9 9 0 00-9-9z" />
-            </svg>
-          </a>
-        );
-      } else {
-        parts.push(
-          <span key={key++} className="text-primary">{display}</span>
-        );
-      }
-      remaining = remaining.slice(match[0].length);
-      continue;
-    }
-
-    // Images: ![alt](path)
-    match = remaining.match(/^!\[([^\]]*)\]\(([^)]+)\)/);
-    if (match) {
-      const alt = match[1];
-      const src = match[2];
-      const imgSrc = /^https?:\/\//.test(src) ? src : getImageSrc(src, imageBaseDir);
-      parts.push(
-        <img
-          key={key++}
-          src={imgSrc}
-          alt={alt}
-          className="max-w-full rounded my-2 cursor-zoom-in"
-          loading="lazy"
-          onClick={(e) => { e.stopPropagation(); onImageClick?.(imgSrc, alt); }}
-        />
-      );
-      remaining = remaining.slice(match[0].length);
-      continue;
-    }
-
-    // Links: [text](url)
-    match = remaining.match(/^\[([^\]]+)\]\(([^)]+)\)/);
-    if (match) {
-      const linkText = match[1];
-      const linkUrl = match[2];
-      const isLocalMd = /\.md(x?)$/i.test(linkUrl) &&
-        !linkUrl.startsWith('http://') &&
-        !linkUrl.startsWith('https://');
-
-      if (isLocalMd && onOpenLinkedDoc) {
-        parts.push(
-          <a
-            key={key++}
-            href={linkUrl}
-            onClick={(e) => {
-              e.preventDefault();
-              onOpenLinkedDoc(linkUrl);
-            }}
-            className="text-primary underline underline-offset-2 hover:text-primary/80 inline-flex items-center gap-1 cursor-pointer"
-            title={`Open: ${linkUrl}`}
-          >
-            {linkText}
-            <svg className="w-3 h-3 opacity-50 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2} aria-hidden="true">
-              <path strokeLinecap="round" strokeLinejoin="round" d="M19.5 14.25v-2.625a3.375 3.375 0 00-3.375-3.375h-1.5A1.125 1.125 0 0113.5 7.125v-1.5a3.375 3.375 0 00-3.375-3.375H8.25m2.25 0H5.625c-.621 0-1.125.504-1.125 1.125v17.25c0 .621.504 1.125 1.125 1.125h12.75c.621 0 1.125-.504 1.125-1.125V11.25a9 9 0 00-9-9z" />
-            </svg>
-          </a>
-        );
-      } else if (isLocalMd) {
-        // No handler — render as plain link (e.g., in shared/portal views)
-        parts.push(
-          <a
-            key={key++}
-            href={linkUrl}
-            className="text-primary underline underline-offset-2 hover:text-primary/80"
-          >
-            {linkText}
-          </a>
-        );
-      } else {
-        parts.push(
-          <a
-            key={key++}
-            href={linkUrl}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="text-primary underline underline-offset-2 hover:text-primary/80"
-          >
-            {linkText}
-          </a>
-        );
-      }
-      remaining = remaining.slice(match[0].length);
-      continue;
-    }
-
-    // Find next special character or consume one regular character
-    const nextSpecial = remaining.slice(1).search(/[\*`\[!]/);
-    if (nextSpecial === -1) {
-      parts.push(remaining);
-      break;
-    } else {
-      parts.push(remaining.slice(0, nextSpecial + 1));
-      remaining = remaining.slice(nextSpecial + 1);
-    }
-  }
-
-  return <>{parts}</>;
-};
-
-const parseTableContent = (content: string): { headers: string[]; rows: string[][] } => {
-  const lines = content.split('\n').filter(line => line.trim());
-  if (lines.length === 0) return { headers: [], rows: [] };
-
-  const parseRow = (line: string): string[] => {
-    // Remove leading/trailing pipes and split by |
-    return line
-      .replace(/^\|/, '')
-      .replace(/\|$/, '')
-      .split('|')
-      .map(cell => cell.trim());
-  };
-
-  const headers = parseRow(lines[0]);
-  const rows: string[][] = [];
-
-  // Skip the separator line (contains dashes) and parse data rows
-  for (let i = 1; i < lines.length; i++) {
-    const line = lines[i].trim();
-    // Skip separator lines (contain only dashes, pipes, colons, spaces)
-    if (/^[\|\-:\s]+$/.test(line)) continue;
-    rows.push(parseRow(line));
-  }
-
-  return { headers, rows };
-};
-
-/** Groups consecutive list-item blocks so they can share a pinpoint hover wrapper. */
-type RenderGroup =
-  | { type: 'single'; block: Block }
-  | { type: 'list-group'; blocks: Block[]; key: string };
-
-function groupBlocks(blocks: Block[]): RenderGroup[] {
-  const groups: RenderGroup[] = [];
-  let i = 0;
-  while (i < blocks.length) {
-    if (blocks[i].type === 'list-item') {
-      const listBlocks: Block[] = [];
-      while (i < blocks.length && blocks[i].type === 'list-item') {
-        listBlocks.push(blocks[i]);
-        i++;
-      }
-      groups.push({ type: 'list-group', blocks: listBlocks, key: `list-${listBlocks[0].id}` });
-    } else {
-      groups.push({ type: 'single', block: blocks[i] });
-      i++;
-    }
-  }
-  return groups;
-}
-
-const BlockRenderer: React.FC<{ block: Block; onOpenLinkedDoc?: (path: string) => void; imageBaseDir?: string; onImageClick?: (src: string, alt: string) => void }> = ({ block, onOpenLinkedDoc, imageBaseDir, onImageClick }) => {
-  switch (block.type) {
-    case 'heading':
-      const Tag = `h${block.level || 1}` as keyof JSX.IntrinsicElements;
-      const styles = {
-        1: 'text-2xl font-bold mb-4 mt-6 first:mt-0 tracking-tight',
-        2: 'text-xl font-semibold mb-3 mt-8 text-foreground/90',
-        3: 'text-base font-semibold mb-2 mt-6 text-foreground/80',
-      }[block.level || 1] || 'text-base font-semibold mb-2 mt-4';
-
-      return <Tag className={styles} data-block-id={block.id} data-block-type="heading"><InlineMarkdown imageBaseDir={imageBaseDir} onImageClick={onImageClick} text={block.content} onOpenLinkedDoc={onOpenLinkedDoc} /></Tag>;
-
-    case 'blockquote':
-      return (
-        <blockquote
-          className="border-l-2 border-primary/50 pl-4 my-4 text-muted-foreground italic"
-          data-block-id={block.id}
-        >
-          <InlineMarkdown imageBaseDir={imageBaseDir} onImageClick={onImageClick} text={block.content} onOpenLinkedDoc={onOpenLinkedDoc} />
-        </blockquote>
-      );
-
-    case 'list-item': {
-      const indent = (block.level || 0) * 1.25; // 1.25rem per level
-      const isCheckbox = block.checked !== undefined;
-      return (
-        <div
-          className="flex gap-3 my-1.5"
-          data-block-id={block.id}
-          style={{ marginLeft: `${indent}rem` }}
-        >
-          <span className="select-none shrink-0 flex items-center">
-            {isCheckbox ? (
-              block.checked ? (
-                <svg className="w-4 h-4 text-success" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2.5}>
-                  <path strokeLinecap="round" strokeLinejoin="round" d="M9 12.75L11.25 15 15 9.75M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
-                </svg>
-              ) : (
-                <svg className="w-4 h-4 text-muted-foreground/50" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}>
-                  <circle cx="12" cy="12" r="9" />
-                </svg>
-              )
-            ) : (
-              <span className="text-primary/60">
-                {(block.level || 0) === 0 ? '•' : (block.level || 0) === 1 ? '◦' : '▪'}
-              </span>
-            )}
-          </span>
-          <span className={`text-sm leading-relaxed ${isCheckbox && block.checked ? 'text-muted-foreground line-through' : 'text-foreground/90'}`}>
-            <InlineMarkdown imageBaseDir={imageBaseDir} onImageClick={onImageClick} text={block.content} onOpenLinkedDoc={onOpenLinkedDoc} />
-          </span>
-        </div>
-      );
-    }
-
-    case 'code':
-      return <CodeBlock block={block} onHover={() => {}} onLeave={() => {}} isHovered={false} />;
-
-    case 'table': {
-      const { headers, rows } = parseTableContent(block.content);
-      return (
-        <div className="my-4 overflow-x-auto" data-block-id={block.id}>
-          <table className="min-w-full border-collapse text-sm">
-            <thead>
-              <tr className="border-b border-border">
-                {headers.map((header, i) => (
-                  <th
-                    key={i}
-                    className="px-3 py-2 text-left font-semibold text-foreground/90 bg-muted/30"
-                  >
-                    <InlineMarkdown imageBaseDir={imageBaseDir} onImageClick={onImageClick} text={header} onOpenLinkedDoc={onOpenLinkedDoc} />
-                  </th>
-                ))}
-              </tr>
-            </thead>
-            <tbody>
-              {rows.map((row, rowIdx) => (
-                <tr key={rowIdx} className="border-b border-border/50 hover:bg-muted/20">
-                  {row.map((cell, cellIdx) => (
-                    <td key={cellIdx} className="px-3 py-2 text-foreground/80">
-                      <InlineMarkdown imageBaseDir={imageBaseDir} onImageClick={onImageClick} text={cell} onOpenLinkedDoc={onOpenLinkedDoc} />
-                    </td>
-                  ))}
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      );
-    }
-
-    case 'hr':
-      return <hr className="border-border/30 my-8" data-block-id={block.id} />;
-
-    default:
-      return (
-        <p
-          className="mb-4 leading-relaxed text-foreground/90 text-[15px]"
-          data-block-id={block.id}
-        >
-          <InlineMarkdown imageBaseDir={imageBaseDir} onImageClick={onImageClick} text={block.content} onOpenLinkedDoc={onOpenLinkedDoc} />
-        </p>
-      );
-  }
-};
-
-interface CodeBlockProps {
-  block: Block;
-  onHover: (element: HTMLElement) => void;
-  onLeave: () => void;
-  isHovered: boolean;
-}
-
-const CodeBlock: React.FC<CodeBlockProps> = ({ block, onHover, onLeave, isHovered }) => {
-  const [copied, setCopied] = useState(false);
-  const containerRef = useRef<HTMLDivElement>(null);
-  const codeRef = useRef<HTMLElement>(null);
-
-  // Highlight code block on mount and when content/language changes
-  useEffect(() => {
-    if (codeRef.current) {
-      // Reset any previous highlighting
-      codeRef.current.removeAttribute('data-highlighted');
-      codeRef.current.className = `hljs font-mono${block.language ? ` language-${block.language}` : ''}`;
-      hljs.highlightElement(codeRef.current);
-    }
-  }, [block.content, block.language]);
-
-  const handleCopy = useCallback(async () => {
-    try {
-      await navigator.clipboard.writeText(block.content);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 2000);
-    } catch (err) {
-      console.error('Failed to copy:', err);
-    }
-  }, [block.content]);
-
-  const handleMouseEnter = () => {
-    if (containerRef.current) {
-      onHover(containerRef.current);
-    }
-  };
-
-  // Build className for code element
-  const codeClassName = `hljs font-mono${block.language ? ` language-${block.language}` : ''}`;
-
-  return (
-    <div
-      ref={containerRef}
-      className="relative group my-5"
-      data-block-id={block.id}
-      onMouseEnter={handleMouseEnter}
-      onMouseLeave={onLeave}
-    >
-      <button
-        onClick={handleCopy}
-        className="absolute top-2 right-2 p-1.5 rounded-md bg-muted/80 hover:bg-muted text-muted-foreground hover:text-foreground opacity-0 group-hover:opacity-100 transition-opacity z-10"
-        title={copied ? 'Copied!' : 'Copy code'}
-      >
-        {copied ? (
-          <svg className="w-4 h-4 text-success" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-            <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
-          </svg>
-        ) : (
-          <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-            <path strokeLinecap="round" strokeLinejoin="round" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
-          </svg>
-        )}
-      </button>
-      <pre className="rounded-lg text-[13px] overflow-x-auto bg-muted/50 border border-border/30">
-        <code ref={codeRef} className={codeClassName}>{block.content}</code>
-      </pre>
-    </div>
-  );
-};

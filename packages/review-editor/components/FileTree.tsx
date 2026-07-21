@@ -1,15 +1,26 @@
 import React, { useEffect, useCallback, useState, useMemo } from 'react';
 import { CodeAnnotation } from '@plannotator/ui/types';
-import type { DiffOption, WorktreeInfo } from '@plannotator/shared/types';
-import { buildFileTree, getAncestorPaths, getAllFolderPaths } from '../utils/buildFileTree';
+import type { AvailableBranches, CompareTargetConfig, DiffOption, JjEvoLogEntry, RecentCommit, SinceBaseSections, WorktreeInfo } from '@plannotator/shared/types';
+import { buildFileTree, getAncestorPaths, getAllFolderPaths, getVisualFileOrder } from '../utils/buildFileTree';
 import { FileTreeNodeItem } from './FileTreeNode';
+import { BaseBranchPicker } from './BaseBranchPicker';
+import { EvoLogPicker } from './EvoLogPicker';
+import { DiffTypePicker } from './DiffTypePicker';
+import { WorktreePicker } from './WorktreePicker';
+import { PanelViewToggle } from './PanelViewToggle';
 import { getReviewSearchSideLabel, type ReviewSearchFileGroup, type ReviewSearchMatch } from '../utils/reviewSearch';
 import type { DiffFile } from '../types';
+import { OverlayScrollArea } from '@plannotator/ui/components/OverlayScrollArea';
+import { GitHubIcon } from '@plannotator/ui/components/GitHubIcon';
+import { Paperclip } from 'lucide-react';
+
+import { SidebarActionRow, SemanticDiffRow, AllFilesRow } from './PanelNavRows';
 
 interface FileTreeProps {
   files: DiffFile[];
   activeFileIndex: number;
   onSelectFile: (index: number) => void;
+  onDoubleClickFile?: (index: number) => void;
   annotations: CodeAnnotation[];
   viewedFiles: Set<string>;
   onToggleViewed?: (filePath: string) => void;
@@ -25,22 +36,72 @@ interface FileTreeProps {
   activeWorktreePath?: string | null;
   onSelectWorktree?: (path: string | null) => void;
   currentBranch?: string;
-  stagedFiles?: Set<string>;
+  /** Compare target picker — base branch for Git, bookmark/revision for jj. */
+  availableBranches?: AvailableBranches;
+  selectedBase?: string;
+  detectedBase?: string;
+  onSelectBase?: (branch: string) => void;
+  compareTarget?: CompareTargetConfig;
+  /** HEAD ancestry for the commit-baseline picker (git only, #709). */
+  recentCommits?: RecentCommit[];
+  /** Evolution log entries for the current jj change (jj-evolog mode only). */
+  jjEvologs?: JjEvoLogEntry[];
+  /** Default evolog commit ID to compare against (second evolog entry). */
+  detectedEvoBase?: string;
+  /** EFFECTIVE staged set from useGitAdd (sidecar + session overrides).
+   *  REQUIRED and the ONLY staging source surfaces may render from — the
+   *  sidecar's own `staged` flag is a snapshot and must never be ORed in. */
+  stagedFiles: Set<string>;
+  onCopyRawDiff?: () => void;
+  canCopyRawDiff?: boolean;
+  copyRawDiffStatus?: 'idle' | 'success' | 'error';
   searchQuery?: string;
+  isSearchOpen?: boolean;
+  isSearchPending?: boolean;
   searchInputRef?: React.RefObject<HTMLInputElement | null>;
+  onOpenSearch?: () => void;
   onSearchChange?: (value: string) => void;
   onSearchClear?: () => void;
+  onSearchClose?: () => void;
   searchGroups?: ReviewSearchFileGroup[];
   searchMatches?: ReviewSearchMatch[];
   activeSearchMatchId?: string | null;
   onSelectSearchMatch?: (matchId: string) => void;
   onStepSearchMatch?: (direction: 1 | -1) => void;
+  onSelectPROverview?: () => void;
+  isPROverviewActive?: boolean;
+  /** PR number label (e.g. "#123") for the PR overview row; omit in non-PR reviews. */
+  prOverviewNumber?: string;
+  /** PR title for the PR overview row. */
+  prOverviewTitle?: string;
+  /** Opens the hosted PR/MR attachment gallery; omitted for local reviews. */
+  onSelectPRArtifacts?: () => void;
+  isPRArtifactsActive?: boolean;
+  prArtifactCount?: number;
+  onSelectSemanticDiff?: () => void;
+  isSemanticDiffActive?: boolean;
+  semanticDiffAvailable?: boolean;
+  onSelectAllFiles?: () => void;
+  isAllFilesActive?: boolean;
+  scrollHighlightIndex?: number;
+  /** Absolute repo root for the "Copy full path" context menu item. Null/undefined hides the option (e.g. PR review mode). */
+  repoRoot?: string | null;
+  /** When the since-base sections view is available, renders a nav row back to it. */
+  onSwitchToSections?: () => void;
+  /** When the commit-history view is available, offers its toggle segment. */
+  onSwitchToCommits?: () => void;
+  /** Sections sidecar while the since-base diff is displayed as a tree —
+   * powers per-row U/staged markers and the stage button. */
+  sinceBaseSections?: SinceBaseSections | null;
+  onStageFile?: (filePath: string) => void;
+  stagingFile?: string | null;
 }
 
 export const FileTree: React.FC<FileTreeProps> = ({
   files,
   activeFileIndex,
   onSelectFile,
+  onDoubleClickFile,
   annotations,
   viewedFiles,
   onToggleViewed,
@@ -56,42 +117,106 @@ export const FileTree: React.FC<FileTreeProps> = ({
   activeWorktreePath,
   onSelectWorktree,
   currentBranch,
+  availableBranches,
+  selectedBase,
+  detectedBase,
+  onSelectBase,
+  compareTarget,
+  recentCommits,
+  jjEvologs,
+  detectedEvoBase,
   stagedFiles,
+  onCopyRawDiff,
+  canCopyRawDiff = false,
+  copyRawDiffStatus = 'idle',
   searchQuery = '',
+  isSearchOpen = false,
+  isSearchPending,
   searchInputRef,
+  onOpenSearch,
   onSearchChange,
   onSearchClear,
+  onSearchClose,
   searchGroups = [],
   searchMatches = [],
   activeSearchMatchId,
   onSelectSearchMatch,
   onStepSearchMatch,
+  onSelectPROverview,
+  isPROverviewActive = false,
+  prOverviewNumber,
+  prOverviewTitle,
+  onSelectPRArtifacts,
+  isPRArtifactsActive = false,
+  prArtifactCount,
+  onSelectSemanticDiff,
+  isSemanticDiffActive = false,
+  semanticDiffAvailable = false,
+  onSelectAllFiles,
+  isAllFilesActive = false,
+  scrollHighlightIndex,
+  repoRoot,
+  onSwitchToSections,
+  onSwitchToCommits,
+  sinceBaseSections,
+  onStageFile,
+  stagingFile,
 }) => {
+  const isSearchVisible = !!onSearchChange && (isSearchOpen || !!searchQuery.trim());
+
+  const tree = useMemo(() => buildFileTree(files), [files]);
+
+  // Since-base sidecar lookup for per-row lifecycle markers + stage buttons.
+  const getSectionEntry = useMemo(() => {
+    if (!sinceBaseSections) return undefined;
+    return (filePath: string) => sinceBaseSections.files[filePath];
+  }, [sinceBaseSections]);
+  const allFolderPaths = useMemo(() => getAllFolderPaths(tree), [tree]);
+  const visualOrder = useMemo(() => getVisualFileOrder(tree), [tree]);
+
   // Keyboard navigation: j/k or arrow keys
   const handleKeyDown = useCallback((e: KeyboardEvent) => {
-    if (!enableKeyboardNav) return;
+    if (!enableKeyboardNav || e.defaultPrevented) return;
 
     // Don't interfere with input fields
     if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) {
       return;
     }
 
+    // Yield keyboard nav when a floating overlay owns the focus — Base UI
+    // Menu / Popover / Dialog handle arrow keys themselves, and the old
+    // native <select> used to absorb these natively. Base UI popups carry
+    // ARIA roles directly (Menu.Popup role="menu", Popover.Popup
+    // role="dialog"), so the role selectors catch the base picker and
+    // worktree picker as well as dialogs/menus.
+    const active = document.activeElement;
+    if (
+      active instanceof HTMLElement &&
+      active.closest('[role="menu"], [role="dialog"], [role="listbox"]')
+    ) {
+      return;
+    }
+
+    const visualPos = visualOrder.indexOf(activeFileIndex);
+
     if (e.key === 'j' || e.key === 'ArrowDown') {
       e.preventDefault();
-      const nextIndex = Math.min(activeFileIndex + 1, files.length - 1);
-      onSelectFile(nextIndex);
+      if (visualPos < visualOrder.length - 1) {
+        onSelectFile(visualOrder[visualPos + 1]);
+      }
     } else if (e.key === 'k' || e.key === 'ArrowUp') {
       e.preventDefault();
-      const prevIndex = Math.max(activeFileIndex - 1, 0);
-      onSelectFile(prevIndex);
+      if (visualPos > 0) {
+        onSelectFile(visualOrder[visualPos - 1]);
+      }
     } else if (e.key === 'Home') {
       e.preventDefault();
-      onSelectFile(0);
+      onSelectFile(visualOrder[0]);
     } else if (e.key === 'End') {
       e.preventDefault();
-      onSelectFile(files.length - 1);
+      onSelectFile(visualOrder[visualOrder.length - 1]);
     }
-  }, [enableKeyboardNav, activeFileIndex, files.length, onSelectFile]);
+  }, [enableKeyboardNav, activeFileIndex, visualOrder, onSelectFile]);
 
   useEffect(() => {
     window.addEventListener('keydown', handleKeyDown);
@@ -110,15 +235,13 @@ export const FileTree: React.FC<FileTreeProps> = ({
     return annotationCountMap.get(filePath) ?? 0;
   }, [annotationCountMap]);
 
-  const tree = useMemo(() => buildFileTree(files), [files]);
-
-  const [expandedFolders, setExpandedFolders] = useState<Set<string>>(new Set());
+  const [expandedFolders, setExpandedFolders] = useState<Set<string>>(() => new Set(allFolderPaths));
   const [prevTree, setPrevTree] = useState(tree);
 
   // Expand all folders when tree changes (initial render + diff switch)
   if (tree !== prevTree) {
     setPrevTree(tree);
-    setExpandedFolders(new Set(getAllFolderPaths(tree)));
+    setExpandedFolders(new Set(allFolderPaths));
   }
 
   // Auto-expand ancestors of the active file so j/k nav always reveals the target
@@ -147,99 +270,71 @@ export const FileTree: React.FC<FileTreeProps> = ({
     });
   }, []);
 
-  return (
-    <aside className="border-r border-border bg-card/30 flex flex-col flex-shrink-0 overflow-hidden" style={{ width: width ?? 256 }}>
-      {/* Search input */}
-      {onSearchChange && (
-        <div className="px-2 flex items-center border-b border-border/50" style={{ height: 'var(--panel-header-h)' }}>
-          <div className="relative flex-1">
-            <svg className="absolute left-2 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-muted-foreground/60 pointer-events-none" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-              <path strokeLinecap="round" strokeLinejoin="round" d="m21 21-4.35-4.35m1.85-5.15a7 7 0 1 1-14 0 7 7 0 0 1 14 0Z" />
-            </svg>
-            <input
-              ref={searchInputRef}
-              type="text"
-              value={searchQuery}
-              onChange={(e) => onSearchChange(e.target.value)}
-              onKeyDown={(e) => {
-                if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'f') {
-                  e.preventDefault();
-                  return;
-                }
-                if (e.key === 'Enter' && searchMatches.length > 0) {
-                  e.preventDefault();
-                  onStepSearchMatch?.(e.shiftKey ? -1 : 1);
-                }
-                if (e.key === 'Escape') {
-                  e.preventDefault();
-                  if (searchQuery) {
-                    onSearchClear?.();
-                  } else {
-                    (e.target as HTMLInputElement).blur();
-                  }
-                }
-              }}
-              placeholder="Search diff..."
-              className={`w-full pl-7 py-1.5 bg-muted rounded-md text-xs text-foreground placeholder:text-muted-foreground/50 focus:outline-none focus:ring-1 focus:ring-primary/50 ${searchQuery ? 'pr-14' : 'pr-7'}`}
-            />
-            {searchQuery && (
-              <div className="absolute right-2 top-1/2 -translate-y-1/2 flex items-center gap-1">
-                {searchQuery.trim() && (
-                  <span className="text-[10px] text-muted-foreground/40 tabular-nums">
-                    {searchMatches.length}
-                  </span>
-                )}
-                <button
-                  onClick={onSearchClear}
-                  className="p-0.5 rounded hover:bg-background/50 text-muted-foreground hover:text-foreground transition-colors"
-                >
-                  <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                    <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
-                  </svg>
-                </button>
-              </div>
-            )}
-          </div>
-        </div>
-      )}
+  const areAllFoldersExpanded = allFolderPaths.length > 0 && allFolderPaths.every(path => expandedFolders.has(path));
 
-      {/* Header */}
-      <div className="px-3 py-2 border-b border-border/50">
-        <div className="flex items-center justify-between">
-          <span className="text-xs font-medium text-muted-foreground uppercase tracking-wider">
-            {searchQuery.trim() ? 'Results' : 'Files'}
-          </span>
-          <div className="flex items-center gap-1.5">
-            {stagedFiles && stagedFiles.size > 0 && (
-              <>
-                <span className="text-xs text-primary font-medium">
-                  {stagedFiles.size} added
-                </span>
-                <span className="text-muted-foreground/40">·</span>
-              </>
-            )}
-            <span className="text-xs text-muted-foreground">
-              {viewedFiles.size}/{files.length}
+  const handleToggleAllFolders = useCallback(() => {
+    setExpandedFolders(areAllFoldersExpanded ? new Set() : new Set(allFolderPaths));
+  }, [allFolderPaths, areAllFoldersExpanded]);
+
+  return (
+    <aside className="border-r border-border/50 bg-card/30 flex flex-col flex-shrink-0 overflow-hidden" style={{ width: width ?? 256 }}>
+      {/* Header — panel label left, controls right. The viewed counter sits
+          immediately AFTER the hide-viewed eye toggle it relates to. */}
+      <div className="px-3 flex items-center border-b border-border/50" style={{ height: 'var(--panel-header-h)' }}>
+        <div className="w-full flex items-center justify-between">
+          {searchQuery.trim() ? (
+            <span className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">
+              Results
             </span>
+          ) : onSwitchToSections || onSwitchToCommits ? (
+            <PanelViewToggle
+              view="tree"
+              showSections={!!onSwitchToSections}
+              showCommits={!!onSwitchToCommits}
+              onSelect={(view) => {
+                if (view === 'sections') onSwitchToSections?.();
+                else if (view === 'commits') onSwitchToCommits?.();
+              }}
+            />
+          ) : (
+            <span className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">
+              Files
+            </span>
+          )}
+          <div className="flex items-center gap-1.5">
+            {stagedFiles.size > 0 && (
+              <span className="text-xs text-primary font-medium">
+                {stagedFiles.size} added
+              </span>
+            )}
+            {onOpenSearch && (
+              <button
+                onClick={onOpenSearch}
+                className={`p-1 rounded transition-colors ${isSearchVisible ? 'bg-primary/15 text-primary' : 'hover:bg-muted text-muted-foreground'}`}
+                title="Search diff (Cmd/Ctrl+F)"
+              >
+                <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="m21 21-4.35-4.35m1.85-5.15a7 7 0 1 1-14 0 7 7 0 0 1 14 0Z" />
+                </svg>
+              </button>
+            )}
             <button
-              onClick={() => setExpandedFolders(new Set(getAllFolderPaths(tree)))}
-              className="p-1 rounded transition-colors hover:bg-muted text-muted-foreground"
-              title="Expand all folders"
+              onClick={handleToggleAllFolders}
+              disabled={allFolderPaths.length === 0}
+              className="p-1 rounded transition-colors hover:bg-muted text-muted-foreground disabled:opacity-50 disabled:cursor-not-allowed"
+              title={areAllFoldersExpanded ? 'Collapse all folders' : 'Expand all folders'}
             >
-              <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                <path strokeLinecap="round" strokeLinejoin="round" d="M5 8l7-6 7 6" />
-                <path strokeLinecap="round" strokeLinejoin="round" d="M5 16l7 6 7-6" />
-              </svg>
-            </button>
-            <button
-              onClick={() => setExpandedFolders(new Set())}
-              className="p-1 rounded transition-colors hover:bg-muted text-muted-foreground"
-              title="Collapse all folders"
-            >
-              <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                <path strokeLinecap="round" strokeLinejoin="round" d="M5 2l7 6 7-6" />
-                <path strokeLinecap="round" strokeLinejoin="round" d="M5 22l7-6 7 6" />
-              </svg>
+              {areAllFoldersExpanded ? (
+                <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M5 2l7 6 7-6" />
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M5 22l7-6 7 6" />
+                </svg>
+              ) : (
+                <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M5 8l7-6 7 6" />
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M5 16l7 6 7-6" />
+                </svg>
+              )}
             </button>
             {onToggleHideViewed && (
               <button
@@ -259,87 +354,159 @@ export const FileTree: React.FC<FileTreeProps> = ({
                 )}
               </button>
             )}
+            <span className="text-xs text-muted-foreground">
+              {viewedFiles.size}/{files.length}
+            </span>
           </div>
         </div>
       </div>
 
-      {/* Worktree context switcher — only shown when worktrees exist */}
-      {worktrees && worktrees.length > 0 && onSelectWorktree && (
-        <div className="px-2 pt-2 pb-1.5 border-b border-border/30">
-          <div className="text-[10px] text-muted-foreground/60 uppercase tracking-wider mb-1 px-0.5">Context</div>
-          <div className="relative">
-            <select
-              value={activeWorktreePath || ''}
-              onChange={(e) => onSelectWorktree(e.target.value || null)}
-              disabled={isLoadingDiff}
-              className={`w-full px-2.5 py-1.5 rounded-md text-xs text-foreground focus:outline-none focus:ring-1 focus:ring-primary/50 cursor-pointer disabled:opacity-50 disabled:cursor-wait appearance-none pr-7 ${
-                activeWorktreePath
-                  ? 'bg-primary/10 border border-primary/30'
-                  : 'bg-muted'
-              }`}
-            >
-              <option value="">{currentBranch || 'Main repo'}</option>
-              {worktrees.map(wt => (
-                <option key={wt.path} value={wt.path}>
-                  {(wt.branch || wt.path.split('/').pop()) + ' (worktree)'}
-                </option>
-              ))}
-            </select>
-            <div className="absolute right-2 top-1/2 -translate-y-1/2 pointer-events-none">
-              <svg className="w-3.5 h-3.5 text-muted-foreground" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                <path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" />
-              </svg>
+      {/* Search input */}
+      {isSearchVisible && (
+        <div className="px-2 flex items-center border-b border-border/50" style={{ height: 'var(--panel-header-h)' }}>
+          <div className="relative flex-1">
+            <svg className="absolute left-2 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-muted-foreground/60 pointer-events-none" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="m21 21-4.35-4.35m1.85-5.15a7 7 0 1 1-14 0 7 7 0 0 1 14 0Z" />
+            </svg>
+            <input
+              ref={searchInputRef}
+              type="text"
+              value={searchQuery}
+              onChange={(e) => onSearchChange(e.target.value)}
+              onKeyDown={(e) => {
+                if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'f') {
+                  e.preventDefault();
+                  return;
+                }
+                if (e.key === 'Enter' && searchMatches.length > 0 && !isSearchPending) {
+                  e.preventDefault();
+                  onStepSearchMatch?.(e.shiftKey ? -1 : 1);
+                }
+                if (e.key === 'Escape') {
+                  e.preventDefault();
+                  if (searchQuery) {
+                    onSearchClear?.();
+                  } else {
+                    onSearchClose?.();
+                    (e.target as HTMLInputElement).blur();
+                  }
+                }
+              }}
+              placeholder="Search diff..."
+              className="w-full pl-7 py-1.5 pr-7 bg-muted rounded text-xs text-foreground placeholder:text-muted-foreground/50 focus:outline-none focus:ring-1 focus:ring-primary/50"
+            />
+            <div className="absolute right-2 top-1/2 -translate-y-1/2 flex items-center gap-1">
+              {searchQuery.trim() && !isSearchPending && (
+                <span className="text-[10px] text-muted-foreground/40 tabular-nums">
+                  {searchMatches.length}
+                </span>
+              )}
+              <button
+                onClick={searchQuery ? onSearchClear : onSearchClose}
+                className="p-0.5 rounded hover:bg-background/50 text-muted-foreground hover:text-foreground transition-colors"
+                title={searchQuery ? 'Clear search' : 'Close search'}
+              >
+                <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+                </svg>
+              </button>
             </div>
           </div>
         </div>
       )}
 
-      {/* Diff type selector — always the same base options */}
-      {diffOptions && diffOptions.length > 0 && onSelectDiff && (
-        <div className="px-2 py-1.5 border-b border-border/30">
-          {worktrees && worktrees.length > 0 && (
-            <div className="text-[10px] text-muted-foreground/60 uppercase tracking-wider mb-1 px-0.5">View</div>
-          )}
-          <div className="relative">
-            <select
-              value={activeDiffType || 'uncommitted'}
-              onChange={(e) => onSelectDiff(e.target.value)}
-              disabled={isLoadingDiff}
-              className="w-full px-2.5 py-1.5 bg-muted rounded-md text-xs text-foreground focus:outline-none focus:ring-1 focus:ring-primary/50 cursor-pointer disabled:opacity-50 disabled:cursor-wait appearance-none pr-7"
-            >
-              {diffOptions.map((option) => (
-                <option key={option.id} value={option.id}>
-                  {option.label}
-                </option>
-              ))}
-            </select>
-            <div className="absolute right-2 top-1/2 -translate-y-1/2 pointer-events-none">
-              {isLoadingDiff ? (
-                <svg className="w-3.5 h-3.5 text-muted-foreground animate-spin" fill="none" viewBox="0 0 24 24">
-                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
-                </svg>
-              ) : (
-                <svg className="w-3.5 h-3.5 text-muted-foreground" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                  <path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" />
-                </svg>
-              )}
+      {/* Worktree + diff selectors — combined row when both present */}
+      {((worktrees && worktrees.length > 0 && onSelectWorktree) || (diffOptions && diffOptions.length > 0 && onSelectDiff)) && (
+        <div className="px-2 py-1.5 border-b border-border/30 flex gap-2">
+          {worktrees && worktrees.length > 0 && onSelectWorktree && (
+            <div className="flex-1 min-w-0">
+              <WorktreePicker
+                worktrees={worktrees}
+                activeWorktreePath={activeWorktreePath ?? null}
+                currentBranch={currentBranch}
+                onSelect={onSelectWorktree}
+                disabled={isLoadingDiff}
+              />
             </div>
-          </div>
+          )}
+          {diffOptions && diffOptions.length > 0 && onSelectDiff && (
+            <div className="flex-1 min-w-0">
+              <DiffTypePicker
+                options={diffOptions}
+                activeDiffType={activeDiffType || 'uncommitted'}
+                onSelect={onSelectDiff}
+                isLoading={isLoadingDiff}
+                hasBasePicker={!!onSelectBase && !!availableBranches}
+              />
+            </div>
+          )}
         </div>
       )}
+
+      {/* Evolog picker — only shown when jj-evolog diff type is active */}
+      {activeDiffType === 'jj-evolog' &&
+        onSelectBase &&
+        selectedBase &&
+        jjEvologs &&
+        jjEvologs.length >= 2 &&
+        detectedEvoBase && (
+          <div className="px-2 py-1.5 border-b border-border/30 flex items-center gap-2">
+            <span className="text-[10px] uppercase tracking-wide text-muted-foreground flex-shrink-0">
+              from evolution
+            </span>
+            <div className="flex-1 min-w-0">
+              <EvoLogPicker
+                entries={jjEvologs}
+                selectedCommitId={selectedBase}
+                detectedCommitId={detectedEvoBase}
+                onSelect={onSelectBase}
+                disabled={isLoadingDiff}
+              />
+            </div>
+          </div>
+        )}
+
+      {/* Compare target picker — only relevant for base-dependent diff types (not evolog) */}
+      {activeDiffType !== 'jj-evolog' &&
+        onSelectBase &&
+        selectedBase &&
+        detectedBase &&
+        availableBranches &&
+        activeDiffType &&
+        compareTarget?.diffTypes.includes(activeDiffType) && (
+          <div className="px-2 py-1.5 border-b border-border/30 flex items-center gap-2">
+            <span className="text-[10px] uppercase tracking-wide text-muted-foreground flex-shrink-0">
+              {compareTarget.picker.rowLabel}
+            </span>
+            <div className="flex-1 min-w-0">
+              <BaseBranchPicker
+                availableBranches={availableBranches}
+                selectedBase={selectedBase}
+                detectedBase={detectedBase}
+                onSelectBase={onSelectBase}
+                disabled={isLoadingDiff}
+                copy={compareTarget.picker}
+                recentCommits={recentCommits}
+              />
+            </div>
+          </div>
+        )}
 
       {/* File tree or search results */}
-      <div className="flex-1 overflow-y-auto p-2">
+      <OverlayScrollArea className="flex-1 min-h-0">
+      <div className="px-1 py-1">
         {searchQuery.trim() ? (
-          searchGroups.length > 0 ? (
+          isSearchPending ? (
+            <div className="py-6 text-center text-xs text-muted-foreground/50">
+              Searching…
+            </div>
+          ) : searchGroups.length > 0 ? (
             searchGroups.map((group) => (
               <SearchFileGroup
                 key={group.filePath}
                 group={group}
                 searchQuery={searchQuery}
                 activeSearchMatchId={activeSearchMatchId ?? null}
-                onSelectFile={onSelectFile}
                 onSelectMatch={onSelectSearchMatch}
               />
             ))
@@ -349,29 +516,97 @@ export const FileTree: React.FC<FileTreeProps> = ({
             </div>
           )
         ) : (
-          tree.map(node => (
+          <>
+          {prOverviewNumber && prOverviewTitle && onSelectPROverview && (
+            <SidebarActionRow
+              active={isPROverviewActive}
+              onClick={onSelectPROverview}
+              title={`${prOverviewNumber} · ${prOverviewTitle}`}
+            >
+              <GitHubIcon className="w-3.5 h-3.5 flex-shrink-0" />
+              <span className="font-mono flex-shrink-0">{prOverviewNumber}</span>
+              <span className="truncate text-muted-foreground/80">{prOverviewTitle}</span>
+            </SidebarActionRow>
+          )}
+          {onSelectPRArtifacts && prArtifactCount !== undefined && (
+            <SidebarActionRow
+              active={isPRArtifactsActive}
+              onClick={onSelectPRArtifacts}
+              title="View attachments shared in this pull request or merge request"
+            >
+              <Paperclip className="w-3.5 h-3.5 flex-shrink-0" />
+              <span>Artifacts</span>
+              <span className="ml-auto rounded bg-muted px-1.5 py-0.5 font-mono text-[9px] tabular-nums text-muted-foreground">
+                {prArtifactCount}
+              </span>
+            </SidebarActionRow>
+          )}
+          {semanticDiffAvailable && onSelectSemanticDiff && (
+            <SemanticDiffRow active={isSemanticDiffActive} onClick={onSelectSemanticDiff} />
+          )}
+          {onSelectAllFiles && (
+            <AllFilesRow
+              active={isAllFilesActive}
+              onClick={onSelectAllFiles}
+              additions={files.reduce((s, f) => s + f.additions, 0)}
+              deletions={files.reduce((s, f) => s + f.deletions, 0)}
+            />
+          )}
+          {tree.map(node => (
             <FileTreeNodeItem
               key={node.type === 'file' ? node.path : `folder:${node.path}`}
               node={node}
               expandedFolders={expandedFolders}
               onToggleFolder={handleToggleFolder}
-              activeFileIndex={activeFileIndex}
+              activeFileIndex={isAllFilesActive || isSemanticDiffActive || isPROverviewActive || isPRArtifactsActive ? -1 : activeFileIndex}
+              scrollHighlightIndex={isAllFilesActive ? scrollHighlightIndex : undefined}
               onSelectFile={onSelectFile}
+              onDoubleClickFile={onDoubleClickFile}
               viewedFiles={viewedFiles}
               onToggleViewed={onToggleViewed}
               hideViewedFiles={hideViewedFiles}
               getAnnotationCount={getAnnotationCount}
               stagedFiles={stagedFiles}
+              repoRoot={repoRoot}
+              getSectionEntry={getSectionEntry}
+              onStageFile={onStageFile}
+              stagingFile={stagingFile}
             />
-          ))
+          ))}
+          </>
         )}
       </div>
+      </OverlayScrollArea>
 
       {/* Footer */}
-      <div className="p-3 border-t border-border/50 text-xs text-muted-foreground space-y-2">
-        <div className="flex justify-between">
-          <span>Total changes:</span>
-          <span className="file-stats">
+      <div className="px-2 py-1.5 border-t border-border/50 text-xs text-muted-foreground">
+        <div className="flex items-center justify-between">
+          {onCopyRawDiff ? (
+            <button
+              onClick={onCopyRawDiff}
+              disabled={!canCopyRawDiff}
+              className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+              title="Copy all raw diffs to clipboard (Cmd/Ctrl+Shift+C)"
+            >
+              {copyRawDiffStatus === 'success' ? (
+                <svg className="w-3 h-3 text-success" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
+                </svg>
+              ) : copyRawDiffStatus === 'error' ? (
+                <svg className="w-3 h-3 text-destructive" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+                </svg>
+              ) : (
+                <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
+                </svg>
+              )}
+              {copyRawDiffStatus === 'success' ? 'Copied' : copyRawDiffStatus === 'error' ? 'Failed' : 'Copy diffs'}
+            </button>
+          ) : (
+            <span />
+          )}
+          <span className="file-stats inline-flex items-center gap-1.5">
             <span className="additions">
               +{files.reduce((sum, f) => sum + f.additions, 0)}
             </span>
@@ -380,11 +615,6 @@ export const FileTree: React.FC<FileTreeProps> = ({
             </span>
           </span>
         </div>
-        {enableKeyboardNav && (
-          <div className="text-[10px] text-muted-foreground/50 text-center">
-            j/k or arrows to navigate
-          </div>
-        )}
       </div>
     </aside>
   );
@@ -393,8 +623,9 @@ export const FileTree: React.FC<FileTreeProps> = ({
 // --- Search result components ---
 
 function highlightQuery(text: string, query: string) {
-  if (!query.trim()) return text;
-  const regex = new RegExp(`(${query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')})`, 'gi');
+  const trimmed = query.trim();
+  if (!trimmed) return text;
+  const regex = new RegExp(`(${trimmed.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')})`, 'gi');
   const parts = text.split(regex);
   // split with a capturing group puts matches at odd indices (1, 3, 5...)
   return parts.map((part, i) =>
@@ -404,13 +635,12 @@ function highlightQuery(text: string, query: string) {
   );
 }
 
-const SearchFileGroup: React.FC<{
+export const SearchFileGroup: React.FC<{
   group: ReviewSearchFileGroup;
   searchQuery: string;
   activeSearchMatchId: string | null;
-  onSelectFile: (index: number) => void;
   onSelectMatch?: (matchId: string) => void;
-}> = ({ group, searchQuery, activeSearchMatchId, onSelectFile, onSelectMatch }) => {
+}> = ({ group, searchQuery, activeSearchMatchId, onSelectMatch }) => {
   const [collapsed, setCollapsed] = useState(false);
   const fileName = group.filePath.split('/').pop() || group.filePath;
   const dirPath = group.filePath.includes('/') ? group.filePath.slice(0, group.filePath.lastIndexOf('/')) : '';
@@ -419,7 +649,7 @@ const SearchFileGroup: React.FC<{
     <div className="mb-1">
       {/* File header */}
       <button
-        className="w-full flex items-center gap-1.5 px-2 py-1.5 rounded-md text-xs hover:bg-muted transition-colors group"
+        className="w-full flex items-center gap-1.5 px-2 py-1.5 rounded text-xs hover:bg-muted transition-colors group"
         onClick={() => setCollapsed(prev => !prev)}
       >
         <svg className={`w-3 h-3 text-muted-foreground/50 transition-transform flex-shrink-0 ${collapsed ? '' : 'rotate-90'}`} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
@@ -445,7 +675,6 @@ const SearchFileGroup: React.FC<{
               searchQuery={searchQuery}
               isActive={activeSearchMatchId === match.id}
               onSelect={() => {
-                onSelectFile(group.fileIndex);
                 onSelectMatch?.(match.id);
               }}
             />
@@ -467,7 +696,7 @@ const SearchMatchRow: React.FC<{
 
   return (
     <button
-      className={`w-full text-left px-2 py-1 rounded-sm text-[11px] font-mono transition-colors flex items-start gap-1.5 ${
+      className={`w-full text-left px-2 py-1 rounded-sm text-xs font-mono transition-colors flex items-start gap-1.5 ${
         isActive
           ? 'bg-primary/15 text-foreground'
           : 'hover:bg-muted/50 text-muted-foreground'
@@ -475,7 +704,7 @@ const SearchMatchRow: React.FC<{
       onClick={onSelect}
     >
       <span className="flex-shrink-0 text-muted-foreground/40 w-7 text-right tabular-nums">{match.lineNumber}</span>
-      <span className={`flex-shrink-0 w-6 text-[9px] font-semibold uppercase ${sideColor}`}>{sideLabel}</span>
+      <span className={`flex-shrink-0 w-6 text-[10px] font-semibold uppercase ${sideColor}`}>{sideLabel}</span>
       <span className="truncate leading-relaxed">{highlightQuery(match.snippet, searchQuery)}</span>
     </button>
   );

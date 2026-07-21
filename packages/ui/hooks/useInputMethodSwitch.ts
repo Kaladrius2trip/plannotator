@@ -15,7 +15,7 @@ export function useInputMethodSwitch(
 ) {
   const stateRef = useRef<'idle' | 'held' | 'tapped'>('idle');
   const downTimestampRef = useRef(0);
-  const revertTimerRef = useRef<ReturnType<typeof setTimeout>>();
+  const revertTimerRef = useRef<ReturnType<typeof setTimeout>>(undefined);
   const originalMethodRef = useRef<InputMethod>(inputMethod);
 
   // Keep originalMethod in sync when user changes it via UI

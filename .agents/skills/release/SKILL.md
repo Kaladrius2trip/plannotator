@@ -117,7 +117,7 @@ Write the draft to `RELEASE_NOTES_v<VERSION>.md` in the repo root and tell the u
 
 ## Phase 2: Version Bump
 
-Bump the version string in these **5 files** (and only these — other package.json files use stub versions):
+Bump the version string in these **7 files** (and only these — other package.json files use stub versions):
 
 | File | Field |
 |------|-------|
@@ -125,9 +125,11 @@ Bump the version string in these **5 files** (and only these — other package.j
 | `apps/opencode-plugin/package.json` | `"version"` |
 | `apps/pi-extension/package.json` | `"version"` |
 | `apps/hook/.claude-plugin/plugin.json` | `"version"` |
+| `apps/copilot/plugin.json` | `"version"` |
+| `openpackage.yml` (root) | `version:` |
 | `packages/server/package.json` | `"version"` |
 
-Read each file, confirm the current version matches expectations, then update all 5 atomically.
+Read each file, confirm the current version matches expectations, then update all 7 atomically.
 
 Do not bump the VS Code extension (`apps/vscode-extension/package.json`) — it has independent versioning.
 
@@ -148,6 +150,23 @@ bun run build:pi        # 4. Pi extension (chains review → hook → pi interna
 
 Verify all builds succeed before proceeding.
 
+### Pi Parity Gate
+
+After builds pass, audit the Pi extension to ensure all server-side imports resolve in the published package. This catches missing files before they reach npm.
+
+1. **Check imports vs `files` array.** Trace all local imports (starting with `./` or `../`) from `index.ts`, `server.ts`, `tool-scope.ts`, and every file in `server/`. Verify each target is covered by a pattern in the `files` array of `apps/pi-extension/package.json`.
+
+2. **Check `vendor.sh` covers all shared/ai imports.** Every `../generated/*.js` import in the server files must have a corresponding entry in `vendor.sh`'s copy loops. If a new shared module or AI module was added to `packages/shared/` or `packages/ai/` and is imported by Pi's server code, it must be added to `vendor.sh`.
+
+3. **Dry-run the pack.** Run `cd apps/pi-extension && bun pm pack --dry-run` and verify the output includes every file the server imports. Look specifically for any newly added files since the last release.
+
+4. **Quick smoke test.** Confirm `generated/` contains all expected files after build, especially any new ones (e.g., a new shared module added in this release cycle).
+
+If anything is missing, fix it before proceeding to Phase 4. Common fixes:
+- Add the file to `vendor.sh`'s copy loop
+- Add the file or directory to the `files` array in `package.json`
+- Add an import path fix (Pi uses `../generated/` not `@plannotator/shared` or `@plannotator/ai`)
+
 ---
 
 ## Phase 4: Commit, Tag, and Release
@@ -156,7 +175,7 @@ Verify all builds succeed before proceeding.
    ```
    chore: bump version to X.Y.Z
    ```
-   Stage only the 5 version-bumped files. Do not stage the release notes file (it's untracked by design).
+   Stage only the 7 version-bumped files. Do not stage the release notes file (it's untracked by design).
 
 2. **Create and push the tag:**
    ```bash
@@ -168,10 +187,13 @@ Verify all builds succeed before proceeding.
 
 3. **The pipeline handles everything else:**
    - Runs tests
-   - Cross-compiles binaries for 5 platforms (macOS ARM64/x64, Linux x64/ARM64, Windows x64)
-   - Compiles paste service binaries (same 5 platforms)
+   - Cross-compiles binaries for 6 platforms (macOS ARM64/x64, Linux x64/ARM64, Windows x64/ARM64)
+   - Compiles paste service binaries (same 6 platforms)
+   - Generates SLSA build provenance attestations for all 12 binaries via `actions/attest-build-provenance` (signed through Sigstore, recorded in Rekor)
    - Creates the GitHub Release with all binaries attached
    - Publishes `@plannotator/opencode` and `@plannotator/pi-extension` to npm with provenance
+
+   **Note on immutable releases:** The repo has GitHub Immutable Releases enabled, so once the `v*` tag is pushed and the release is created, the tag→commit and tag→asset bindings are permanent. You cannot delete and re-create a tag to "fix" a bad release — you must ship a new version. Release notes remain editable (see step 5), but everything else is locked.
 
 4. **Monitor the pipeline:**
    Watch the release workflow run until it completes:
@@ -197,13 +219,14 @@ Verify all builds succeed before proceeding.
 ## Checklist
 
 Before tagging, verify:
-- [ ] All 5 version files bumped consistently
+- [ ] All 7 version files bumped consistently
 - [ ] Release notes drafted and reviewed
 - [ ] `bun run build:review` succeeded
 - [ ] `bun run build:hook` succeeded
 - [ ] `bun run build:opencode` succeeded
 - [ ] `bun run build:pi` succeeded (or pi-specific build step)
 - [ ] Version bump committed
+- [ ] Pi parity gate passed (imports, vendor.sh, dry-run pack)
 - [ ] No stale build artifacts (clean builds, no cache issues — run `bun install` first if dependencies changed)
 
 After tagging, verify:

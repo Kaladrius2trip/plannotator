@@ -16,8 +16,10 @@ export default defineConfig({
   },
   plugins: [react(), tailwindcss(), devMockApi(), viteSingleFile()],
   resolve: {
+    dedupe: ['react', 'react-dom'],
     alias: {
       '@': path.resolve(__dirname, '.'),
+      '@plannotator/shared': path.resolve(__dirname, '../../packages/shared'),
       '@plannotator/ui': path.resolve(__dirname, '../../packages/ui'),
       '@plannotator/editor/styles': path.resolve(__dirname, '../../packages/editor/index.css'),
       '@plannotator/editor': path.resolve(__dirname, '../../packages/editor/App.tsx'),

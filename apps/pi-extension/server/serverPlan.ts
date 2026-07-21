@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { createServer } from "node:http";
 
 import { contentHash, deleteDraft } from "../generated/draft.js";
@@ -15,13 +16,17 @@ import {
 	saveToHistory,
 } from "../generated/storage.js";
 import { createEditorAnnotationHandler } from "./annotations.js";
+import { createExternalAnnotationHandler } from "./external-annotations.js";
 import {
 	handleDraftRequest,
 	handleFavicon,
 	handleImageRequest,
+	readDraftGenerationFromBody,
+	handleSaveNotesRequest,
 	handleUploadRequest,
 } from "./handlers.js";
-import { html, json, parseBody, requestUrl } from "./helpers.js";
+import { handleApiNotFound, html, json, parseBody, requestUrl } from "./helpers.js";
+import { createPiAIRuntime, handlePiAIRequest } from "./ai-runtime.js";
 import { openEditorDiff } from "./ide.js";
 import {
 	type BearConfig,
@@ -34,21 +39,36 @@ import {
 } from "./integrations.js";
 import { listenOnPort } from "./network.js";
 
-import { saveConfig, detectGitUser, getServerConfig } from "../generated/config.js";
+import { loadConfig, saveConfig, detectGitUser, getServerConfig, resolveSharingEnabled } from "../generated/config.js";
+import { readImprovementHook, getImprovementHookExpectedPath } from "../generated/improvement-hooks.js";
+import { composeImproveContext } from "../generated/pfm-reminder.js";
 import { detectProjectName, getRepoInfo } from "./project.js";
 import {
 	handleDocRequest,
+	handleDocExistsRequest,
 	handleFileBrowserRequest,
 	handleObsidianDocRequest,
 	handleObsidianFilesRequest,
 	handleObsidianVaultsRequest,
 } from "./reference.js";
+import { handleFileBrowserStreamRequest } from "./file-browser-watch.js";
+import { warmFileListCache } from "../generated/resolve-file.js";
+
+export interface PlanReviewDecision {
+	approved: boolean;
+	feedback?: string;
+	savedPath?: string;
+	agentSwitch?: string;
+	permissionMode?: string;
+}
 
 export interface PlanServerResult {
+	reviewId: string;
 	port: number;
 	portSource: "env" | "remote-default" | "random";
 	url: string;
-	waitForDecision: () => Promise<{ approved: boolean; feedback?: string; savedPath?: string; agentSwitch?: string; permissionMode?: string }>;
+	waitForDecision: () => Promise<PlanReviewDecision>;
+	onDecision: (listener: (result: PlanReviewDecision) => void | Promise<void>) => () => void;
 	waitForDone?: () => Promise<void>;
 	stop: () => void;
 }
@@ -66,7 +86,7 @@ export async function startPlanReviewServer(options: {
 }): Promise<PlanServerResult> {
 	const gitUser = detectGitUser();
 	const sharingEnabled =
-		options.sharingEnabled ?? process.env.PLANNOTATOR_SHARE !== "disabled";
+		options.sharingEnabled ?? resolveSharingEnabled(loadConfig());
 	const shareBaseUrl =
 		(options.shareBaseUrl ?? process.env.PLANNOTATOR_SHARE_URL) || undefined;
 	const pasteApiUrl =
@@ -113,28 +133,32 @@ export async function startPlanReviewServer(options: {
 				}
 			: null;
 
-	let resolveDecision!: (result: {
-		approved: boolean;
-		feedback?: string;
-		savedPath?: string;
-		agentSwitch?: string;
-		permissionMode?: string;
-	}) => void;
-	const decisionPromise = new Promise<{
-		approved: boolean;
-		feedback?: string;
-		savedPath?: string;
-		agentSwitch?: string;
-		permissionMode?: string;
-	}>((r) => {
+	const reviewId = randomUUID();
+	let resolveDecision!: (result: PlanReviewDecision) => void;
+	const decisionListeners = new Set<(result: PlanReviewDecision) => void | Promise<void>>();
+	let decisionSettled = false;
+	const decisionPromise = new Promise<PlanReviewDecision>((r) => {
 		resolveDecision = r;
 	});
+	const publishDecision = (result: PlanReviewDecision): boolean => {
+		if (decisionSettled) return false;
+		decisionSettled = true;
+		resolveDecision(result);
+		for (const listener of decisionListeners) {
+			Promise.resolve(listener(result)).catch((error) => {
+				console.error("[Plan Review] Decision listener failed:", error);
+			});
+		}
+		return true;
+	};
 
 	// Draft key for annotation persistence
 	const draftKey = options.mode !== "archive" ? contentHash(options.plan) : "";
 
 	// Editor annotations (in-memory, VS Code integration — skip in archive mode)
 	const editorAnnotations = options.mode !== "archive" ? createEditorAnnotationHandler() : null;
+	const externalAnnotations = options.mode !== "archive" ? createExternalAnnotationHandler("plan") : null;
+	const aiRuntime = options.mode !== "archive" ? await createPiAIRuntime() : null;
 
 	// Lazy cache for in-session archive tab
 	let cachedArchivePlans: ArchivedPlan[] | null = null;
@@ -158,7 +182,7 @@ export async function startPlanReviewServer(options: {
 				return;
 			}
 			const markdown = readArchivedPlan(filename, customPath);
-			if (!markdown) {
+			if (markdown === null) {
 				json(res, { error: "Not found" }, 404);
 				return;
 			}
@@ -208,12 +232,31 @@ export async function startPlanReviewServer(options: {
 					serverConfig: getServerConfig(gitUser),
 				});
 			}
+		} else if (url.pathname === "/api/hooks/status" && req.method === "GET") {
+			const config = loadConfig();
+			const hook = readImprovementHook("enterplanmode-improve");
+			const pfmEnabled = config.pfmReminder === true;
+			const composed = composeImproveContext({ pfmEnabled, improvementHookContent: hook?.content ?? null });
+			json(res, {
+				pfmReminder: { enabled: pfmEnabled },
+				improvementHook: {
+					present: !!hook,
+					filePath: hook?.filePath ?? getImprovementHookExpectedPath("enterplanmode-improve"),
+					fileSize: hook?.content?.length ?? null,
+					content: hook?.content ?? null,
+				},
+				composedLength: composed?.length ?? null,
+			});
 		} else if (url.pathname === "/api/config" && req.method === "POST") {
 			try {
-				const body = (await parseBody(req)) as { displayName?: string };
-				if (body.displayName !== undefined) {
-					saveConfig({ displayName: body.displayName });
-				}
+				const body = (await parseBody(req)) as { displayName?: string; diffOptions?: Record<string, unknown>; conventionalComments?: boolean; conventionalLabels?: unknown[] | null; pfmReminder?: boolean };
+				const toSave: Record<string, unknown> = {};
+				if (body.displayName !== undefined) toSave.displayName = body.displayName;
+				if (body.diffOptions !== undefined) toSave.diffOptions = body.diffOptions;
+				if (body.conventionalComments !== undefined) toSave.conventionalComments = body.conventionalComments;
+				if (body.conventionalLabels !== undefined) toSave.conventionalLabels = body.conventionalLabels;
+				if (body.pfmReminder !== undefined) toSave.pfmReminder = body.pfmReminder;
+				if (Object.keys(toSave).length > 0) saveConfig(toSave as Parameters<typeof saveConfig>[0]);
 				json(res, { ok: true });
 			} catch {
 				json(res, { error: "Invalid request" }, 400);
@@ -226,8 +269,14 @@ export async function startPlanReviewServer(options: {
 			await handleDraftRequest(req, res, draftKey);
 		} else if (editorAnnotations && (await editorAnnotations.handle(req, res, url))) {
 			return;
+		} else if (externalAnnotations && (await externalAnnotations.handle(req, res, url))) {
+			return;
+		} else if (url.pathname.startsWith("/api/ai/") && await handlePiAIRequest(req, res, url, aiRuntime)) {
+			return;
 		} else if (url.pathname === "/api/doc" && req.method === "GET") {
-			handleDocRequest(res, url);
+			await handleDocRequest(res, url);
+		} else if (url.pathname === "/api/doc/exists" && req.method === "POST") {
+			await handleDocExistsRequest(res, req);
 		} else if (url.pathname === "/api/obsidian/vaults") {
 			handleObsidianVaultsRequest(res);
 		} else if (url.pathname === "/api/reference/obsidian/files" && req.method === "GET") {
@@ -235,7 +284,10 @@ export async function startPlanReviewServer(options: {
 		} else if (url.pathname === "/api/reference/obsidian/doc" && req.method === "GET") {
 			handleObsidianDocRequest(res, url);
 		} else if (url.pathname === "/api/reference/files" && req.method === "GET") {
-			handleFileBrowserRequest(res, url);
+			await handleFileBrowserRequest(res, url);
+		} else if (url.pathname === "/api/reference/files/stream" && req.method === "GET") {
+			handleFileBrowserStreamRequest(req, res, url);
+			return;
 		} else if (
 			url.pathname === "/api/plan/vscode-diff" &&
 			req.method === "POST"
@@ -272,60 +324,24 @@ export async function startPlanReviewServer(options: {
 			}
 		} else if (url.pathname === "/api/agents" && req.method === "GET") {
 			json(res, { agents: [] });
-		} else if (url.pathname === "/favicon.svg") {
+		} else if (url.pathname === "/favicon.png") {
 			handleFavicon(res);
 		} else if (url.pathname === "/api/save-notes" && req.method === "POST") {
-			const results: {
-				obsidian?: IntegrationResult;
-				bear?: IntegrationResult;
-				octarine?: IntegrationResult;
-			} = {};
-			try {
-				const body = await parseBody(req);
-				const promises: Promise<void>[] = [];
-				const obsConfig = body.obsidian as ObsidianConfig | undefined;
-				const bearConfig = body.bear as BearConfig | undefined;
-				const octConfig = body.octarine as OctarineConfig | undefined;
-				if (obsConfig?.vaultPath && obsConfig?.plan) {
-					promises.push(
-						saveToObsidian(obsConfig).then((r) => {
-							results.obsidian = r;
-						}),
-					);
-				}
-				if (bearConfig?.plan) {
-					promises.push(
-						saveToBear(bearConfig).then((r) => {
-							results.bear = r;
-						}),
-					);
-				}
-				if (octConfig?.plan && octConfig?.workspace) {
-					promises.push(
-						saveToOctarine(octConfig).then((r) => {
-							results.octarine = r;
-						}),
-					);
-				}
-				await Promise.allSettled(promises);
-				for (const [name, result] of Object.entries(results)) {
-					if (!result?.success && result)
-						console.error(`[${name}] Save failed: ${result.error}`);
-				}
-			} catch (err) {
-				console.error(`[Save Notes] Error:`, err);
-				json(res, { error: "Save failed" }, 500);
+			await handleSaveNotesRequest(req, res);
+		} else if (url.pathname === "/api/approve" && req.method === "POST") {
+			if (decisionSettled) {
+				json(res, { ok: true, duplicate: true });
 				return;
 			}
-			json(res, { ok: true, results });
-		} else if (url.pathname === "/api/approve" && req.method === "POST") {
 			let feedback: string | undefined;
 			let agentSwitch: string | undefined;
 			let requestedPermissionMode: string | undefined;
 			let planSaveEnabled = true;
 			let planSaveCustomPath: string | undefined;
+			let draftGeneration: number | undefined;
 			try {
 				const body = await parseBody(req);
+				draftGeneration = readDraftGenerationFromBody(body);
 				if (body.feedback) feedback = body.feedback as string;
 				if (body.agentSwitch) agentSwitch = body.agentSwitch as string;
 				if (body.permissionMode)
@@ -383,9 +399,9 @@ export async function startPlanReviewServer(options: {
 					planSaveCustomPath,
 				);
 			}
-			deleteDraft(draftKey);
+			deleteDraft(draftKey, draftGeneration);
 			const effectivePermissionMode = requestedPermissionMode || options.permissionMode;
-			resolveDecision({
+			publishDecision({
 				approved: true,
 				feedback,
 				savedPath,
@@ -394,11 +410,17 @@ export async function startPlanReviewServer(options: {
 			});
 			json(res, { ok: true, savedPath });
 		} else if (url.pathname === "/api/deny" && req.method === "POST") {
+			if (decisionSettled) {
+				json(res, { ok: true, duplicate: true });
+				return;
+			}
 			let feedback = "Plan rejected by user";
 			let planSaveEnabled = true;
 			let planSaveCustomPath: string | undefined;
+			let draftGeneration: number | undefined;
 			try {
 				const body = await parseBody(req);
+				draftGeneration = readDraftGenerationFromBody(body);
 				feedback = (body.feedback as string) || feedback;
 				if (body.planSave !== undefined) {
 					const ps = body.planSave as { enabled: boolean; customPath?: string };
@@ -419,9 +441,11 @@ export async function startPlanReviewServer(options: {
 					planSaveCustomPath,
 				);
 			}
-			deleteDraft(draftKey);
-			resolveDecision({ approved: false, feedback, savedPath });
+			deleteDraft(draftKey, draftGeneration);
+			publishDecision({ approved: false, feedback, savedPath });
 			json(res, { ok: true, savedPath });
+		} else if (url.pathname.startsWith("/api/")) {
+			handleApiNotFound(res, url.pathname);
 		} else {
 			html(res, options.htmlContent);
 		}
@@ -429,12 +453,25 @@ export async function startPlanReviewServer(options: {
 
 	const { port, portSource } = await listenOnPort(server);
 
+	// Mirror the Bun server: bind first, then warm through the async shared walk.
+	void warmFileListCache(process.cwd(), "code");
+
 	return {
+		reviewId,
 		port,
 		portSource,
 		url: `http://localhost:${port}`,
 		waitForDecision: () => decisionPromise,
+		onDecision: (listener) => {
+			decisionListeners.add(listener);
+			return () => {
+				decisionListeners.delete(listener);
+			};
+		},
 		...(donePromise && { waitForDone: () => donePromise }),
-		stop: () => server.close(),
+		stop: () => {
+			aiRuntime?.dispose();
+			server.close();
+		},
 	};
 }

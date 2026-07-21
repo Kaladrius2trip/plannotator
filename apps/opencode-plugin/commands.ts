@@ -1,15 +1,10 @@
 /**
  * Command Handlers for OpenCode Plugin
  *
- * Handles /plannotator-review, /plannotator-annotate, /plannotator-last,
- * and /plannotator-archive slash commands. Extracted from the event hook
- * for modularity.
+ * Handles /plannotator-review, /plannotator-annotate, and /plannotator-last
+ * slash commands. Extracted from the event hook for modularity.
  */
 
-import {
-  startPlannotatorServer,
-  handleServerReady,
-} from "@plannotator/server";
 import {
   startReviewServer,
   handleReviewServerReady,
@@ -18,9 +13,24 @@ import {
   startAnnotateServer,
   handleAnnotateServerReady,
 } from "@plannotator/server/annotate";
-import { getGitContext, runGitDiffWithContext } from "@plannotator/server/git";
+import { type DiffType, prepareLocalReviewDiff, detectManagedVcs } from "@plannotator/server/vcs";
+import { detectProjectName } from "@plannotator/server/project";
 import { parsePRUrl, checkPRAuth, fetchPR, getCliName, getMRLabel, getMRNumberLabel, getDisplayRepo } from "@plannotator/server/pr";
-import { resolveMarkdownFile } from "@plannotator/shared/resolve-file";
+import { loadConfig, resolveDefaultDiffType, resolveUseJina } from "@plannotator/shared/config";
+import {
+  getReviewApprovedPrompt,
+  getReviewDeniedSuffix,
+  getAnnotateFileFeedbackPrompt,
+} from "@plannotator/shared/prompts";
+import { resolveMarkdownFile, resolveUserPath, hasMarkdownFiles, ANNOTATABLE_DOC_REGEX, MAX_ANNOTATABLE_FILE_BYTES } from "@plannotator/shared/resolve-file";
+import { FILE_BROWSER_EXCLUDED } from "@plannotator/shared/reference-common";
+import { htmlToMarkdown } from "@plannotator/shared/html-to-markdown";
+import { parseAnnotateArgs } from "@plannotator/shared/annotate-args";
+import { parseReviewArgs } from "@plannotator/shared/review-args";
+import { urlToMarkdown, isConvertedSource } from "@plannotator/shared/url-to-markdown";
+import { buildLocalWorkspaceReview, type WorkspaceDiffType } from "@plannotator/server/review-workspace";
+import { statSync } from "fs";
+import path from "path";
 
 /** Shared dependencies injected by the plugin */
 export interface CommandDeps {
@@ -29,7 +39,14 @@ export interface CommandDeps {
   reviewHtmlContent: string;
   getSharingEnabled: () => Promise<boolean>;
   getShareBaseUrl: () => string | undefined;
+  getPasteApiUrl: () => string | undefined;
   directory?: string;
+  /**
+   * Annotate server starter. Injectable so tests can supply a stub without a
+   * global `mock.module` (which Bun cannot scope per-file or unset, and which
+   * would leak into other suites). Defaults to the real annotate server.
+   */
+  startAnnotateServer?: typeof startAnnotateServer;
 }
 
 export async function handleReviewCommand(
@@ -39,14 +56,19 @@ export async function handleReviewCommand(
   const { client, reviewHtmlContent, getSharingEnabled, getShareBaseUrl, directory } = deps;
 
   // @ts-ignore - Event properties contain arguments
-  const urlArg: string = event.properties?.arguments || "";
-  const isPRMode = urlArg?.startsWith("http://") || urlArg?.startsWith("https://");
+  const reviewArgs = parseReviewArgs(event.properties?.arguments || "");
+  const urlArg = reviewArgs.prUrl;
+  const isPRMode = urlArg !== undefined;
 
   let rawPatch: string;
   let gitRef: string;
   let diffError: string | undefined;
-  let gitContext: Awaited<ReturnType<typeof getGitContext>> | undefined;
+  let initialFingerprint: string | undefined;
+  let userDiffType: DiffType | WorkspaceDiffType | undefined;
+  let gitContext: Awaited<ReturnType<typeof prepareLocalReviewDiff>>["gitContext"] | undefined;
   let prMetadata: Awaited<ReturnType<typeof fetchPR>>["metadata"] | undefined;
+  let workspace: Awaited<ReturnType<typeof buildLocalWorkspaceReview>> | undefined;
+  let agentCwd: string | undefined;
 
   if (isPRMode) {
     const prRef = parsePRUrl(urlArg);
@@ -77,11 +99,43 @@ export async function handleReviewCommand(
   } else {
     client.app.log({ level: "info", message: "Opening code review UI..." });
 
-    gitContext = await getGitContext(directory);
-    const diffResult = await runGitDiffWithContext("uncommitted", gitContext);
-    rawPatch = diffResult.patch;
-    gitRef = diffResult.label;
-    diffError = diffResult.error;
+    const config = loadConfig();
+    const cwd = directory ?? process.cwd();
+    const managedVcs = await detectManagedVcs(cwd, reviewArgs.vcsType);
+    const forcedVcs = !!reviewArgs.vcsType && reviewArgs.vcsType !== "auto";
+    if (managedVcs || forcedVcs) {
+      try {
+        const diffResult = await prepareLocalReviewDiff({
+          cwd,
+          vcsType: reviewArgs.vcsType,
+          configuredDiffType: resolveDefaultDiffType(config),
+          hideWhitespace: config.diffOptions?.hideWhitespace ?? false,
+        });
+        gitContext = diffResult.gitContext;
+        userDiffType = diffResult.diffType;
+        rawPatch = diffResult.rawPatch;
+        gitRef = diffResult.gitRef;
+        diffError = diffResult.error;
+        initialFingerprint = diffResult.fingerprint;
+      } catch (err) {
+        client.app.log({ level: "error", message: err instanceof Error ? err.message : "Failed to prepare local review diff" });
+        return;
+      }
+    } else {
+      workspace = await buildLocalWorkspaceReview(cwd, {
+        configuredDiffType: resolveDefaultDiffType(config),
+        hideWhitespace: config.diffOptions?.hideWhitespace ?? false,
+      });
+      if (workspace.repos.length === 0) {
+        client.app.log({ level: "error", message: "Not in a VCS repo and no nested Git/JJ/GitButler repositories were found." });
+        return;
+      }
+      rawPatch = workspace.rawPatch;
+      gitRef = workspace.gitRef;
+      diffError = workspace.error;
+      userDiffType = workspace.diffType;
+      agentCwd = workspace.root;
+    }
   }
 
   const server = await startReviewServer({
@@ -89,19 +143,29 @@ export async function handleReviewCommand(
     gitRef,
     error: diffError,
     origin: "opencode",
-    diffType: isPRMode ? undefined : "uncommitted",
+    diffType: isPRMode ? undefined : userDiffType,
     gitContext,
+    initialFingerprint,
     prMetadata,
+    workspace,
+    agentCwd,
     sharingEnabled: await getSharingEnabled(),
     shareBaseUrl: getShareBaseUrl(),
     htmlContent: reviewHtmlContent,
     opencodeClient: client,
-    onReady: handleReviewServerReady,
+    onReady: (url, isRemote, port) => {
+      handleReviewServerReady(url, isRemote, port);
+      client.app.log({ level: "info", message: `[Plannotator] Open code review: ${url}` });
+    },
   });
 
   const result = await server.waitForDecision();
   await Bun.sleep(1500);
   server.stop();
+
+  if (result.exit) {
+    return;
+  }
 
   if (result.feedback) {
     // @ts-ignore - Event properties contain sessionID
@@ -111,11 +175,14 @@ export async function handleReviewCommand(
       const shouldSwitchAgent = result.agentSwitch && result.agentSwitch !== "disabled";
       const targetAgent = result.agentSwitch || "build";
 
+      // Append the verification-only suffix when the reviewer sent annotations to
+      // act on (PR mode included). Platform PR actions post a status message
+      // with no annotations — those go through verbatim, no suffix.
       const message = result.approved
-        ? "# Code Review\n\nCode review completed — no changes requested."
-        : isPRMode
-          ? result.feedback
-          : `${result.feedback}\n\nPlease address this feedback.`;
+        ? getReviewApprovedPrompt("opencode")
+        : result.annotations.length > 0
+          ? `${result.feedback}${getReviewDeniedSuffix("opencode")}`
+          : result.feedback;
 
       try {
         await client.session.prompt({
@@ -136,50 +203,154 @@ export async function handleAnnotateCommand(
   event: any,
   deps: CommandDeps
 ) {
-  const { client, htmlContent, getSharingEnabled, getShareBaseUrl } = deps;
+  const { client, htmlContent, getSharingEnabled, getShareBaseUrl, getPasteApiUrl, directory } = deps;
+  const startServer = deps.startAnnotateServer ?? startAnnotateServer;
 
   // @ts-ignore - Event properties contain arguments
-  const filePath = event.properties?.arguments || event.arguments || "";
+  const rawArgs = event.properties?.arguments || event.arguments || "";
+  // Split known annotate flags out of the args; rest is the file path.
+  // --json is accepted silently (OpenCode writes to session, not stdout).
+  // parseAnnotateArgs strips leading @ on filePath (reference-mode convention).
+  // `rawFilePath` preserves it for the scoped-package markdown fallback.
+  const { filePath, rawFilePath, gate, renderMarkdown: renderMarkdownFlag, noJina } = parseAnnotateArgs(rawArgs);
 
   if (!filePath) {
-    client.app.log({ level: "error", message: "Usage: /plannotator-annotate <file.md>" });
+    client.app.log({ level: "error", message: "Usage: /plannotator-annotate <file.md | file.txt | file.html | https://... | folder/> [--markdown] [--no-jina] [--gate] [--json]" });
     return;
   }
 
-  client.app.log({ level: "info", message: `Opening annotation UI for ${filePath}...` });
+  let markdown: string;
+  let rawHtml: string | undefined;
+  let absolutePath: string;
+  let folderPath: string | undefined;
+  let annotateMode: "annotate" | "annotate-folder" = "annotate";
+  let isFolder = false;
+  let sourceInfo: string | undefined;
+  let sourceConverted = false;
+  const agentCwd = directory || process.cwd();
 
-  const projectRoot = process.cwd();
-  const resolved = await resolveMarkdownFile(filePath, projectRoot);
+  // --- URL annotation ---
+  const isUrl = /^https?:\/\//i.test(filePath);
 
-  if (resolved.kind === "ambiguous") {
-    client.app.log({
-      level: "error",
-      message: `Ambiguous filename "${resolved.input}" — found ${resolved.matches.length} matches:\n${resolved.matches.map((m) => `  ${m}`).join("\n")}`,
-    });
-    return;
+  if (isUrl) {
+    const useJina = resolveUseJina(noJina, loadConfig());
+    client.app.log({ level: "info", message: `Fetching: ${filePath}${useJina ? " (via Jina Reader)" : " (via fetch+Turndown)"}...` });
+    try {
+      const result = await urlToMarkdown(filePath, { useJina });
+      markdown = result.markdown;
+      sourceConverted = isConvertedSource(result.source);
+    } catch (err) {
+      client.app.log({ level: "error", message: `Failed to fetch URL: ${err instanceof Error ? err.message : String(err)}` });
+      return;
+    }
+    absolutePath = filePath;
+    sourceInfo = filePath;
+  } else {
+    const projectRoot = agentCwd;
+    const resolvedArg = resolveUserPath(filePath, projectRoot);
+
+    try {
+      isFolder = statSync(resolvedArg).isDirectory();
+    } catch {
+      // Not a directory, fall through to file resolution.
+    }
+
+    if (isFolder) {
+      if (!hasMarkdownFiles(resolvedArg, FILE_BROWSER_EXCLUDED, ANNOTATABLE_DOC_REGEX)) {
+        client.app.log({ level: "error", message: `No annotatable files (markdown, plain-text, config, or HTML) found in ${resolvedArg}` });
+        return;
+      }
+      folderPath = resolvedArg;
+      absolutePath = resolvedArg;
+      markdown = "";
+      annotateMode = "annotate-folder";
+      client.app.log({ level: "info", message: `Opening annotation UI for folder ${resolvedArg}...` });
+    } else if (/\.html?$/i.test(resolvedArg)) {
+      try {
+        statSync(resolvedArg);
+      } catch {
+        client.app.log({ level: "error", message: `File not found: ${filePath}` });
+        return;
+      }
+      const html = await Bun.file(resolvedArg).text();
+      const renderHtmlForFile = !renderMarkdownFlag;
+      if (renderHtmlForFile) {
+        rawHtml = html;
+        markdown = "";
+      } else {
+        markdown = htmlToMarkdown(html);
+        sourceConverted = true;
+      }
+      absolutePath = resolvedArg;
+      sourceInfo = path.basename(resolvedArg);
+      client.app.log({ level: "info", message: `${renderHtmlForFile ? "Raw HTML" : "Converted"}: ${absolutePath}` });
+    } else {
+      // Markdown file annotation
+      client.app.log({ level: "info", message: `Opening annotation UI for ${filePath}...` });
+      // Strip-first with literal-@ fallback (scoped-package-style names).
+      let resolved = await resolveMarkdownFile(filePath, projectRoot);
+      if (resolved.kind === "not_found" && rawFilePath !== filePath) {
+        resolved = await resolveMarkdownFile(rawFilePath, projectRoot);
+      }
+
+      if (resolved.kind === "ambiguous") {
+        client.app.log({
+          level: "error",
+          message: `Ambiguous filename "${resolved.input}" — found ${resolved.matches.length} matches:\n${resolved.matches.map((m) => `  ${m}`).join("\n")}`,
+        });
+        return;
+      }
+      if (resolved.kind === "not_found") {
+        client.app.log({ level: "error", message: `File not found: ${resolved.input}` });
+        return;
+      }
+
+      absolutePath = resolved.path;
+      if (Bun.file(absolutePath).size > MAX_ANNOTATABLE_FILE_BYTES) {
+        client.app.log({ level: "error", message: `File too large to annotate (max 2MB): ${absolutePath}` });
+        return;
+      }
+      client.app.log({ level: "info", message: `Resolved: ${absolutePath}` });
+      markdown = await Bun.file(absolutePath).text();
+    }
   }
-  if (resolved.kind === "not_found") {
-    client.app.log({ level: "error", message: `File not found: ${resolved.input}` });
-    return;
-  }
 
-  const absolutePath = resolved.path;
-  client.app.log({ level: "info", message: `Resolved: ${absolutePath}` });
-  const markdown = await Bun.file(absolutePath).text();
-
-  const server = await startAnnotateServer({
+  // Per-project scoping for the annotate version history — matches the hook
+  // and Pi runtimes, which both pass it (otherwise history lands in the
+  // shared "_unknown" bucket).
+  const annotateProject = (await detectProjectName()) ?? undefined;
+  const server = await startServer({
     markdown,
     filePath: absolutePath,
     origin: "opencode",
+    mode: annotateMode,
+    project: annotateProject,
+    folderPath,
+    sourceInfo,
+    sourceConverted,
+    rawHtml,
+    renderHtml: !!rawHtml,
+    convertHtml: renderMarkdownFlag,
     sharingEnabled: await getSharingEnabled(),
     shareBaseUrl: getShareBaseUrl(),
+    pasteApiUrl: getPasteApiUrl(),
+    gate,
+    agentCwd,
     htmlContent,
-    onReady: handleAnnotateServerReady,
+    onReady: (url, isRemote, port) => {
+      handleAnnotateServerReady(url, isRemote, port);
+      client.app.log({ level: "info", message: `[Plannotator] Open annotation UI: ${url}` });
+    },
   });
 
   const result = await server.waitForDecision();
   await Bun.sleep(1500);
   server.stop();
+
+  // Both exit and approve are "no-op for the agent" — skip session injection.
+  if (result.exit || result.approved) {
+    return;
+  }
 
   if (result.feedback) {
     // @ts-ignore - Event properties contain sessionID
@@ -192,7 +363,11 @@ export async function handleAnnotateCommand(
           body: {
             parts: [{
               type: "text",
-              text: `# Markdown Annotations\n\nFile: ${absolutePath}\n\n${result.feedback}\n\nPlease address the annotation feedback above.`,
+              text: getAnnotateFileFeedbackPrompt("opencode", undefined, {
+                fileHeader: isFolder ? "Folder" : "File",
+                filePath: absolutePath,
+                feedback: result.feedback,
+              }),
             }],
           },
         });
@@ -212,7 +387,13 @@ export async function handleAnnotateLastCommand(
   event: any,
   deps: CommandDeps
 ): Promise<string | null> {
-  const { client, htmlContent, getSharingEnabled, getShareBaseUrl } = deps;
+  const { client, htmlContent, getSharingEnabled, getShareBaseUrl, getPasteApiUrl } = deps;
+  const startServer = deps.startAnnotateServer ?? startAnnotateServer;
+
+  // @ts-ignore - Event properties contain arguments
+  const rawArgs = event.properties?.arguments || event.arguments || "";
+  // Support --gate on /plannotator-last (Stop-hook review-gate pattern).
+  const { gate } = parseAnnotateArgs(rawArgs);
 
   // @ts-ignore - Event properties contain sessionID
   const sessionId = event.properties?.sessionID;
@@ -227,23 +408,25 @@ export async function handleAnnotateLastCommand(
   });
   const messages = messagesResponse.data;
 
-  // Walk backward, find last assistant message with text
-  let lastText: string | null = null;
+  const RECENT_LIMIT = 25;
+  const recentMessages: { messageId: string; text: string; timestamp?: string }[] = [];
   if (messages) {
-    for (let i = messages.length - 1; i >= 0; i--) {
+    for (let i = messages.length - 1; i >= 0 && recentMessages.length < RECENT_LIMIT; i--) {
       const msg = messages[i];
-      if (msg.info.role === "assistant") {
-        const textParts = msg.parts
-          .filter((p: any) => p.type === "text" && p.text?.trim())
-          .map((p: any) => p.text);
-        if (textParts.length > 0) {
-          lastText = textParts.join("\n");
-          break;
-        }
-      }
+      if (msg.info.role !== "assistant") continue;
+      const textParts = msg.parts
+        .filter((p: any) => p.type === "text" && p.text?.trim())
+        .map((p: any) => p.text);
+      if (textParts.length === 0) continue;
+      recentMessages.push({
+        messageId: msg.info.id ?? `opencode-${i}`,
+        text: textParts.join("\n"),
+        timestamp: msg.info.time?.created ? new Date(msg.info.time.created).toISOString() : undefined,
+      });
     }
   }
 
+  const lastText = recentMessages[0]?.text ?? null;
   if (!lastText) {
     client.app.log({ level: "error", message: "No assistant message found in session." });
     return null;
@@ -251,45 +434,35 @@ export async function handleAnnotateLastCommand(
 
   client.app.log({ level: "info", message: "Opening annotation UI for last message..." });
 
-  const server = await startAnnotateServer({
+  const pickerMessages = recentMessages.length > 1 ? recentMessages : undefined;
+
+  const lastProject = (await detectProjectName()) ?? undefined;
+  const server = await startServer({
     markdown: lastText,
     filePath: "last-message",
     origin: "opencode",
     mode: "annotate-last",
+    project: lastProject,
+    recentMessages: pickerMessages,
     sharingEnabled: await getSharingEnabled(),
     shareBaseUrl: getShareBaseUrl(),
+    pasteApiUrl: getPasteApiUrl(),
+    gate,
     htmlContent,
-    onReady: handleAnnotateServerReady,
+    onReady: (url, isRemote, port) => {
+      handleAnnotateServerReady(url, isRemote, port);
+      client.app.log({ level: "info", message: `[Plannotator] Open annotation UI: ${url}` });
+    },
   });
 
   const result = await server.waitForDecision();
   await Bun.sleep(1500);
   server.stop();
 
-  return result.feedback || null;
-}
-
-export async function handleArchiveCommand(
-  event: any,
-  deps: CommandDeps
-) {
-  const { client, htmlContent, getSharingEnabled, getShareBaseUrl } = deps;
-
-  client.app.log({ level: "info", message: "Opening plan archive..." });
-
-  const server = await startPlannotatorServer({
-    plan: "",
-    origin: "opencode",
-    mode: "archive",
-    sharingEnabled: await getSharingEnabled(),
-    shareBaseUrl: getShareBaseUrl(),
-    htmlContent,
-    onReady: handleServerReady,
-  });
-
-  if (server.waitForDone) {
-    await server.waitForDone();
+  // Both exit and approve signal "don't inject feedback" — return null.
+  if (result.exit || result.approved) {
+    return null;
   }
-  await Bun.sleep(1500);
-  server.stop();
+
+  return result.feedback || null;
 }

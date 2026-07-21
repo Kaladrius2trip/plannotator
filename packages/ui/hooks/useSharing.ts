@@ -8,7 +8,7 @@
  * - Tracking whether current session is from a shared link
  */
 
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { Annotation, type ImageAttachment } from '../types';
 import {
   type SharePayload,
@@ -64,7 +64,7 @@ interface UseSharingResult {
   refreshShareUrl: () => Promise<void>;
 
   /** Generate a short URL via the paste service (user must explicitly trigger this) */
-  generateShortUrl: () => Promise<void>;
+  generateShortUrl: () => Promise<string | null>;
 
   /** Import annotations from a teammate's share URL */
   importFromShareUrl: (url: string) => Promise<ImportResult>;
@@ -77,6 +77,18 @@ interface UseSharingResult {
 }
 
 
+// Share payloads are base64url-encoded deflate output: charset [A-Za-z0-9_-],
+// realistically >=30 chars, and virtually always mixed-case because deflate
+// output has high entropy. Plain heading anchors — whether the lowercase
+// ASCII slugs from `slugifyHeading` ("section-overview"), Unicode slugs
+// ("café", "中文-notes"), or raw HTML ids ("MySection") — miss at least one
+// of those signals. So: run share parsing only when the hash looks like a
+// share payload. Everything else is left for Viewer to scroll to (or ignore).
+function looksLikeSharePayload(rawHash: string): boolean {
+  const hash = rawHash.replace(/^#/, '').split('?')[0];
+  return hash.length >= 30 && /^[A-Za-z0-9_-]+$/.test(hash) && /[A-Z]/.test(hash);
+}
+
 export function useSharing(
   markdown: string,
   annotations: Annotation[],
@@ -86,7 +98,12 @@ export function useSharing(
   setGlobalAttachments: React.Dispatch<React.SetStateAction<ImageAttachment[]>>,
   onSharedLoad?: () => void,
   shareBaseUrl?: string,
-  pasteApiUrl?: string
+  pasteApiUrl?: string,
+  rawHtml?: string,
+  resolveRawHtmlForShare?: () => Promise<string | null>,
+  setRawHtml?: (h: string) => void,
+  setShareHtml?: (h: string) => void,
+  setRenderAs?: (m: 'markdown' | 'html') => void,
 ): UseSharingResult {
   const [isSharedSession, setIsSharedSession] = useState(false);
   const [isLoadingShared, setIsLoadingShared] = useState(true);
@@ -114,25 +131,38 @@ export function useSharing(
       if (pathMatch) {
         const pasteId = pathMatch[1];
 
-        // Extract encryption key from URL fragment: #key=<base64url>
+        // Extract key and optional paste origin from fragment: #key=<k>&paste=<base64url>
         const fragment = window.location.hash.slice(1);
-        const encryptionKey = fragment.startsWith('key=') ? fragment.slice(4) : undefined;
+        const params = new URLSearchParams(fragment);
+        const encryptionKey = params.get('key') ?? undefined;
+        const pasteFromFragment = params.get('paste')
+          ? atob(params.get('paste')!.replace(/-/g, '+').replace(/_/g, '/'))
+          : undefined;
 
-        const payload = await loadFromPasteId(pasteId, pasteApiUrl, encryptionKey);
+        const payload = await loadFromPasteId(pasteId, pasteFromFragment ?? pasteApiUrl, encryptionKey);
         if (payload) {
-          setMarkdown(payload.p);
+          if (payload.h && payload.r === 'html') {
+            setRawHtml?.(payload.h);
+            setShareHtml?.(payload.h);
+            setRenderAs?.('html');
+            setMarkdown('');
+          } else {
+            setMarkdown(payload.p);
+            setRenderAs?.('markdown');
+            setRawHtml?.('');
+            setShareHtml?.('');
+          }
 
-          const restoredAnnotations = fromShareable(payload.a, payload.d);
+          const restoredAnnotations = fromShareable(payload.a, payload.d, payload.s);
           setAnnotations(restoredAnnotations);
 
-          if (payload.g?.length) {
-            const parsed = parseShareableImages(payload.g) ?? [];
-            setGlobalAttachments(parsed);
-            setSharedGlobalAttachments(parsed);
-          }
+          const parsedGlobalAttachments = parseShareableImages(payload.g) ?? [];
+          setGlobalAttachments(parsedGlobalAttachments);
+          setSharedGlobalAttachments(parsedGlobalAttachments.length ? parsedGlobalAttachments : null);
 
           setPendingSharedAnnotations(restoredAnnotations);
           setIsSharedSession(true);
+          setShortShareUrl(window.location.href);
           onSharedLoad?.();
 
           // Remove the /p/<id> path from browser history so a refresh doesn't
@@ -149,22 +179,34 @@ export function useSharing(
       }
 
       const hash = window.location.hash.slice(1);
+
+      // Not a share payload — leave it for Viewer to scroll to (or ignore).
+      if (!looksLikeSharePayload(hash)) {
+        return false;
+      }
+
       const payload = await parseShareHash();
 
       if (payload) {
-        // Set plan content
-        setMarkdown(payload.p);
+        if (payload.h && payload.r === 'html') {
+          setRawHtml?.(payload.h);
+          setShareHtml?.(payload.h);
+          setRenderAs?.('html');
+          setMarkdown('');
+        } else {
+          setMarkdown(payload.p);
+          setRenderAs?.('markdown');
+          setRawHtml?.('');
+          setShareHtml?.('');
+        }
 
         // Convert shareable annotations to full annotations
-        const restoredAnnotations = fromShareable(payload.a, payload.d);
+        const restoredAnnotations = fromShareable(payload.a, payload.d, payload.s);
         setAnnotations(restoredAnnotations);
 
-        // Restore global attachments if present
-        if (payload.g?.length) {
-          const parsed = parseShareableImages(payload.g) ?? [];
-          setGlobalAttachments(parsed);
-          setSharedGlobalAttachments(parsed);
-        }
+        const parsedGlobalAttachments = parseShareableImages(payload.g) ?? [];
+        setGlobalAttachments(parsedGlobalAttachments);
+        setSharedGlobalAttachments(parsedGlobalAttachments.length ? parsedGlobalAttachments : null);
 
         // Store for later application to DOM
         setPendingSharedAnnotations(restoredAnnotations);
@@ -195,7 +237,7 @@ export function useSharing(
       setShareLoadError('Failed to load shared plan — an unexpected error occurred.');
       return false;
     }
-  }, [setMarkdown, setAnnotations, setGlobalAttachments, onSharedLoad, pasteApiUrl]);
+  }, [setMarkdown, setAnnotations, setGlobalAttachments, onSharedLoad, pasteApiUrl, setRawHtml, setShareHtml, setRenderAs]);
 
   // Load from hash on mount
   useEffect(() => {
@@ -205,9 +247,8 @@ export function useSharing(
   // Listen for hash changes (when user pastes a new share URL)
   useEffect(() => {
     const handleHashChange = () => {
-      if (window.location.hash.length > 1) {
-        loadFromHash();
-      }
+      if (!looksLikeSharePayload(window.location.hash)) return;
+      loadFromHash();
     };
 
     window.addEventListener('hashchange', handleHashChange);
@@ -217,15 +258,15 @@ export function useSharing(
   // Generate share URL when markdown or annotations change
   const refreshShareUrl = useCallback(async () => {
     try {
-      const url = await generateShareUrl(markdown, annotations, globalAttachments, shareBaseUrl);
-      setShareUrl(url);
-      setShareUrlSize(formatUrlSize(url));
+      const url = await generateShareUrl(markdown, annotations, globalAttachments, shareBaseUrl, rawHtml);
+      setShareUrl(url ?? '');
+      setShareUrlSize(url ? formatUrlSize(url) : '');
     } catch (e) {
       console.error('Failed to generate share URL:', e);
       setShareUrl('');
       setShareUrlSize('');
     }
-  }, [markdown, annotations, globalAttachments, shareBaseUrl]);
+  }, [markdown, annotations, globalAttachments, shareBaseUrl, rawHtml]);
 
   // Auto-refresh share URL when dependencies change
   useEffect(() => {
@@ -233,11 +274,15 @@ export function useSharing(
   }, [refreshShareUrl]);
 
   // Clear stale short URL when content changes (does NOT auto-regenerate —
-  // the user must explicitly click "Create short link" again)
+  // the user must explicitly click "Create short link" again).
+  // Skip on shared session load — the incoming short URL must survive.
+  const isSharedRef = useRef(false);
   useEffect(() => {
+    if (isSharedSession) { isSharedRef.current = true; return; }
+    if (isSharedRef.current) { isSharedRef.current = false; return; }
     setShortShareUrl('');
     setShortUrlError('');
-  }, [markdown, annotations]);
+  }, [markdown, annotations, globalAttachments, rawHtml, isSharedSession]);
 
   /**
    * Generate a short URL via the paste service.
@@ -245,33 +290,40 @@ export function useSharing(
    * Clears the short URL if the service is unavailable — the full
    * hash-based URL remains usable as a fallback.
    */
-  const generateShortUrl = useCallback(async () => {
-    if (!markdown) return;
+  const generateShortUrl = useCallback(async (): Promise<string | null> => {
+    if (!markdown && !rawHtml) return null;
 
     setIsGeneratingShortUrl(true);
     setShortUrlError('');
 
     try {
+      const htmlForShare = rawHtml
+        ? (await resolveRawHtmlForShare?.()) ?? rawHtml
+        : undefined;
       const result = await createShortShareUrl(
         markdown,
         annotations,
         globalAttachments,
-        { pasteApiUrl, shareBaseUrl }
+        { pasteApiUrl, shareBaseUrl },
+        htmlForShare,
       );
 
       if (result) {
         setShortShareUrl(result.shortUrl);
+        return result.shortUrl;
       } else {
         setShortShareUrl('');
         setShortUrlError('Short URL service unavailable');
+        return null;
       }
-    } catch {
+    } catch (e) {
       setShortShareUrl('');
-      setShortUrlError('Failed to generate short URL');
+      setShortUrlError(e instanceof Error ? e.message : 'Failed to generate short URL');
+      return null;
     } finally {
       setIsGeneratingShortUrl(false);
     }
-  }, [markdown, annotations, globalAttachments, shareBaseUrl, pasteApiUrl]);
+  }, [markdown, annotations, globalAttachments, shareBaseUrl, pasteApiUrl, rawHtml, resolveRawHtmlForShare]);
 
   // Import annotations from a teammate's share URL (supports both hash-based and short /p/<id> URLs)
   const importFromShareUrl = useCallback(async (url: string): Promise<ImportResult> => {
@@ -279,11 +331,15 @@ export function useSharing(
       let payload: SharePayload | undefined;
 
       // Check for short URL pattern: /p/<id> with optional #key=<key> fragment
-      const shortMatch = url.match(/\/p\/([A-Za-z0-9]{6,16})(?:#key=([A-Za-z0-9_-]+))?(?:\?|#|$)/);
+      const shortMatch = url.match(/\/p\/([A-Za-z0-9]{6,16})(?:#(.*))?(?:\?|$)/);
       if (shortMatch) {
         const pasteId = shortMatch[1];
-        const encryptionKey = shortMatch[2]; // undefined if no key fragment
-        const loaded = await loadFromPasteId(pasteId, pasteApiUrl, encryptionKey);
+        const fragParams = new URLSearchParams(shortMatch[2] ?? '');
+        const encryptionKey = fragParams.get('key') ?? undefined;
+        const pasteFromFragment = fragParams.get('paste')
+          ? atob(fragParams.get('paste')!.replace(/-/g, '+').replace(/_/g, '/'))
+          : undefined;
+        const loaded = await loadFromPasteId(pasteId, pasteFromFragment ?? pasteApiUrl, encryptionKey);
         if (!loaded) {
           return { success: false, count: 0, planTitle: '', error: 'Failed to load from short URL — paste may have expired' };
         }
@@ -299,16 +355,21 @@ export function useSharing(
           return { success: false, count: 0, planTitle: '', error: 'Invalid share URL: empty hash' };
         }
 
-        payload = await decompress(hash);
+        payload = (await decompress(hash)) as SharePayload;
       }
 
-      // Extract plan title from embedded plan text
-      const lines = (payload.p || '').trim().split('\n');
-      const titleLine = lines.find(l => l.startsWith('#'));
-      const planTitle = titleLine ? titleLine.replace(/^#+\s*/, '').trim() : 'Unknown Plan';
+      // Extract plan title from embedded plan text (or HTML <title>)
+      let planTitle = 'Unknown Plan';
+      if (payload.p) {
+        const titleLine = payload.p.trim().split('\n').find(l => l.startsWith('#'));
+        if (titleLine) planTitle = titleLine.replace(/^#+\s*/, '').trim();
+      } else if (payload.h) {
+        const titleMatch = payload.h.match(/<title[^>]*>([^<]+)<\/title>/i);
+        if (titleMatch) planTitle = titleMatch[1].trim();
+      }
 
       // Convert to full annotations
-      const importedAnnotations = fromShareable(payload.a, payload.d);
+      const importedAnnotations = fromShareable(payload.a, payload.d, payload.s);
 
       if (importedAnnotations.length === 0) {
         return { success: true, count: 0, planTitle, error: 'No annotations found in share link' };

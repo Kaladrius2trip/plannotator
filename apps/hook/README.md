@@ -21,6 +21,8 @@ irm https://plannotator.ai/install.ps1 | iex
 curl -fsSL https://plannotator.ai/install.cmd -o install.cmd && install.cmd && del install.cmd
 ```
 
+Released binaries ship with SHA256 sidecars and [SLSA build provenance](https://slsa.dev/) attestations from v0.17.2 onwards. See the [installation docs](https://plannotator.ai/docs/getting-started/installation/) for version pinning and the [verification docs](https://plannotator.ai/docs/reference/verifying-your-install/) for verification commands.
+
 ---
 
 [Plugin Installation](#plugin-installation) · [Manual Installation (Hooks)](#manual-installation-hooks) · [Obsidian Integration](#obsidian-integration)  
@@ -75,14 +77,14 @@ When Claude Code calls `ExitPlanMode`, this hook intercepts and:
 
 | Variable | Description |
 |----------|-------------|
-| `PLANNOTATOR_REMOTE` | Set to `1` for remote mode (devcontainer, SSH). Uses fixed port and skips browser open. |
+| `PLANNOTATOR_REMOTE` | Set to `1` / `true` for remote mode, `0` / `false` for local mode, or leave unset for SSH auto-detection. Uses a fixed port in remote mode; browser-opening behavior depends on the environment. |
 | `PLANNOTATOR_PORT` | Fixed port to use. Default: random locally, `19432` for remote sessions. |
 | `PLANNOTATOR_BROWSER` | Custom browser to open plans in. macOS: app name or path. Linux/Windows: executable path. |
 | `PLANNOTATOR_SHARE_URL` | Custom share portal URL for self-hosting. Default: `https://share.plannotator.ai`. |
 
 ## Remote / Devcontainer Usage
 
-When running Claude Code in a remote environment (SSH, devcontainer, WSL), set these environment variables:
+When running Claude Code in a remote environment (SSH, devcontainer, WSL), set `PLANNOTATOR_REMOTE=1` (or `true`) and these environment variables:
 
 ```bash
 export PLANNOTATOR_REMOTE=1
@@ -91,7 +93,7 @@ export PLANNOTATOR_PORT=9999  # Choose a port you'll forward
 
 This tells Plannotator to:
 - Use a fixed port instead of a random one (so you can set up port forwarding)
-- Skip auto-opening the browser (since you'll open it manually on your local machine)
+- Use remote-friendly port/browser handling for forwarded environments
 - Print the URL to the terminal for you to access
 
 **Port forwarding in VS Code devcontainers:** The port should be automatically forwarded. Check the "Ports" tab.
@@ -104,12 +106,12 @@ Host your-server
 
 ## Slash Commands
 
-The plugin registers three slash commands:
+Plannotator's slash commands are installed as Claude Code skills in `~/.claude/skills` by the install script (the canonical source is `apps/skills/core/`). Claude Code skills are user-invocable by directory name, so these three work like slash commands inside your session:
 
 | Command | Description |
 |---------|-------------|
-| `/plannotator-review` | Open code review UI for uncommitted changes or a GitHub PR |
-| `/plannotator-annotate <file.md>` | Annotate any markdown file |
+| `/plannotator-review [--git \| --gitbutler]` | Open code review UI for current changes or a GitHub PR; optionally force the Git or GitButler provider |
+| `/plannotator-annotate <file.md \| file.html \| https://... \| folder/>` | Annotate a file, URL, or folder |
 | `/plannotator-last` | Annotate the agent's last message |
 
 ## Obsidian Integration

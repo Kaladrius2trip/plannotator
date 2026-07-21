@@ -11,6 +11,29 @@ import { getObsidianSettings, getEffectiveVaultPath } from '../utils/obsidian';
 import { getBearSettings } from '../utils/bear';
 import { getOctarineSettings } from '../utils/octarine';
 import { wrapFeedbackForAgent } from '../utils/parser';
+import { OverlayScrollArea } from './OverlayScrollArea';
+
+/** POST body shape sent to the notes endpoint (mirrors what the Notes tab builds today). */
+interface SaveToNotesPayload {
+  obsidian?: object;
+  bear?: object;
+  octarine?: object;
+}
+
+/** Parsed response from the notes endpoint. */
+interface SaveToNotesResult {
+  results?: Record<string, { success?: boolean; error?: string }>;
+}
+
+/** Default save-to-notes wire: today's literal POST to /api/save-notes. */
+async function defaultSaveToNotes(body: SaveToNotesPayload): Promise<SaveToNotesResult> {
+  const res = await fetch('/api/save-notes', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  return res.json();
+}
 
 interface ExportModalProps {
   isOpen: boolean;
@@ -24,7 +47,7 @@ interface ExportModalProps {
   /** Error from the last short URL generation attempt (empty string = no error) */
   shortUrlError?: string;
   /** Generate a short URL on demand (user clicks "Create short link") */
-  onGenerateShortUrl?: () => void;
+  onGenerateShortUrl?: () => void | Promise<unknown>;
   annotationsOutput: string;
   annotationCount: number;
   taterSprite?: React.ReactNode;
@@ -32,6 +55,8 @@ interface ExportModalProps {
   markdown?: string;
   isApiMode?: boolean;
   initialTab?: Tab;
+  /** Override the save-to-notes wire. Default: POST /api/save-notes (today's behavior). */
+  onSaveToNotes?: (payload: SaveToNotesPayload) => Promise<SaveToNotesResult>;
 }
 
 type Tab = 'share' | 'annotations' | 'notes';
@@ -55,6 +80,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({
   markdown,
   isApiMode = false,
   initialTab,
+  onSaveToNotes = defaultSaveToNotes,
 }) => {
   const defaultTab = initialTab || (sharingEnabled ? 'share' : 'annotations');
   const [activeTab, setActiveTab] = useState<Tab>(defaultTab);
@@ -104,6 +130,8 @@ export const ExportModal: React.FC<ExportModalProps> = ({
 
   // Whether the hash URL is large enough to warrant a short URL option
   const urlIsLarge = shareUrl.length > 2048;
+  // Hash-based sharing unavailable (e.g. HTML render mode) — show only short link
+  const hashUnavailable = !shareUrl && !!onGenerateShortUrl;
 
   const handleDownloadAnnotations = () => {
     const blob = new Blob([annotationsOutput], { type: 'text/plain' });
@@ -144,12 +172,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({
     }
 
     try {
-      const res = await fetch('/api/save-notes', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-      });
-      const data = await res.json();
+      const data = await onSaveToNotes(body);
       const result = data.results?.[target];
 
       if (result?.success) {
@@ -206,7 +229,8 @@ export const ExportModal: React.FC<ExportModalProps> = ({
         </div>
 
         {/* Body */}
-        <div className="flex-1 overflow-auto p-4">
+        <OverlayScrollArea className="flex-1 min-h-0">
+        <div className="p-4">
           {/* Tabs */}
           {showTabs && (
             <div className="flex gap-1 bg-muted rounded-lg p-1 mb-4">
@@ -295,11 +319,13 @@ export const ExportModal: React.FC<ExportModalProps> = ({
                   </svg>
                   Generating short link...
                 </div>
-              ) : urlIsLarge && onGenerateShortUrl ? (
+              ) : (urlIsLarge || hashUnavailable) && onGenerateShortUrl ? (
                 <div className="p-3 bg-amber-500/10 border border-amber-500/20 rounded-lg">
-                  <p className="text-xs text-amber-600 dark:text-amber-400 mb-2">
-                    This URL may be too long for some messaging apps.
-                  </p>
+                  {!hashUnavailable && (
+                    <p className="text-xs text-amber-600 dark:text-amber-400 mb-2">
+                      This URL may be too long for some messaging apps.
+                    </p>
+                  )}
                   <button
                     onClick={onGenerateShortUrl}
                     className="px-3 py-1.5 rounded-md text-xs font-medium bg-primary text-primary-foreground hover:opacity-90 transition-opacity"
@@ -312,8 +338,8 @@ export const ExportModal: React.FC<ExportModalProps> = ({
                 </div>
               ) : null}
 
-              {/* Full hash URL — always available */}
-              <div>
+              {/* Full hash URL — hidden when hash-based sharing is unavailable (HTML mode) */}
+              {!hashUnavailable && <div>
                 <label className="block text-xs font-medium text-muted-foreground mb-2">
                   {shortShareUrl ? 'Full URL (backup)' : 'Shareable URL'}
                 </label>
@@ -353,7 +379,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({
                     Your plan is encoded entirely in the URL — it never touches a server.
                   </p>
                 )}
-              </div>
+              </div>}
 
               <p className="text-xs text-muted-foreground">
                 Only someone with this exact link can view your plan. Short links are end-to-end encrypted — the decryption key is in the URL and never sent to the server.
@@ -514,6 +540,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({
             </pre>
           )}
         </div>
+        </OverlayScrollArea>
 
         {/* Footer actions - only show for Annotations tab */}
         {activeTab === 'annotations' && (

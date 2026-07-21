@@ -1,7 +1,7 @@
 /**
  * SidebarContainer — Shared sidebar shell
  *
- * Houses the Table of Contents, Version Browser, Vault Browser, and Archive Browser views.
+ * Houses the Table of Contents, Version Browser, File Browser, and Archive Browser views.
  * Tab bar at top switches between them.
  */
 
@@ -9,19 +9,25 @@ import React from "react";
 import type { SidebarTab } from "../../hooks/useSidebar";
 import type { Block, Annotation } from "../../types";
 import type { VersionInfo, VersionEntry } from "../../hooks/usePlanDiff";
-import type { UseVaultBrowserReturn } from "../../hooks/useVaultBrowser";
 import type { UseFileBrowserReturn } from "../../hooks/useFileBrowser";
 import { TableOfContents } from "../TableOfContents";
 import { VersionBrowser } from "./VersionBrowser";
-import { VaultBrowser } from "./VaultBrowser";
-import { FileBrowser } from "./FileBrowser";
+import { FileBrowser, type FileEditStatus } from "./FileBrowser";
 import { ArchiveBrowser, type ArchivedPlan } from "./ArchiveBrowser";
+import { MessagesBrowser, type PickerMessage } from "./MessagesBrowser";
+import { MessagesIcon } from "../icons/MessagesIcon";
+import { OverlayScrollArea } from "../OverlayScrollArea";
+import { ReviewAgentsIcon } from "../ReviewAgentsIcon";
 
 interface SidebarContainerProps {
   activeTab: SidebarTab;
   onTabChange: (tab: SidebarTab) => void;
   onClose: () => void;
-  width: number;
+  width: number | string;
+  showAgentTerminalButton?: boolean;
+  isAgentTerminalOpen?: boolean;
+  isAgentTerminalRunning?: boolean;
+  onToggleAgentTerminal?: () => void;
   // TOC props
   blocks: Block[];
   annotations: Annotation[];
@@ -29,18 +35,18 @@ interface SidebarContainerProps {
   onTocNavigate: (blockId: string) => void;
   linkedDocFilepath?: string | null;
   onLinkedDocBack?: () => void;
+  backLabel?: string;
   // File Browser props
   showFilesTab?: boolean;
+  fileAnnotationCounts?: Map<string, number>;
+  highlightedFiles?: Set<string>;
+  fileEditStatuses?: Map<string, FileEditStatus>;
   fileBrowser?: UseFileBrowserReturn;
   onFilesSelectFile?: (absolutePath: string, dirPath: string) => void;
   onFilesFetchAll?: () => void;
-  // Vault Browser props
-  showVaultTab?: boolean;
-  vaultPath?: string;
-  vaultBrowser?: UseVaultBrowserReturn;
-  onVaultSelectFile?: (relativePath: string) => void;
-  onVaultFetchTree?: () => void;
+  onFilesRetryVaultDir?: (vaultPath: string) => void;
   // Version Browser props
+  showVersionsTab?: boolean;
   versionInfo: VersionInfo | null;
   versions: VersionEntry[];
   selectedBaseVersion: number | null;
@@ -52,12 +58,19 @@ interface SidebarContainerProps {
   isSelectingVersion: boolean;
   fetchingVersion: number | null;
   onFetchVersions: () => void;
+  // Annotation indicators
+  hasFileAnnotations?: boolean;
   // Archive Browser props
   showArchiveTab?: boolean;
   archivePlans: ArchivedPlan[];
   selectedArchiveFile: string | null;
   onArchiveSelect: (filename: string) => void;
   isLoadingArchive: boolean;
+  showMessagesTab?: boolean;
+  messages?: PickerMessage[];
+  selectedMessageId?: string | null;
+  onSelectMessage?: (messageId: string) => void;
+  messageAnnotationCounts?: Map<string, number>;
 }
 
 export const SidebarContainer: React.FC<SidebarContainerProps> = ({
@@ -65,21 +78,26 @@ export const SidebarContainer: React.FC<SidebarContainerProps> = ({
   onTabChange,
   onClose,
   width,
+  showAgentTerminalButton,
+  isAgentTerminalOpen,
+  isAgentTerminalRunning,
+  onToggleAgentTerminal,
   blocks,
   annotations,
   activeSection,
   onTocNavigate,
   linkedDocFilepath,
   onLinkedDocBack,
+  backLabel,
   showFilesTab,
+  fileAnnotationCounts,
+  highlightedFiles,
+  fileEditStatuses,
   fileBrowser,
   onFilesSelectFile,
   onFilesFetchAll,
-  showVaultTab,
-  vaultPath,
-  vaultBrowser,
-  onVaultSelectFile,
-  onVaultFetchTree,
+  onFilesRetryVaultDir,
+  showVersionsTab,
   versionInfo,
   versions,
   selectedBaseVersion,
@@ -91,19 +109,34 @@ export const SidebarContainer: React.FC<SidebarContainerProps> = ({
   isSelectingVersion,
   fetchingVersion,
   onFetchVersions,
+  hasFileAnnotations,
   showArchiveTab,
   archivePlans,
   selectedArchiveFile,
   onArchiveSelect,
   isLoadingArchive,
+  showMessagesTab,
+  messages,
+  selectedMessageId,
+  onSelectMessage,
+  messageAnnotationCounts,
 }) => {
   return (
     <aside
-      className="hidden lg:flex flex-col sticky top-12 h-[calc(100vh-3rem)] flex-shrink-0 bg-card/50 backdrop-blur-sm border-r border-border"
+      className="hidden lg:flex flex-col sticky top-12 h-[calc(100vh-3rem)] flex-shrink-0 bg-card border-r border-border"
       style={{ width }}
     >
       {/* Tab bar */}
-      <div className="flex items-center border-b border-border/50 px-1 py-1 gap-0.5 flex-shrink-0 overflow-hidden min-w-0">
+      <div className="flex h-10 items-center border-b border-border/50 px-2 gap-0.5 flex-shrink-0 overflow-hidden min-w-0">
+        {showAgentTerminalButton && onToggleAgentTerminal && (
+          <ActionButton
+            active={!!isAgentTerminalOpen}
+            running={!!isAgentTerminalRunning}
+            onClick={onToggleAgentTerminal}
+            icon={<ReviewAgentsIcon className="w-3 h-3" />}
+            label="Agent"
+          />
+        )}
         <TabButton
           active={activeTab === "toc"}
           onClick={() => onTabChange("toc")}
@@ -124,26 +157,37 @@ export const SidebarContainer: React.FC<SidebarContainerProps> = ({
           }
           label="Contents"
         />
-        <TabButton
-          active={activeTab === "versions"}
-          onClick={() => onTabChange("versions")}
-          icon={
-            <svg
-              className="w-3 h-3"
-              fill="none"
-              viewBox="0 0 24 24"
-              stroke="currentColor"
-              strokeWidth={2}
-            >
-              <path
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"
-              />
-            </svg>
-          }
-          label="Versions"
-        />
+        {showVersionsTab && (
+          <TabButton
+            active={activeTab === "versions"}
+            onClick={() => onTabChange("versions")}
+            icon={
+              <svg
+                className="w-3 h-3"
+                fill="none"
+                viewBox="0 0 24 24"
+                stroke="currentColor"
+                strokeWidth={2}
+              >
+                <path
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"
+                />
+              </svg>
+            }
+            label="Versions"
+          />
+        )}
+        {showMessagesTab && (
+          <TabButton
+            active={activeTab === "messages"}
+            onClick={() => onTabChange("messages")}
+            icon={<MessagesIcon className="w-3 h-3" />}
+            label="Messages"
+            badge={messageAnnotationCounts !== undefined && messageAnnotationCounts.size > 0}
+          />
+        )}
         {showFilesTab && (
           <TabButton
             active={activeTab === "files"}
@@ -164,28 +208,7 @@ export const SidebarContainer: React.FC<SidebarContainerProps> = ({
               </svg>
             }
             label="Files"
-          />
-        )}
-        {showVaultTab && (
-          <TabButton
-            active={activeTab === "vault"}
-            onClick={() => onTabChange("vault")}
-            icon={
-              <svg
-                className="w-3 h-3"
-                fill="none"
-                viewBox="0 0 24 24"
-                stroke="currentColor"
-                strokeWidth={2}
-              >
-                <path
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                  d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z"
-                />
-              </svg>
-            }
-            label="Vault"
+            badge={hasFileAnnotations}
           />
         )}
         {showArchiveTab && (
@@ -210,39 +233,22 @@ export const SidebarContainer: React.FC<SidebarContainerProps> = ({
             label="Archive"
           />
         )}
-        <div className="flex-1 min-w-0" />
-        <button
-          onClick={onClose}
-          className="p-1 rounded text-muted-foreground hover:text-foreground hover:bg-muted transition-colors shrink-0"
-          title="Close sidebar"
-        >
-          <svg
-            className="w-3 h-3"
-            fill="none"
-            viewBox="0 0 24 24"
-            stroke="currentColor"
-            strokeWidth={2}
-          >
-            <path
-              strokeLinecap="round"
-              strokeLinejoin="round"
-              d="M15 19l-7-7 7-7"
-            />
-          </svg>
-        </button>
+        {/* No header close button — the sidebar collapses via the resize-handle
+            hover button (see ResizeHandle onCollapse). */}
       </div>
 
       {/* Content area */}
-      <div className="flex-1 overflow-y-auto">
+      <OverlayScrollArea className="flex-1 min-h-0">
         {activeTab === "toc" && (
           <TableOfContents
             blocks={blocks}
             annotations={annotations}
             activeId={activeSection}
             onNavigate={onTocNavigate}
-            className="overflow-y-auto"
+            className=""
             linkedDocFilepath={linkedDocFilepath}
             onLinkedDocBack={onLinkedDocBack}
+            backLabel={backLabel}
           />
         )}
         {activeTab === "versions" && (
@@ -270,19 +276,10 @@ export const SidebarContainer: React.FC<SidebarContainerProps> = ({
             onSelectFile={onFilesSelectFile ?? (() => {})}
             activeFile={fileBrowser.activeFile}
             onFetchAll={onFilesFetchAll ?? (() => {})}
-          />
-        )}
-        {activeTab === "vault" && showVaultTab && vaultPath && vaultBrowser && (
-          <VaultBrowser
-            vaultPath={vaultPath}
-            tree={vaultBrowser.tree}
-            isLoading={vaultBrowser.isLoading}
-            error={vaultBrowser.error}
-            expandedFolders={vaultBrowser.expandedFolders}
-            onToggleFolder={vaultBrowser.toggleFolder}
-            onSelectFile={onVaultSelectFile ?? (() => {})}
-            activeFile={vaultBrowser.activeFile}
-            onFetchTree={onVaultFetchTree ?? (() => {})}
+            onRetryVaultDir={onFilesRetryVaultDir}
+            annotationCounts={fileAnnotationCounts}
+            highlightedFiles={highlightedFiles}
+            editStatuses={fileEditStatuses}
           />
         )}
         {activeTab === "archive" && showArchiveTab && (
@@ -293,7 +290,15 @@ export const SidebarContainer: React.FC<SidebarContainerProps> = ({
             isLoading={isLoadingArchive}
           />
         )}
-      </div>
+        {activeTab === "messages" && showMessagesTab && messages && onSelectMessage && (
+          <MessagesBrowser
+            messages={messages}
+            selectedMessageId={selectedMessageId ?? null}
+            onSelect={onSelectMessage}
+            annotationCounts={messageAnnotationCounts}
+          />
+        )}
+      </OverlayScrollArea>
     </aside>
   );
 };
@@ -303,10 +308,11 @@ const TabButton: React.FC<{
   onClick: () => void;
   icon: React.ReactNode;
   label: string;
-}> = ({ active, onClick, icon, label }) => (
+  badge?: boolean;
+}> = ({ active, onClick, icon, label, badge }) => (
   <button
     onClick={onClick}
-    className={`flex items-center gap-1 px-2 py-1 rounded text-[10px] font-medium transition-colors min-w-0 shrink-0 ${
+    className={`relative flex items-center gap-1 px-2 py-1 rounded text-xs font-medium transition-colors min-w-0 shrink-0 ${
       active
         ? "bg-primary/10 text-primary"
         : "text-muted-foreground hover:text-foreground hover:bg-muted/50"
@@ -314,5 +320,34 @@ const TabButton: React.FC<{
   >
     {icon}
     {label}
+    {badge && (
+      <span className="absolute -top-0.5 -right-0.5 w-1.5 h-1.5 rounded-full bg-primary" />
+    )}
+</button>
+);
+
+const ActionButton: React.FC<{
+  active: boolean;
+  running?: boolean;
+  onClick: () => void;
+  icon: React.ReactNode;
+  label: string;
+}> = ({ active, running, onClick, icon, label }) => (
+  <button
+    type="button"
+    onClick={onClick}
+    aria-pressed={active}
+    title={running ? "Agent running" : label}
+    className={`relative flex items-center gap-1 px-2 py-1 rounded text-xs font-medium transition-colors min-w-0 shrink-0 ${
+      active || running
+        ? "bg-primary/10 text-primary"
+        : "text-muted-foreground hover:text-foreground hover:bg-muted/50"
+    }`}
+  >
+    {icon}
+    {label}
+    {running && (
+      <span className="absolute -top-0.5 -right-0.5 h-1.5 w-1.5 rounded-full bg-primary" />
+    )}
   </button>
 );

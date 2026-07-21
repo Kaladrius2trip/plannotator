@@ -1,17 +1,15 @@
 /**
  * Plannotator Pi Extension — File-based plan mode with visual browser review.
  *
- * Plans are written to PLAN.md on disk (git-trackable, editor-visible).
- * The agent calls plannotator_submit_plan to request approval; the user
- * reviews the plan in the Plannotator browser UI and can approve, deny
- * with annotations, or request changes.
+ * During planning the agent writes any markdown file anywhere inside cwd and
+ * calls plannotator_submit_plan with the path. The user reviews in the
+ * browser UI and can approve, deny with annotations, or request changes.
  *
  * Features:
  * - /plannotator command or Ctrl+Alt+P to toggle
  * - --plan flag to start in planning mode
- * - --plan-file flag to customize the plan file path
  * - Bash unrestricted during planning (prompt-guided)
- * - Write restricted to plan file only during planning
+ * - Writes restricted to markdown files inside cwd during planning
  * - plannotator_submit_plan tool with browser-based visual approval
  * - [DONE:n] markers for execution progress tracking
  * - /plannotator-review command for code review
@@ -19,114 +17,255 @@
  */
 
 import { existsSync, readFileSync, statSync } from "node:fs";
-import { dirname, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
-import type { AgentMessage } from "@mariozechner/pi-agent-core";
-import type { AssistantMessage, TextContent } from "@mariozechner/pi-ai";
-import { Type } from "@mariozechner/pi-ai";
+import { basename, resolve } from "node:path";
+import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
+import { Type } from "@earendil-works/pi-ai";
 import type {
 	ExtensionAPI,
 	ExtensionContext,
-} from "@mariozechner/pi-coding-agent";
-import { Key } from "@mariozechner/pi-tui";
+} from "@earendil-works/pi-coding-agent";
+import { Key } from "@earendil-works/pi-tui";
+import { buildPromptVariables, formatTodoList, loadPlannotatorConfig, renderTemplate, resolvePhaseProfile } from "./config.js";
 import {
 	type ChecklistItem,
 	markCompletedSteps,
 	parseChecklist,
 } from "./generated/checklist.js";
-import { planDenyFeedback } from "./generated/feedback-templates.js";
-import { hasMarkdownFiles } from "./generated/resolve-file.js";
-import { FILE_BROWSER_EXCLUDED } from "./generated/reference-common.js";
-import { openBrowser } from "./server/network.js";
+import { loadConfig, resolveUseJina } from "./generated/config.js";
+import { readImprovementHook } from "./generated/improvement-hooks.js";
+import { composeImproveContext } from "./generated/pfm-reminder.js";
 import {
-	type AnnotateServerResult,
-	getGitContext,
-	type PlanServerResult,
-	type ReviewServerResult,
-	runGitDiff,
-	startAnnotateServer,
-	startPlanReviewServer,
-	startReviewServer,
-} from "./server.js";
+	hasPlanBrowserHtml,
+	hasReviewBrowserHtml,
+	getStartupErrorMessage,
+	startCodeReviewBrowserSession,
+	startLastMessageAnnotationSession,
+	startMarkdownAnnotationSession,
+	openPlanReviewBrowser,
+	registerPlannotatorEventListeners,
+} from "./plannotator-events.js";
+import {
+	findAssistantMessageByEntryId,
+	getAssistantMessageText,
+	getLastAssistantMessageSnapshot,
+	getRecentAssistantMessages,
+	hasSessionMovedPastEntry,
+} from "./assistant-message.js";
+import {
+	getPiSessionIdentity,
+	isCurrentPiSessionDifferentFrom,
+	notifyCurrentPiSession,
+	type PiSessionIdentity,
+	registerCurrentPiSession,
+	sendUserMessageToCurrentPiSession,
+	withCurrentPiSessionFallbackHeader,
+} from "./current-pi-session.js";
 import {
 	getToolsForPhase,
+	isPlanWritePathAllowed,
 	PLAN_SUBMIT_TOOL,
 	type Phase,
 	stripPlanningOnlyTools,
 } from "./tool-scope.ts";
+import { isRemoteSession } from "./server/network.js";
 
 // ── Types ──────────────────────────────────────────────────────────────
 
-/** Common interface for servers that can wait for a user decision in a browser. */
-interface DecisionServer<T> {
-	url: string;
-	stop: () => void;
-	waitForDecision: () => Promise<T>;
+type PlannotatorPromptsModule = typeof import("./generated/prompts.js");
+
+let promptsModulePromise: Promise<PlannotatorPromptsModule> | undefined;
+
+function loadPlannotatorPrompts(): Promise<PlannotatorPromptsModule> {
+	if (!promptsModulePromise) {
+		promptsModulePromise = import("./generated/prompts.js").catch((error: unknown) => {
+			promptsModulePromise = undefined;
+			throw error;
+		});
+	}
+	return promptsModulePromise;
 }
 
-// Load HTML at runtime (jiti doesn't support import attributes)
-const __dirname = dirname(fileURLToPath(import.meta.url));
-let planHtmlContent = "";
-let reviewHtmlContent = "";
-try {
-	planHtmlContent = readFileSync(
-		resolve(__dirname, "plannotator.html"),
-		"utf-8",
-	);
-} catch {
-	// HTML not built yet — browser features will be unavailable
-}
-try {
-	reviewHtmlContent = readFileSync(
-		resolve(__dirname, "review-editor.html"),
-		"utf-8",
-	);
-} catch {
-	// HTML not built yet — review feature will be unavailable
-}
-
-function isAssistantMessage(m: AgentMessage): m is AssistantMessage {
-	return m.role === "assistant" && Array.isArray(m.content);
+async function loadAnnotateCommandModules() {
+	const [annotateArgs, atReference, resolveFile, referenceCommon] = await Promise.all([
+		import("./generated/annotate-args.js"),
+		import("./generated/at-reference.js"),
+		import("./generated/resolve-file.js"),
+		import("./generated/reference-common.js"),
+	]);
+	return {
+		parseAnnotateArgs: annotateArgs.parseAnnotateArgs,
+		resolveAtReference: atReference.resolveAtReference,
+		hasMarkdownFiles: resolveFile.hasMarkdownFiles,
+		resolveUserPath: resolveFile.resolveUserPath,
+		isAnnotatableTextPath: resolveFile.isAnnotatableTextPath,
+		ANNOTATABLE_DOC_REGEX: resolveFile.ANNOTATABLE_DOC_REGEX,
+		ANNOTATABLE_EXTENSIONS_HINT: resolveFile.ANNOTATABLE_EXTENSIONS_HINT,
+		MAX_ANNOTATABLE_FILE_BYTES: resolveFile.MAX_ANNOTATABLE_FILE_BYTES,
+		FILE_BROWSER_EXCLUDED: referenceCommon.FILE_BROWSER_EXCLUDED,
+	};
 }
 
-function getTextContent(message: AssistantMessage): string {
-	return message.content
-		.filter((block): block is TextContent => block.type === "text")
-		.map((block) => block.text)
-		.join("\n");
+
+type SavedPhaseState = {
+	activeTools: string[];
+	model?: { provider: string; id: string };
+	thinkingLevel: ThinkingLevel;
+};
+
+type PersistedPlannotatorState = {
+	phase: Phase;
+	lastSubmittedPath?: string;
+	savedState?: SavedPhaseState;
+};
+
+function getPlanReviewAvailabilityWarning(options: { hasUI: boolean; hasPlanHtml: boolean }): string | null {
+	const { hasUI, hasPlanHtml } = options;
+	if (hasUI && hasPlanHtml) return null;
+	if (!hasUI && !hasPlanHtml) {
+		return "Plannotator: interactive plan review is unavailable in this session (no UI support and missing built assets). Plans will auto-approve on exit_plan_mode.";
+	}
+	if (!hasUI) {
+		return "Plannotator: interactive plan review is unavailable in this session (no UI support). Plans will auto-approve on exit_plan_mode.";
+	}
+	return "Plannotator: interactive plan review assets are missing. Rebuild the extension to restore the browser UI. Plans will auto-approve on exit_plan_mode.";
+}
+
+function safeNotify(
+	ctx: ExtensionContext,
+	message: string,
+	type: "info" | "warning" | "error" = "info",
+	origin?: PiSessionIdentity,
+): void {
+	try {
+		ctx.ui.notify(message, type);
+	} catch (err) {
+		if (notifyCurrentPiSession(message, type, origin)) return;
+		console.error(`Plannotator notification failed: ${err instanceof Error ? err.message : String(err)}`);
+	}
 }
 
 /**
- * Open browser for user review, wait for decision, then stop server.
- * Handles remote session notification automatically.
+ * Foreground "session opened" notice. For a remote session the auto-opened
+ * browser is unreachable, so the URL must ride in THIS in-turn message — the
+ * after-turn notify inside openBrowserForServer fires too late to render.
  */
-async function runBrowserReview<T>(
-	server: DecisionServer<T>,
-	ctx: ExtensionContext,
-): Promise<T> {
-	const browserResult = openBrowser(server.url);
-	if (browserResult.isRemote) {
-		ctx.ui.notify(
-			`Remote session. Open manually: ${browserResult.url}`,
-			"info",
-		);
-	}
-
-	const result = await server.waitForDecision();
-	await new Promise((r) => setTimeout(r, 1500));
-	server.stop();
-	return result;
+function sessionOpenedMessage(label: string, url: string): string {
+	return isRemoteSession()
+		? `${label} — open ${url} on your local machine (forward the port if needed). You can keep chatting while it runs.`
+		: `${label}. You can keep chatting while it runs.`;
 }
 
-function getStartupErrorMessage(err: unknown): string {
-	return err instanceof Error ? err.message : "Unknown error";
+function reportBackgroundError(ctx: ExtensionContext, message: string, err: unknown, origin?: PiSessionIdentity): void {
+	const detail = getStartupErrorMessage(err);
+	console.error(`${message}: ${detail}`);
+	safeNotify(ctx, `${message}: ${detail}`, "error", origin);
+}
+
+function excerptText(text: string, maxChars = 1000): string {
+	const trimmed = text.trim();
+	if (trimmed.length <= maxChars) return trimmed;
+	return `${trimmed.slice(0, maxChars).trimEnd()}...`;
+}
+
+function blockquote(text: string): string {
+	return text
+		.split("\n")
+		.map((line) => `> ${line}`)
+		.join("\n");
+}
+
+function anchorMessageFeedback(feedback: string, originalMessage: string): string {
+	return `This feedback applies to the earlier assistant response excerpted below:
+
+${blockquote(excerptText(originalMessage))}
+
+User feedback:
+${feedback}`;
+}
+
+function shouldAnchorLastMessageFeedback(ctx: ExtensionContext, entryId: string, origin: PiSessionIdentity): boolean {
+	if (isCurrentPiSessionDifferentFrom(origin)) return true;
+	try {
+		return hasSessionMovedPastEntry(ctx, entryId);
+	} catch {
+		return true;
+	}
+}
+
+function reportCurrentSessionSendFailure(errorMessage: string, err: unknown, origin: PiSessionIdentity): void {
+	const detail = getStartupErrorMessage(err);
+	console.error(`${errorMessage}: ${detail}`);
+	notifyCurrentPiSession(`${errorMessage}: ${detail}`, "error", origin);
+}
+
+function trySendUserMessageToDifferentCurrentSession(
+	content: Parameters<ExtensionAPI["sendUserMessage"]>[0],
+	options: Parameters<ExtensionAPI["sendUserMessage"]>[1],
+	errorMessage: string,
+	origin: PiSessionIdentity,
+): boolean {
+	const result = sendUserMessageToCurrentPiSession(
+		withCurrentPiSessionFallbackHeader(content),
+		options,
+		origin,
+	);
+	if (result.ok) return true;
+	if (result.reason === "send-failed") {
+		reportCurrentSessionSendFailure(errorMessage, result.error, origin);
+		return true;
+	}
+	return false;
+}
+
+function sendUserMessageWithCurrentSessionFallback(
+	pi: ExtensionAPI,
+	content: Parameters<ExtensionAPI["sendUserMessage"]>[0],
+	options: Parameters<ExtensionAPI["sendUserMessage"]>[1],
+	errorMessage: string,
+	origin: PiSessionIdentity,
+): void {
+	if (trySendUserMessageToDifferentCurrentSession(content, options, errorMessage, origin)) return;
+
+	try {
+		pi.sendUserMessage(content, options);
+		return;
+	} catch (err) {
+		if (trySendUserMessageToDifferentCurrentSession(content, options, errorMessage, origin)) return;
+		throw err;
+	}
 }
 
 export default function plannotator(pi: ExtensionAPI): void {
+	const currentPiSession = registerCurrentPiSession(pi);
 	let phase: Phase = "idle";
-	let planFilePath = "PLAN.md";
+	void registerPlannotatorEventListeners(pi, {
+		handlePlanMode: async (mode, ctx) => {
+			if (mode === "status") return { phase };
+			if (mode === "enter") {
+				if (phase === "idle") await enterPlanning(ctx);
+				return { phase };
+			}
+			if (mode === "exit") {
+				if (phase !== "idle") await exitToIdle(ctx);
+				return { phase };
+			}
+			await togglePlanMode(ctx);
+			return { phase };
+		},
+	});
+	let lastSubmittedPath: string | null = null;
 	let checklistItems: ChecklistItem[] = [];
-	let preplanTools: string[] | null = null;
+	let savedState: SavedPhaseState | null = null;
+	let plannotatorConfig = {};
+	let justApprovedPlan = false;
+
+	pi.on("session_start", (_event, ctx) => {
+		currentPiSession.update(ctx);
+	});
+
+	pi.on("session_shutdown", () => {
+		currentPiSession.clear();
+	});
 
 	// ── Flags ────────────────────────────────────────────────────────────
 
@@ -136,27 +275,27 @@ export default function plannotator(pi: ExtensionAPI): void {
 		default: false,
 	});
 
-	pi.registerFlag("plan-file", {
-		description: "Plan file path (default: PLAN.md)",
-		type: "string",
-		default: "PLAN.md",
-	});
-
 	// ── Helpers ──────────────────────────────────────────────────────────
 
-	function resolvePlanPath(cwd: string): string {
-		return resolve(cwd, planFilePath);
+	function getPhaseProfile(): ReturnType<typeof resolvePhaseProfile> | undefined {
+		if (phase === "planning" || phase === "executing") {
+			return resolvePhaseProfile(plannotatorConfig, phase);
+		}
+		return undefined;
 	}
 
 	function updateStatus(ctx: ExtensionContext): void {
+		const profile = getPhaseProfile();
 		if (phase === "executing" && checklistItems.length > 0) {
 			const completed = checklistItems.filter((t) => t.completed).length;
 			ctx.ui.setStatus(
 				"plannotator",
 				ctx.ui.theme.fg("accent", `📋 ${completed}/${checklistItems.length}`),
 			);
-		} else if (phase === "planning") {
-			ctx.ui.setStatus("plannotator", ctx.ui.theme.fg("warning", "⏸ plan"));
+		} else if (phase === "planning" && profile?.statusLabel) {
+			ctx.ui.setStatus("plannotator", ctx.ui.theme.fg("warning", profile.statusLabel));
+		} else if (phase === "executing" && profile?.statusLabel) {
+			ctx.ui.setStatus("plannotator", ctx.ui.theme.fg("accent", profile.statusLabel));
 		} else {
 			ctx.ui.setStatus("plannotator", undefined);
 		}
@@ -179,160 +318,196 @@ export default function plannotator(pi: ExtensionAPI): void {
 		}
 	}
 
+	function captureSavedState(ctx: ExtensionContext): void {
+		savedState = {
+			activeTools: pi.getActiveTools(),
+			model: ctx.model ? { provider: ctx.model.provider, id: ctx.model.id } : undefined,
+			thinkingLevel: pi.getThinkingLevel(),
+		};
+	}
+
 	function persistState(): void {
-		pi.appendEntry("plannotator", { phase, planFilePath, preplanTools });
+
+
+		pi.appendEntry("plannotator", { phase, lastSubmittedPath, savedState });
 	}
 
-	/** Apply tool visibility for the current phase, preserving tools from other extensions. */
-	function applyToolsForPhase(): void {
-		const baseTools = stripPlanningOnlyTools(preplanTools ?? pi.getActiveTools());
-		pi.setActiveTools(getToolsForPhase(baseTools, phase));
+	async function applyModelRef(
+		ref: { provider: string; id: string },
+		ctx: ExtensionContext,
+		reason: string,
+	): Promise<void> {
+		const model = ctx.modelRegistry.find(ref.provider, ref.id);
+		if (!model) {
+			ctx.ui.notify(`Plannotator: ${reason} model ${ref.provider}/${ref.id} not found.`, "warning");
+			return;
+		}
+
+		const success = await pi.setModel(model);
+		if (!success) {
+			ctx.ui.notify(`Plannotator: no API key for ${ref.provider}/${ref.id}.`, "warning");
+		}
 	}
 
-	function enterPlanning(ctx: ExtensionContext): void {
-		phase = "planning";
-		checklistItems = [];
-		preplanTools = stripPlanningOnlyTools(pi.getActiveTools());
-		applyToolsForPhase();
+	async function restoreSavedState(ctx: ExtensionContext): Promise<void> {
+		if (!savedState) return;
+
+		pi.setActiveTools(savedState.activeTools);
+		if (savedState.model) {
+			await applyModelRef(savedState.model, ctx, "restore");
+		}
+		pi.setThinkingLevel(savedState.thinkingLevel);
+	}
+
+	async function applyPhaseConfig(ctx: ExtensionContext, opts: { restoreSavedState?: boolean } = {}): Promise<void> {
+		const profile = getPhaseProfile();
+		if (opts.restoreSavedState !== false && savedState) {
+			await restoreSavedState(ctx);
+		}
+
+		if (phase === "planning" || phase === "executing") {
+			const baseTools = stripPlanningOnlyTools(savedState?.activeTools ?? pi.getActiveTools());
+			const toolSet = new Set(baseTools);
+			for (const tool of profile?.activeTools ?? []) toolSet.add(tool);
+			if (phase === "planning") {
+				pi.setActiveTools(getToolsForPhase([...toolSet], phase));
+			} else {
+				pi.setActiveTools([...toolSet]);
+			}
+		}
+
+		if (profile?.model) {
+			await applyModelRef(profile.model, ctx, phase);
+		}
+
+		if (profile?.thinking) {
+			pi.setThinkingLevel(profile.thinking);
+		}
+
 		updateStatus(ctx);
 		updateWidget(ctx);
-		persistState();
-		ctx.ui.notify(
-			`Plannotator: planning mode enabled. Write your plan to ${planFilePath}.`,
-		);
 	}
 
-	function exitToIdle(ctx: ExtensionContext): void {
+	async function enterPlanning(ctx: ExtensionContext): Promise<void> {
+		phase = "planning";
+		checklistItems = [];
+		captureSavedState(ctx);
+		await applyPhaseConfig(ctx, { restoreSavedState: false });
+		persistState();
+		ctx.ui.notify(
+			"Plannotator: planning mode enabled.",
+		);
+		const warning = getPlanReviewAvailabilityWarning({ hasUI: ctx.hasUI, hasPlanHtml: hasPlanBrowserHtml() });
+		if (warning) {
+			ctx.ui.notify(warning, "warning");
+		}
+	}
+
+	async function exitToIdle(ctx: ExtensionContext): Promise<void> {
 		phase = "idle";
 		checklistItems = [];
-		applyToolsForPhase();
-		preplanTools = null;
+		lastSubmittedPath = null;
+
+		await restoreSavedState(ctx);
+		savedState = null;
 		updateStatus(ctx);
 		updateWidget(ctx);
 		persistState();
 		ctx.ui.notify("Plannotator: disabled. Full access restored.");
 	}
 
-	function togglePlanMode(ctx: ExtensionContext): void {
+	async function togglePlanMode(ctx: ExtensionContext): Promise<void> {
 		if (phase === "idle") {
-			enterPlanning(ctx);
+			await enterPlanning(ctx);
 		} else {
-			exitToIdle(ctx);
+			await exitToIdle(ctx);
 		}
 	}
 
 	// ── Commands & Shortcuts ─────────────────────────────────────────────
 
 	pi.registerCommand("plannotator", {
-		description: "Toggle plannotator (file-based plan mode)",
-		handler: async (args, ctx) => {
-			if (phase !== "idle") {
-				exitToIdle(ctx);
-				return;
-			}
-
-			// Accept path as argument: /plannotator plans/auth.md
-			let targetPath = args?.trim() || undefined;
-
-			// No arg — prompt for file path interactively
-			if (!targetPath && ctx.hasUI) {
-				targetPath = await ctx.ui.input("Plan file path", planFilePath);
-				if (targetPath === undefined) return; // cancelled
-			}
-
-			if (targetPath) planFilePath = targetPath;
-			enterPlanning(ctx);
-		},
-	});
-
-	pi.registerCommand("plannotator-status", {
-		description: "Show plannotator status",
+		description: "Toggle plannotator planning mode",
 		handler: async (_args, ctx) => {
-			const parts = [`Phase: ${phase}`, `Plan file: ${planFilePath}`];
-			if (checklistItems.length > 0) {
-				const done = checklistItems.filter((t) => t.completed).length;
-				parts.push(`Progress: ${done}/${checklistItems.length}`);
-			}
-			ctx.ui.notify(parts.join("\n"), "info");
-		},
-	});
-
-	pi.registerCommand("plannotator-set-file", {
-		description: "Change the plan file path",
-		handler: async (args, ctx) => {
-			let targetPath = args?.trim() || undefined;
-
-			if (!targetPath && ctx.hasUI) {
-				targetPath = await ctx.ui.input("Plan file path", planFilePath);
-				if (targetPath === undefined) return; // cancelled
-			}
-
-			if (!targetPath) {
-				ctx.ui.notify(`Current plan file: ${planFilePath}`, "info");
-				return;
-			}
-
-			planFilePath = targetPath;
-			persistState();
-			ctx.ui.notify(`Plan file changed to: ${planFilePath}`);
+			await togglePlanMode(ctx);
 		},
 	});
 
 	pi.registerCommand("plannotator-review", {
-		description: "Open interactive code review for current changes",
-		handler: async (_args, ctx) => {
-			if (!reviewHtmlContent) {
+		description: "Open interactive code review for current changes or a PR URL; pass --git or --gitbutler to force that provider",
+		handler: async (args, ctx) => {
+			if (!hasReviewBrowserHtml()) {
 				ctx.ui.notify(
-					"Review UI not available. Run 'bun run build' in the pi-extension directory.",
+					"Code review UI not available. Run 'bun run build' in the pi-extension directory.",
 					"error",
 				);
 				return;
 			}
 
-			ctx.ui.notify("Opening code review UI...", "info");
+			currentPiSession.update(ctx);
+			const origin = getPiSessionIdentity(ctx);
 
-			let server: ReviewServerResult;
 			try {
-				const gitCtx = await getGitContext();
-				const {
-					patch: rawPatch,
-					label: gitRef,
-					error,
-				} = await runGitDiff("uncommitted", gitCtx.defaultBranch);
-
-				server = await startReviewServer({
-					rawPatch,
-					gitRef,
-					error,
-					origin: "pi",
-					diffType: "uncommitted",
-					gitContext: gitCtx,
-					htmlContent: reviewHtmlContent,
-					sharingEnabled: process.env.PLANNOTATOR_SHARE !== "disabled",
-					shareBaseUrl: process.env.PLANNOTATOR_SHARE_URL || undefined,
+				const { parseReviewArgs } = await import("./generated/review-args.js");
+				const reviewArgs = parseReviewArgs(args ?? "");
+				const session = await startCodeReviewBrowserSession(ctx, {
+					prUrl: reviewArgs.prUrl,
+					vcsType: reviewArgs.vcsType,
+					useLocal: reviewArgs.useLocal,
 				});
+				ctx.ui.notify(sessionOpenedMessage("Code review opened", session.url), "info");
+				void session
+					.waitForDecision()
+					.then(async (result) => {
+						try {
+							if (result.exit) {
+								safeNotify(ctx, "Code review session closed.", "info", origin);
+								return;
+							}
+							if (result.approved) {
+								const { getReviewApprovedPrompt } = await loadPlannotatorPrompts();
+								sendUserMessageWithCurrentSessionFallback(
+									pi,
+									getReviewApprovedPrompt("pi", loadConfig()),
+									{ deliverAs: "followUp" },
+									"Plannotator code review feedback could not be sent",
+									origin,
+								);
+								return;
+							}
+							if (!result.feedback) {
+								safeNotify(ctx, "Code review closed (no feedback).", "info", origin);
+								return;
+							}
+							// Append the verification-only suffix when the reviewer sent
+							// annotations to act on (PR mode included). Platform PR actions
+							// (approve/comment posted to the host) come back with an empty
+							// annotation set and a status message — don't tell the agent to
+							// "address" a platform action.
+							let reviewFeedback = result.feedback;
+							if ((result.annotations?.length ?? 0) > 0) {
+								const { getReviewDeniedSuffix } = await loadPlannotatorPrompts();
+								reviewFeedback += getReviewDeniedSuffix("pi", loadConfig());
+							}
+							sendUserMessageWithCurrentSessionFallback(
+								pi,
+								reviewFeedback,
+								{ deliverAs: "followUp" },
+								"Plannotator code review feedback could not be sent",
+								origin,
+							);
+						} catch (err) {
+							reportBackgroundError(ctx, "Plannotator code review feedback could not be sent", err, origin);
+						}
+					})
+					.catch((err) => {
+						reportBackgroundError(ctx, "Plannotator code review session failed", err, origin);
+					});
 			} catch (err) {
 				ctx.ui.notify(
 					`Failed to start code review UI: ${getStartupErrorMessage(err)}`,
 					"error",
 				);
-				return;
-			}
-
-			const result = await runBrowserReview(server, ctx);
-
-			if (result.feedback) {
-				if (result.approved) {
-					pi.sendUserMessage(
-						`# Code Review\n\nCode review completed — no changes requested.`,
-					);
-				} else {
-					pi.sendUserMessage(
-						`${result.feedback}\n\nPlease address this feedback.`,
-					);
-				}
-			} else {
-				ctx.ui.notify("Code review closed (no feedback).", "info");
 			}
 		},
 	});
@@ -340,12 +515,27 @@ export default function plannotator(pi: ExtensionAPI): void {
 	pi.registerCommand("plannotator-annotate", {
 		description: "Open markdown file or folder in annotation UI",
 		handler: async (args, ctx) => {
-			const filePath = args?.trim();
+			const {
+				FILE_BROWSER_EXCLUDED,
+				hasMarkdownFiles,
+				parseAnnotateArgs,
+				resolveAtReference,
+				resolveUserPath,
+				isAnnotatableTextPath,
+				ANNOTATABLE_DOC_REGEX,
+				ANNOTATABLE_EXTENSIONS_HINT,
+				MAX_ANNOTATABLE_FILE_BYTES,
+			} = await loadAnnotateCommandModules();
+			// Split known annotate flags from the path. --json is silently
+			// accepted (Pi writes back via sendUserMessage, not stdout).
+			// `rawFilePath` keeps any leading `@` for the literal-@ fallback
+			// (scoped-package-style names).
+			const { filePath, rawFilePath, gate, renderMarkdown: renderMarkdownFlag, noJina } = parseAnnotateArgs(args ?? "");
 			if (!filePath) {
-				ctx.ui.notify("Usage: /plannotator-annotate <file.md | folder/>", "error");
+				ctx.ui.notify("Usage: /plannotator-annotate <file.md | file.txt | file.html | https://... | folder/> [--markdown] [--no-jina] [--gate] [--json]", "error");
 				return;
 			}
-			if (!planHtmlContent) {
+			if (!hasPlanBrowserHtml()) {
 				ctx.ui.notify(
 					"Annotation UI not available. Run 'bun run build' in the pi-extension directory.",
 					"error",
@@ -353,79 +543,161 @@ export default function plannotator(pi: ExtensionAPI): void {
 				return;
 			}
 
-			const absolutePath = resolve(ctx.cwd, filePath);
-			if (!existsSync(absolutePath)) {
-				ctx.ui.notify(`File not found: ${absolutePath}`, "error");
-				return;
-			}
-
-			// Check if the argument is a directory (folder annotation mode)
-			let isFolder = false;
-			try {
-				isFolder = statSync(absolutePath).isDirectory();
-			} catch {
-				ctx.ui.notify(`Cannot access: ${absolutePath}`, "error");
-				return;
-			}
-
 			let markdown: string;
+			let rawHtml: string | undefined;
+			let absolutePath: string;
 			let folderPath: string | undefined;
-			let mode: string | undefined;
+			let mode: "annotate" | "annotate-folder" | undefined;
+			let sourceInfo: string | undefined;
+			let sourceConverted = false;
+			let isFolder = false;
 
-			if (isFolder) {
-				if (!hasMarkdownFiles(absolutePath, FILE_BROWSER_EXCLUDED)) {
-					ctx.ui.notify(`No markdown files found in ${absolutePath}`, "error");
+			// --- URL annotation ---
+			const isUrl = /^https?:\/\//i.test(filePath);
+
+			if (isUrl) {
+				const useJina = resolveUseJina(noJina, loadConfig());
+				ctx.ui.notify(`Fetching: ${filePath}${useJina ? " (via Jina Reader)" : " (via fetch+Turndown)"}...`, "info");
+				try {
+					const { isConvertedSource, urlToMarkdown } = await import("./generated/url-to-markdown.js");
+					const result = await urlToMarkdown(filePath, { useJina });
+					markdown = result.markdown;
+					sourceConverted = isConvertedSource(result.source);
+				} catch (err) {
+					ctx.ui.notify(`Failed to fetch URL: ${err instanceof Error ? err.message : String(err)}`, "error");
 					return;
 				}
-				markdown = "";
-				folderPath = absolutePath;
-				mode = "annotate-folder";
-				ctx.ui.notify(`Opening annotation UI for folder ${filePath}...`, "info");
+				absolutePath = filePath;
+				sourceInfo = filePath;
 			} else {
-				markdown = readFileSync(absolutePath, "utf-8");
-				ctx.ui.notify(`Opening annotation UI for ${filePath}...`, "info");
+				// Pick the interpretation of the user input that actually exists:
+				// stripped form first (reference-mode primary), literal as fallback
+				// for scoped-package-style names. Falls back to the stripped form
+				// for the error message if neither exists.
+				const resolvedCandidate = resolveAtReference(rawFilePath, (c) => {
+					const abs = resolveUserPath(c, ctx.cwd);
+					return existsSync(abs);
+				});
+				if (resolvedCandidate === null) {
+					absolutePath = resolveUserPath(filePath, ctx.cwd);
+					ctx.ui.notify(`File not found: ${absolutePath}`, "error");
+					return;
+				}
+				absolutePath = resolveUserPath(resolvedCandidate, ctx.cwd);
+
+				try {
+					isFolder = statSync(absolutePath).isDirectory();
+				} catch {
+					ctx.ui.notify(`Cannot access: ${absolutePath}`, "error");
+					return;
+				}
+
+				if (isFolder) {
+					if (!hasMarkdownFiles(absolutePath, FILE_BROWSER_EXCLUDED, ANNOTATABLE_DOC_REGEX)) {
+						ctx.ui.notify(`No annotatable files (markdown, plain-text, config, or HTML) found in ${absolutePath}`, "error");
+						return;
+					}
+					markdown = "";
+					folderPath = absolutePath;
+					mode = "annotate-folder";
+					ctx.ui.notify(`Opening annotation UI for folder ${filePath}...`, "info");
+				} else if (/\.html?$/i.test(absolutePath)) {
+					const html = readFileSync(absolutePath, "utf-8");
+					const renderHtmlForFile = !renderMarkdownFlag;
+					if (renderHtmlForFile) {
+						rawHtml = html;
+						markdown = "";
+					} else {
+						const { htmlToMarkdown } = await import("./generated/html-to-markdown.js");
+						markdown = htmlToMarkdown(html);
+						sourceConverted = true;
+					}
+					sourceInfo = basename(absolutePath);
+					ctx.ui.notify(`Opening annotation UI for ${filePath}...`, "info");
+				} else {
+					if (!isAnnotatableTextPath(absolutePath)) {
+						ctx.ui.notify(`File type not supported. Supported types: ${ANNOTATABLE_EXTENSIONS_HINT}`, "error");
+						return;
+					}
+					if (statSync(absolutePath).size > MAX_ANNOTATABLE_FILE_BYTES) {
+						ctx.ui.notify(`File too large to annotate (max 2MB): ${absolutePath}`, "error");
+						return;
+					}
+					markdown = readFileSync(absolutePath, "utf-8");
+					ctx.ui.notify(`Opening annotation UI for ${filePath}...`, "info");
+				}
 			}
 
-			let server: AnnotateServerResult;
+			currentPiSession.update(ctx);
+			const origin = getPiSessionIdentity(ctx);
+
 			try {
-				server = await startAnnotateServer({
+				const session = await startMarkdownAnnotationSession(
+					ctx,
+					absolutePath,
 					markdown,
-					filePath: absolutePath,
-					origin: "pi",
-					mode,
+					mode ?? "annotate",
 					folderPath,
-					htmlContent: planHtmlContent,
-					sharingEnabled: process.env.PLANNOTATOR_SHARE !== "disabled",
-					shareBaseUrl: process.env.PLANNOTATOR_SHARE_URL || undefined,
-					pasteApiUrl: process.env.PLANNOTATOR_PASTE_URL || undefined,
-				});
+					sourceInfo,
+					sourceConverted,
+					gate,
+					rawHtml,
+					!!rawHtml,
+					renderMarkdownFlag,
+				);
+				ctx.ui.notify(sessionOpenedMessage("Annotation opened", session.url), "info");
+				void session
+					.waitForDecision()
+					.then(async (result) => {
+						try {
+							if (result.exit) {
+								safeNotify(ctx, "Annotation session closed.", "info", origin);
+								return;
+							}
+							if (result.approved) {
+								safeNotify(ctx, "Annotation approved.", "info", origin);
+								return;
+							}
+							if (!result.feedback) {
+								safeNotify(ctx, "Annotation closed (no feedback).", "info", origin);
+								return;
+							}
+							const { getAnnotateFileFeedbackPrompt } = await loadPlannotatorPrompts();
+							sendUserMessageWithCurrentSessionFallback(
+								pi,
+								getAnnotateFileFeedbackPrompt("pi", loadConfig(), {
+									fileHeader: isFolder ? "Folder" : "File",
+									filePath: absolutePath,
+									feedback: result.feedback,
+								}),
+								{ deliverAs: "followUp" },
+								"Plannotator annotation feedback could not be sent",
+								origin,
+							);
+						} catch (err) {
+							reportBackgroundError(ctx, "Plannotator annotation feedback could not be sent", err, origin);
+						}
+					})
+					.catch((err) => {
+						reportBackgroundError(ctx, "Plannotator annotation session failed", err, origin);
+					});
 			} catch (err) {
 				ctx.ui.notify(
 					`Failed to start annotation UI: ${getStartupErrorMessage(err)}`,
 					"error",
 				);
-				return;
-			}
-
-			const result = await runBrowserReview(server, ctx);
-
-			if (result.feedback) {
-				const header = isFolder
-					? `# Markdown Annotations\n\nFolder: ${absolutePath}\n\n`
-					: `# Markdown Annotations\n\nFile: ${absolutePath}\n\n`;
-				pi.sendUserMessage(
-					`${header}${result.feedback}\n\nPlease address the annotation feedback above.`,
-				);
-			} else {
-				ctx.ui.notify("Annotation closed (no feedback).", "info");
 			}
 		},
 	});
 
 	pi.registerCommand("plannotator-last", {
 		description: "Annotate the last assistant message",
-		handler: async (_args, ctx) => {
-			if (!planHtmlContent) {
+		handler: async (args, ctx) => {
+			// Support --gate on /plannotator-last for the Stop-hook review gate.
+			const { parseAnnotateArgs } = await import("./generated/annotate-args.js");
+			const { gate } = parseAnnotateArgs(args ?? "");
+
+			if (!hasPlanBrowserHtml()) {
 				ctx.ui.notify(
 					"Annotation UI not available. Run 'bun run build' in the pi-extension directory.",
 					"error",
@@ -433,114 +705,78 @@ export default function plannotator(pi: ExtensionAPI): void {
 				return;
 			}
 
-			const entries = ctx.sessionManager.getEntries();
-			let lastText: string | null = null;
-			for (let i = entries.length - 1; i >= 0; i--) {
-				const entry = entries[i] as { type: string; message?: AgentMessage };
-				if (
-					entry.type === "message" &&
-					entry.message &&
-					isAssistantMessage(entry.message)
-				) {
-					const text = getTextContent(entry.message);
-					if (text.trim()) {
-						lastText = text;
-						break;
-					}
-				}
-			}
+			currentPiSession.update(ctx);
+			const origin = getPiSessionIdentity(ctx);
 
-			if (!lastText) {
+			const snapshot = getLastAssistantMessageSnapshot(ctx);
+			if (!snapshot) {
 				ctx.ui.notify("No assistant message found in session.", "error");
 				return;
 			}
 
+			const recent = getRecentAssistantMessages(ctx, 25);
+			const pickerMessages = recent.length > 1 ? recent : undefined;
+
 			ctx.ui.notify("Opening annotation UI for last message...", "info");
 
-			let server: AnnotateServerResult;
 			try {
-				server = await startAnnotateServer({
-					markdown: lastText,
-					filePath: "last-message",
-					origin: "pi",
-					mode: "annotate-last",
-					htmlContent: planHtmlContent,
-					sharingEnabled: process.env.PLANNOTATOR_SHARE !== "disabled",
-					shareBaseUrl: process.env.PLANNOTATOR_SHARE_URL || undefined,
-					pasteApiUrl: process.env.PLANNOTATOR_PASTE_URL || undefined,
-				});
+				const session = await startLastMessageAnnotationSession(ctx, snapshot.text, gate, pickerMessages);
+				ctx.ui.notify(sessionOpenedMessage("Last-message annotation opened", session.url), "info");
+				void session
+					.waitForDecision()
+					.then(async (result) => {
+						try {
+							if (result.exit) {
+								safeNotify(ctx, "Annotation session closed.", "info", origin);
+								return;
+							}
+							if (result.approved) {
+								safeNotify(ctx, "Message approved.", "info", origin);
+								return;
+							}
+							if (!result.feedback) {
+								safeNotify(ctx, "Annotation closed (no feedback).", "info", origin);
+								return;
+							}
+							// Picker may have changed which message the feedback targets; if so,
+							// look that one up in the current branch so the anchor quote matches.
+							const target = result.selectedMessageId && result.selectedMessageId !== snapshot.entryId
+								? findAssistantMessageByEntryId(ctx, result.selectedMessageId) ?? snapshot
+								: snapshot;
+							const feedback = result.feedbackScope !== "messages" && shouldAnchorLastMessageFeedback(ctx, target.entryId, origin)
+									? anchorMessageFeedback(result.feedback, target.text)
+									: result.feedback;
+							const { getAnnotateMessageFeedbackPrompt } = await loadPlannotatorPrompts();
+							sendUserMessageWithCurrentSessionFallback(
+								pi,
+								getAnnotateMessageFeedbackPrompt("pi", loadConfig(), {
+									feedback,
+								}),
+								{ deliverAs: "followUp" },
+								"Plannotator message annotation feedback could not be sent",
+								origin,
+							);
+						} catch (err) {
+							reportBackgroundError(ctx, "Plannotator message annotation feedback could not be sent", err, origin);
+						}
+					})
+					.catch((err) => {
+						reportBackgroundError(ctx, "Plannotator message annotation session failed", err, origin);
+					});
 			} catch (err) {
 				ctx.ui.notify(
 					`Failed to start annotation UI: ${getStartupErrorMessage(err)}`,
 					"error",
 				);
-				return;
 			}
-
-			const result = await runBrowserReview(server, ctx);
-
-			if (result.feedback) {
-				pi.sendUserMessage(
-					`# Message Annotations\n\n${result.feedback}\n\nPlease address the annotation feedback above.`,
-				);
-			} else {
-				ctx.ui.notify("Annotation closed (no feedback).", "info");
-			}
-		},
-	});
-
-	pi.registerCommand("plannotator-archive", {
-		description: "Browse saved plan decisions",
-		handler: async (_args, ctx) => {
-			if (!planHtmlContent) {
-				ctx.ui.notify(
-					"Archive UI not available. Run 'bun run build' in the pi-extension directory.",
-					"error",
-				);
-				return;
-			}
-
-			ctx.ui.notify("Opening plan archive...", "info");
-
-			let server: PlanServerResult;
-			try {
-				server = await startPlanReviewServer({
-					plan: "",
-					htmlContent: planHtmlContent,
-					origin: "pi",
-					mode: "archive",
-					sharingEnabled: process.env.PLANNOTATOR_SHARE !== "disabled",
-					shareBaseUrl: process.env.PLANNOTATOR_SHARE_URL || undefined,
-					pasteApiUrl: process.env.PLANNOTATOR_PASTE_URL || undefined,
-				});
-			} catch (err) {
-				ctx.ui.notify(
-					`Failed to start archive: ${getStartupErrorMessage(err)}`,
-					"error",
-				);
-				return;
-			}
-
-			const browserResult = openBrowser(server.url);
-			if (browserResult.isRemote) {
-				ctx.ui.notify(
-					`Remote session. Open manually: ${browserResult.url}`,
-					"info",
-				);
-			}
-
-			if (server.waitForDone) {
-				await server.waitForDone();
-			}
-			await new Promise((r) => setTimeout(r, 1500));
-			server.stop();
-			ctx.ui.notify("Archive browser closed.", "info");
 		},
 	});
 
 	pi.registerShortcut(Key.ctrlAlt("p"), {
 		description: "Toggle plannotator",
-		handler: async (ctx) => togglePlanMode(ctx),
+		handler: async (ctx) => {
+			await togglePlanMode(ctx);
+		},
 	});
 
 	// ── plannotator_submit_plan Tool ────────────────────────────────────
@@ -550,18 +786,18 @@ export default function plannotator(pi: ExtensionAPI): void {
 		label: "Submit Plan",
 		description:
 			"Submit your Plannotator plan for user review. " +
-			"Call this only while Plannotator planning mode is active, after drafting or revising your plan file. " +
+			"Call this only while Plannotator planning mode is active, after writing your plan as a markdown file anywhere inside the working directory. " +
+			"Pass the path to the plan file (e.g. PLAN.md or plans/auth.md). " +
 			"The user will review the plan in a visual browser UI and can approve, deny with feedback, or annotate it. " +
-			"If denied, use the edit tool to make targeted revisions (not write), then call this again.",
+			"If denied, edit the same file in place, then call this again with the same path.",
 		parameters: Type.Object({
-			summary: Type.Optional(
-				Type.String({
-					description: "Brief summary of the plan for the user's review",
-				}),
-			),
-		}),
+			filePath: Type.String({
+				description:
+					"Path to the markdown plan file, relative to the working directory. Must end in .md or .mdx and resolve inside cwd.",
+			}),
+		}) as any,
 
-		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			// Guard: must be in planning phase
 			if (phase !== "planning") {
 				return {
@@ -575,17 +811,66 @@ export default function plannotator(pi: ExtensionAPI): void {
 				};
 			}
 
-			// Read plan file
-			const fullPath = resolvePlanPath(ctx.cwd);
-			let planContent: string;
+			const inputPath = (params as { filePath?: string })?.filePath?.trim();
+			if (!inputPath) {
+				return {
+					content: [
+						{
+							type: "text",
+							text: `Error: ${PLAN_SUBMIT_TOOL} requires a filePath argument pointing to your markdown plan file (e.g. "PLAN.md" or "plans/auth.md").`,
+						},
+					],
+					details: { approved: false },
+				};
+			}
+
+			if (!isPlanWritePathAllowed(inputPath, ctx.cwd)) {
+				return {
+					content: [
+						{
+							type: "text",
+							text: `Error: plan file must be a markdown file (.md or .mdx) inside the working directory. Rejected: ${inputPath}`,
+						},
+					],
+					details: { approved: false },
+				};
+			}
+
+			const fullPath = resolve(ctx.cwd, inputPath);
+
 			try {
-				planContent = readFileSync(fullPath, "utf-8");
+				if (!statSync(fullPath).isFile()) {
+					return {
+						content: [
+							{
+								type: "text",
+								text: `Error: ${inputPath} is not a regular file. Write your plan to a markdown file first, then call ${PLAN_SUBMIT_TOOL} with its path.`,
+							},
+						],
+						details: { approved: false },
+					};
+				}
 			} catch {
 				return {
 					content: [
 						{
 							type: "text",
-							text: `Error: ${planFilePath} does not exist. Write your plan using the write tool first, then call ${PLAN_SUBMIT_TOOL} again.`,
+							text: `Error: ${inputPath} does not exist. Write your plan using the write tool first, then call ${PLAN_SUBMIT_TOOL} again.`,
+						},
+					],
+					details: { approved: false },
+				};
+			}
+
+			let planContent: string;
+			try {
+				planContent = readFileSync(fullPath, "utf-8");
+			} catch (err) {
+				return {
+					content: [
+						{
+							type: "text",
+							text: `Error: failed to read ${inputPath}: ${err instanceof Error ? err.message : String(err)}`,
 						},
 					],
 					details: { approved: false },
@@ -597,44 +882,39 @@ export default function plannotator(pi: ExtensionAPI): void {
 					content: [
 						{
 							type: "text",
-							text: `Error: ${planFilePath} is empty. Write your plan first, then call ${PLAN_SUBMIT_TOOL} again.`,
+							text: `Error: ${inputPath} is empty. Write your plan first, then call ${PLAN_SUBMIT_TOOL} again.`,
 						},
 					],
 					details: { approved: false },
 				};
 			}
 
-			// Parse checklist items
+			lastSubmittedPath = inputPath;
 			checklistItems = parseChecklist(planContent);
 
 			// Non-interactive or no HTML: auto-approve
-			if (!ctx.hasUI || !planHtmlContent) {
+			if (!ctx.hasUI || !hasPlanBrowserHtml()) {
 				phase = "executing";
-				applyToolsForPhase();
-				preplanTools = null;
+				await applyPhaseConfig(ctx, { restoreSavedState: true });
+				pi.appendEntry("plannotator-execute", { lastSubmittedPath });
 				persistState();
+				justApprovedPlan = true;
+				const { getPlanAutoApprovedPrompt } = await loadPlannotatorPrompts();
 				return {
 					content: [
 						{
 							type: "text",
-							text: "Plan auto-approved (non-interactive mode). Execute the plan now.",
+							text: getPlanAutoApprovedPrompt("pi", loadConfig()),
 						},
 					],
 					details: { approved: true },
+					terminate: true,
 				};
 			}
 
-			// Start browser-based plan review server
-			let server: PlanServerResult;
+			let result: Awaited<ReturnType<typeof openPlanReviewBrowser>>;
 			try {
-				server = await startPlanReviewServer({
-					plan: planContent,
-					htmlContent: planHtmlContent,
-					origin: "pi",
-					sharingEnabled: process.env.PLANNOTATOR_SHARE !== "disabled",
-					shareBaseUrl: process.env.PLANNOTATOR_SHARE_URL || undefined,
-					pasteApiUrl: process.env.PLANNOTATOR_PASTE_URL || undefined,
-				});
+				result = await openPlanReviewBrowser(ctx, planContent);
 			} catch (err) {
 				const message = `Failed to start plan review UI: ${getStartupErrorMessage(err)}`;
 				ctx.ui.notify(message, "error");
@@ -644,17 +924,12 @@ export default function plannotator(pi: ExtensionAPI): void {
 				};
 			}
 
-			const result = await runBrowserReview(server, ctx);
-
 			if (result.approved) {
 				phase = "executing";
-				applyToolsForPhase();
-				preplanTools = null;
-				updateStatus(ctx);
-				updateWidget(ctx);
+				await applyPhaseConfig(ctx, { restoreSavedState: true });
+				pi.appendEntry("plannotator-execute", { lastSubmittedPath });
 				persistState();
-
-				pi.appendEntry("plannotator-execute", { planFilePath });
+				justApprovedPlan = true;
 
 				const doneMsg =
 					checklistItems.length > 0
@@ -662,36 +937,51 @@ export default function plannotator(pi: ExtensionAPI): void {
 						: "";
 
 				if (result.feedback) {
+					const { getPlanApprovedWithNotesPrompt } = await loadPlannotatorPrompts();
 					return {
 						content: [
 							{
 								type: "text",
-								text: `Plan approved with notes! You now have full tool access (read, bash, edit, write). Execute the plan in ${planFilePath}. ${doneMsg}\n\n## Implementation Notes\n\nThe user approved your plan but added the following notes to consider during implementation:\n\n${result.feedback}\n\nProceed with implementation, incorporating these notes where applicable.`,
+								text: getPlanApprovedWithNotesPrompt("pi", loadConfig(), {
+									planFilePath: inputPath,
+									doneMsg,
+									feedback: result.feedback,
+								}),
 							},
 						],
 						details: { approved: true, feedback: result.feedback },
+						terminate: true,
 					};
 				}
 
+				const { getPlanApprovedPrompt } = await loadPlannotatorPrompts();
 				return {
 					content: [
 						{
 							type: "text",
-							text: `Plan approved. You now have full tool access (read, bash, edit, write). Execute the plan in ${planFilePath}. ${doneMsg}`,
+							text: getPlanApprovedPrompt("pi", loadConfig(), {
+								planFilePath: inputPath,
+								doneMsg,
+							}),
 						},
 					],
 					details: { approved: true },
+					terminate: true,
 				};
 			}
 
 			// Denied
+			persistState();
 			const feedbackText = result.feedback || "Plan rejected. Please revise.";
+			const { buildPlanFileRule, getPlanDeniedPrompt, getPlanToolName } = await loadPlannotatorPrompts();
 			return {
 				content: [
 					{
 						type: "text",
-						text: planDenyFeedback(feedbackText, PLAN_SUBMIT_TOOL, {
-							planFilePath,
+						text: getPlanDeniedPrompt("pi", loadConfig(), {
+							toolName: getPlanToolName("pi"),
+							planFileRule: buildPlanFileRule(getPlanToolName("pi"), inputPath),
+							feedback: feedbackText,
 						}),
 					},
 				],
@@ -702,56 +992,96 @@ export default function plannotator(pi: ExtensionAPI): void {
 
 	// ── Event Handlers ───────────────────────────────────────────────────
 
-	// Gate writes during planning
+	// Gate writes during planning — only markdown files inside cwd.
 	pi.on("tool_call", async (event, ctx) => {
 		if (phase !== "planning") return;
+		if (event.toolName !== "write" && event.toolName !== "edit") return;
 
-		if (event.toolName === "write") {
-			const targetPath = resolve(ctx.cwd, event.input.path as string);
-			const allowedPath = resolvePlanPath(ctx.cwd);
-			if (targetPath !== allowedPath) {
-				return {
-					block: true,
-					reason: `Plannotator: writes are restricted to ${planFilePath} during planning. Blocked: ${event.input.path}`,
-				};
-			}
-		}
-
-		if (event.toolName === "edit") {
-			const targetPath = resolve(ctx.cwd, event.input.path as string);
-			const allowedPath = resolvePlanPath(ctx.cwd);
-			if (targetPath !== allowedPath) {
-				return {
-					block: true,
-					reason: `Plannotator: edits are restricted to ${planFilePath} during planning. Blocked: ${event.input.path}`,
-				};
-			}
+		const inputPath = event.input.path as string;
+		if (!isPlanWritePathAllowed(inputPath, ctx.cwd)) {
+			const verb = event.toolName === "write" ? "writes" : "edits";
+			return {
+				block: true,
+				reason: `Plannotator: during planning, ${verb} are limited to markdown files (.md, .mdx) inside the working directory. Blocked: ${inputPath}`,
+			};
 		}
 	});
 
 	// Inject phase-specific context
 	pi.on("before_agent_start", async (_event, ctx) => {
+		const profile = getPhaseProfile();
+		const planRef = lastSubmittedPath ?? "your plan file";
+
+		if (phase === "executing" && lastSubmittedPath) {
+			// Re-read from disk each turn to stay current
+			const fullPath = resolve(ctx.cwd, lastSubmittedPath);
+			try {
+				const planContent = readFileSync(fullPath, "utf-8");
+				checklistItems = parseChecklist(planContent);
+			} catch {
+				// File deleted during execution — degrade gracefully
+			}
+		}
+
+		const todoStats = phase === "executing" ? formatTodoList(checklistItems) : formatTodoList([]);
+
+		let improveContext: string | null = null;
+		if (phase === "planning") {
+			const hook = readImprovementHook("enterplanmode-improve");
+			const pfmEnabled = loadConfig().pfmReminder === true;
+			improveContext = composeImproveContext({
+				pfmEnabled,
+				improvementHookContent: hook?.content ?? null,
+			});
+		}
+
+		if (profile?.systemPrompt) {
+			const rendered = renderTemplate(
+				profile.systemPrompt,
+				buildPromptVariables({
+					planFilePath: planRef,
+					phase,
+					todoList: todoStats.todoList,
+					completedCount: todoStats.completedCount,
+					totalCount: todoStats.totalCount,
+					remainingCount: todoStats.remainingCount,
+				}),
+			);
+			if (rendered.unknownVariables.length > 0) {
+				ctx.ui.notify(
+					"Plannotator: unknown template variables in " + phase + " prompt: " + rendered.unknownVariables.join(", "),
+					"warning",
+				);
+			}
+
+			return { systemPrompt: rendered.text + (improveContext ? "\n\n" + improveContext : "") };
+		}
+
 		if (phase === "planning") {
 			return {
 				message: {
 					customType: "plannotator-context",
 					content: `[PLANNOTATOR - PLANNING PHASE]
-You are in plan mode. You MUST NOT make any changes to the codebase — no edits, no commits, no installs, no destructive commands. The ONLY file you may write to or edit is the plan file: ${planFilePath}.
+You are in plan mode. You MUST NOT make any changes to the codebase — no edits, no commits, no installs, no destructive commands. During planning you may only write or edit markdown files (.md, .mdx) inside the working directory.
 
-Available tools: read, bash, grep, find, ls, write (${planFilePath} only), edit (${planFilePath} only), ${PLAN_SUBMIT_TOOL}
+Available tools: read, bash, grep, find, ls, write (markdown only), edit (markdown only), ${PLAN_SUBMIT_TOOL}
 
 Do not run destructive bash commands (rm, git push, npm install, etc.) — focus on reading and exploring the codebase. Web fetching (curl, wget) is fine.
 
 ## Iterative Planning Workflow
 
-You are pair-planning with the user. Explore the code to build context, then write your findings into ${planFilePath} as you go. The plan starts as a rough skeleton and gradually becomes the final plan.
+You are pair-planning with the user. Explore the code to build context, then write your findings into a markdown plan file as you go. The plan starts as a rough skeleton and gradually becomes the final plan.
+
+### Picking a plan file
+
+Choose a descriptive filename for your plan. Convention: \`PLAN.md\` at the repo root for a single focused plan, or \`plans/<short-name>.md\` for projects that keep multiple plans. Reuse the same filename across revisions of the same plan so version history links up.
 
 ### The Loop
 
 Repeat this cycle until the plan is complete:
 
 1. **Explore** — Use read, grep, find, ls, and bash to understand the codebase. Actively search for existing functions, utilities, and patterns that can be reused — avoid proposing new code when suitable implementations already exist.
-2. **Update the plan file** — After each discovery, immediately capture what you learned in ${planFilePath}. Don't wait until the end. Use write for the initial draft, then edit for all subsequent updates.
+2. **Update the plan file** — After each discovery, immediately capture what you learned in the plan. Don't wait until the end. Use write for the initial draft, then edit for all subsequent updates.
 3. **Ask the user** — When you hit an ambiguity or decision you can't resolve from code alone, ask. Then go back to step 1.
 
 ### First Turn
@@ -781,14 +1111,14 @@ Keep the plan concise enough to scan quickly, but detailed enough to execute eff
 
 ### When to Submit
 
-Your plan is ready when you've addressed all ambiguities and it covers: what to change, which files to modify, what existing code to reuse, and how to verify. Call ${PLAN_SUBMIT_TOOL} to submit for review.
+Your plan is ready when you've addressed all ambiguities and it covers: what to change, which files to modify, what existing code to reuse, and how to verify. Call ${PLAN_SUBMIT_TOOL} with the path to your plan file to submit for review.
 
 ### Revising After Feedback
 
 When the user denies a plan with feedback:
-1. Read ${planFilePath} to see the current plan.
+1. Read the plan file to see the current plan.
 2. Use the edit tool to make targeted changes addressing the feedback — do NOT rewrite the entire file.
-3. Call ${PLAN_SUBMIT_TOOL} again to resubmit.
+3. Call ${PLAN_SUBMIT_TOOL} again with the same filePath to resubmit.
 
 ### Ending Your Turn
 
@@ -796,23 +1126,13 @@ Your turn should only end by either:
 - Asking the user a question to gather more information.
 - Calling ${PLAN_SUBMIT_TOOL} when the plan is ready for review.
 
-Do not end your turn without doing one of these two things.`,
+Do not end your turn without doing one of these two things.` + (improveContext ? "\n\n---\n\n" + improveContext : ""),
 					display: false,
 				},
 			};
 		}
 
 		if (phase === "executing" && checklistItems.length > 0) {
-			// Re-read from disk each turn to stay current
-			const fullPath = resolvePlanPath(ctx.cwd);
-			let planContent = "";
-			try {
-				planContent = readFileSync(fullPath, "utf-8");
-				checklistItems = parseChecklist(planContent);
-			} catch {
-				// File deleted during execution — degrade gracefully
-			}
-
 			const remaining = checklistItems.filter((t) => !t.completed);
 			if (remaining.length > 0) {
 				const todoList = remaining
@@ -822,7 +1142,7 @@ Do not end your turn without doing one of these two things.`,
 					message: {
 						customType: "plannotator-context",
 						content: `[PLANNOTATOR - EXECUTING PLAN]
-Full tool access is enabled. Execute the plan from ${planFilePath}.
+Full tool access is enabled. Execute the plan from ${planRef}.
 
 Remaining steps:
 ${todoList}
@@ -841,7 +1161,7 @@ Execute each step in order. After completing a step, include [DONE:n] in your re
 
 		return {
 			messages: event.messages.filter((m) => {
-				const msg = m as AgentMessage & { customType?: string };
+				const msg = m as { customType?: string; role?: string; content?: unknown };
 				if (msg.customType === "plannotator-context") return false;
 				if (msg.role !== "user") return true;
 
@@ -853,7 +1173,7 @@ Execute each step in order. After completing a step, include [DONE:n] in your re
 					return !content.some(
 						(c) =>
 							c.type === "text" &&
-							(c as TextContent).text?.includes("[PLANNOTATOR -"),
+							(c as { text?: string }).text?.includes("[PLANNOTATOR -"),
 					);
 				}
 				return true;
@@ -864,9 +1184,9 @@ Execute each step in order. After completing a step, include [DONE:n] in your re
 	// Track execution progress
 	pi.on("turn_end", async (event, ctx) => {
 		if (phase !== "executing" || checklistItems.length === 0) return;
-		if (!isAssistantMessage(event.message)) return;
 
-		const text = getTextContent(event.message);
+		const text = getAssistantMessageText(event.message);
+		if (!text) return;
 		if (markCompletedSteps(text, checklistItems) > 0) {
 			updateStatus(ctx);
 			updateWidget(ctx);
@@ -876,6 +1196,21 @@ Execute each step in order. After completing a step, include [DONE:n] in your re
 
 	// Detect execution completion
 	pi.on("agent_end", async (_event, ctx) => {
+		if (phase === "executing" && justApprovedPlan) {
+			justApprovedPlan = false;
+			let attempts = 0;
+			const continueWhenIdle = (): void => {
+				if (!ctx.isIdle()) {
+					attempts += 1;
+					if (attempts <= 200) setTimeout(continueWhenIdle, 50);
+					return;
+				}
+				pi.sendUserMessage("Continue with the approved plan.");
+			};
+			setTimeout(continueWhenIdle, 0);
+			return;
+		}
+
 		if (phase !== "executing" || checklistItems.length === 0) return;
 
 		if (checklistItems.every((t) => t.completed)) {
@@ -892,8 +1227,10 @@ Execute each step in order. After completing a step, include [DONE:n] in your re
 			);
 			phase = "idle";
 			checklistItems = [];
-			applyToolsForPhase();
-			preplanTools = null;
+			lastSubmittedPath = null;
+
+			await restoreSavedState(ctx);
+			savedState = null;
 			updateStatus(ctx);
 			updateWidget(ctx);
 			persistState();
@@ -902,10 +1239,10 @@ Execute each step in order. After completing a step, include [DONE:n] in your re
 
 	// Restore state on session start/resume
 	pi.on("session_start", async (_event, ctx) => {
-		// Resolve plan file path from flag
-		const flagPlanFile = pi.getFlag("plan-file") as string;
-		if (flagPlanFile) {
-			planFilePath = flagPlanFile;
+		const loadedConfig = loadPlannotatorConfig(ctx.cwd);
+		plannotatorConfig = loadedConfig.config;
+		for (const warning of loadedConfig.warnings) {
+			ctx.ui.notify(`Plannotator config: ${warning}`, "warning");
 		}
 
 		// Check --plan flag
@@ -920,55 +1257,76 @@ Execute each step in order. After completing a step, include [DONE:n] in your re
 				(e: { type: string; customType?: string }) =>
 					e.type === "custom" && e.customType === "plannotator",
 			)
-			.pop() as {
-				data?: { phase: Phase; planFilePath?: string; preplanTools?: string[] | null };
-			} | undefined;
+			.pop() as { data?: PersistedPlannotatorState } | undefined;
 
 		if (stateEntry?.data) {
 			phase = stateEntry.data.phase ?? phase;
-			planFilePath = stateEntry.data.planFilePath ?? planFilePath;
-			preplanTools = stateEntry.data.preplanTools ?? preplanTools;
+			lastSubmittedPath = stateEntry.data.lastSubmittedPath ?? lastSubmittedPath;
+			savedState = stateEntry.data.savedState ?? savedState;
 		}
 
 		// Rebuild execution state from disk + session messages
 		if (phase === "executing") {
-			const fullPath = resolvePlanPath(ctx.cwd);
-			if (existsSync(fullPath)) {
-				const content = readFileSync(fullPath, "utf-8");
-				checklistItems = parseChecklist(content);
+			if (lastSubmittedPath) {
+				const fullPath = resolve(ctx.cwd, lastSubmittedPath);
+				if (existsSync(fullPath)) {
+					const content = readFileSync(fullPath, "utf-8");
+					checklistItems = parseChecklist(content);
 
-				// Find last execution marker and scan messages after it for [DONE:n]
-				let executeIndex = -1;
-				for (let i = entries.length - 1; i >= 0; i--) {
-					const entry = entries[i] as { type: string; customType?: string };
-					if (entry.customType === "plannotator-execute") {
-						executeIndex = i;
-						break;
+					// Find last execution marker and scan messages after it for [DONE:n]
+					let executeIndex = -1;
+					for (let i = entries.length - 1; i >= 0; i--) {
+						const entry = entries[i] as { type: string; customType?: string };
+						if (entry.customType === "plannotator-execute") {
+							executeIndex = i;
+							break;
+						}
 					}
-				}
 
-				for (let i = executeIndex + 1; i < entries.length; i++) {
-					const entry = entries[i];
-					if (
-						entry.type === "message" &&
-						"message" in entry &&
-						isAssistantMessage(entry.message as AgentMessage)
-					) {
-						const text = getTextContent(entry.message as AssistantMessage);
-						markCompletedSteps(text, checklistItems);
+					for (let i = executeIndex + 1; i < entries.length; i++) {
+						const entry = entries[i];
+						if (entry.type === "message" && "message" in entry) {
+							const text = getAssistantMessageText(entry.message);
+							if (text) markCompletedSteps(text, checklistItems);
+						}
 					}
+				} else {
+					// Plan file gone — fall back to idle
+					phase = "idle";
+					lastSubmittedPath = null;
 				}
 			} else {
-				// Plan file gone — fall back to idle
+				// No path recorded — can't rebuild, fall back to idle
 				phase = "idle";
 			}
 		}
 
-		// Re-apply tool visibility on startup/resume so planning-only tools stay hidden
-		// outside planning and pre-plan tool state is restored after approvals.
-		applyToolsForPhase();
+
+
+		if (phase === "planning") {
+			checklistItems = [];
+			const warning = getPlanReviewAvailabilityWarning({ hasUI: ctx.hasUI, hasPlanHtml: hasPlanBrowserHtml() });
+			if (warning) {
+				ctx.ui.notify(warning, "warning");
+			}
+		}
+
+		if (phase === "idle") {
+			if (savedState) {
+				await restoreSavedState(ctx);
+				savedState = null;
+			} else {
+				// Strip planning-only tools on fresh sessions where savedState is null.
+				// Without this, plannotator_submit_plan stays in the active tool set
+				// even though plan mode hasn't been activated. See #387.
+				pi.setActiveTools(stripPlanningOnlyTools(pi.getActiveTools()));
+			}
+		} else if (phase === "planning" || phase === "executing") {
+			await applyPhaseConfig(ctx, { restoreSavedState: true });
+		}
 
 		updateStatus(ctx);
 		updateWidget(ctx);
+		persistState();
 	});
 }

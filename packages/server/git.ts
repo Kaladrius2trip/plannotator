@@ -10,7 +10,9 @@ import {
   type DiffResult,
   type DiffType,
   type GitCommandResult,
+  type GitCommandOptions,
   type GitContext,
+  type GitDiffOptions,
   type ReviewGitRuntime,
   type WorktreeInfo,
   getCurrentBranch as getCurrentBranchCore,
@@ -21,6 +23,7 @@ import {
   gitAddFile as gitAddFileCore,
   gitResetFile as gitResetFileCore,
   parseWorktreeDiffType,
+  prepareGitCommand,
   runGitDiff as runGitDiffCore,
   runGitDiffWithContext as runGitDiffWithContextCore,
   validateFilePath,
@@ -31,18 +34,46 @@ export type {
   DiffType,
   DiffResult,
   GitContext,
+  GitDiffOptions,
   WorktreeInfo,
 } from "@plannotator/shared/review-core";
 
 async function runGit(
   args: string[],
-  options?: { cwd?: string },
+  options?: GitCommandOptions,
 ): Promise<GitCommandResult> {
-  const proc = Bun.spawn(["git", ...args], {
+  const command = prepareGitCommand(args, options, process.env);
+  const proc = Bun.spawn(["git", ...command.args], {
     cwd: options?.cwd,
+    detached: command.isolateProcessGroup,
+    env: command.env,
+    stdin: "ignore",
     stdout: "pipe",
     stderr: "pipe",
+    windowsHide: true,
   });
+
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  if (options?.timeoutMs) {
+    timer = setTimeout(() => {
+      if (command.isolateProcessGroup && process.platform !== "win32") {
+        try {
+          process.kill(-proc.pid, "SIGKILL");
+          return;
+        } catch {
+          // Fall through when the process exited between the timer and signal.
+        }
+      }
+      if (command.isolateProcessGroup && process.platform === "win32") {
+        const killed = Bun.spawnSync(
+          ["taskkill.exe", "/pid", String(proc.pid), "/t", "/f"],
+          { stdin: "ignore", stdout: "ignore", stderr: "ignore", windowsHide: true },
+        );
+        if (killed.exitCode === 0) return;
+      }
+      proc.kill("SIGKILL");
+    }, options.timeoutMs);
+  }
 
   const [stdout, stderr, exitCode] = await Promise.all([
     new Response(proc.stdout).text(),
@@ -50,10 +81,13 @@ async function runGit(
     proc.exited,
   ]);
 
+  if (timer) clearTimeout(timer);
+
   return { stdout, stderr, exitCode };
 }
 
-const runtime: ReviewGitRuntime = {
+/** Bun-based git runtime. Exported for use with shared utilities (worktree, etc.) */
+export const runtime: ReviewGitRuntime = {
   runGit,
   async readTextFile(path: string): Promise<string | null> {
     try {
@@ -84,15 +118,17 @@ export function runGitDiff(
   diffType: DiffType,
   defaultBranch: string = "main",
   cwd?: string,
+  options?: GitDiffOptions,
 ): Promise<DiffResult> {
-  return runGitDiffCore(runtime, diffType, defaultBranch, cwd);
+  return runGitDiffCore(runtime, diffType, defaultBranch, cwd, options);
 }
 
 export function runGitDiffWithContext(
   diffType: DiffType,
   gitContext: GitContext,
+  options?: GitDiffOptions,
 ): Promise<DiffResult> {
-  return runGitDiffWithContextCore(runtime, diffType, gitContext);
+  return runGitDiffWithContextCore(runtime, diffType, gitContext, options);
 }
 
 export function getFileContentsForDiff(

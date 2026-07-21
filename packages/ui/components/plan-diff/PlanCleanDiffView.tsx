@@ -8,10 +8,15 @@
 
 import React, { useEffect, useRef, useState, useCallback } from "react";
 import hljs from "highlight.js";
-import { parseMarkdownToBlocks } from "../../utils/parser";
+import { parseMarkdownToBlocks, computeListIndices } from "../../utils/parser";
+import { ListItemBody } from "../ListItemBody";
 import type { Block, Annotation, EditorMode, ImageAttachment } from "../../types";
 import { AnnotationType } from "../../types";
-import type { PlanDiffBlock } from "../../utils/planDiffEngine";
+import type {
+  PlanDiffBlock,
+  InlineDiffToken,
+  InlineDiffWrap,
+} from "../../utils/planDiffEngine";
 import type { QuickLabel } from "../../utils/quickLabels";
 import { AnnotationToolbar } from "../AnnotationToolbar";
 import { CommentPopover } from "../CommentPopover";
@@ -25,6 +30,13 @@ interface PlanCleanDiffViewProps {
   onSelectAnnotation?: (id: string | null) => void;
   selectedAnnotationId?: string | null;
   mode?: EditorMode;
+  /**
+   * When true (default), modified blocks that passed the qualification gate
+   * render with inline word-level highlights. When false, every modified
+   * block falls back to the stacked old-struck / new-green layout — the
+   * "Classic" diff view exposed in the mode switcher.
+   */
+  wordLevel?: boolean;
 }
 
 export const PlanCleanDiffView: React.FC<PlanCleanDiffViewProps> = ({
@@ -34,6 +46,7 @@ export const PlanCleanDiffView: React.FC<PlanCleanDiffViewProps> = ({
   onSelectAnnotation,
   selectedAnnotationId = null,
   mode = "selection",
+  wordLevel = true,
 }) => {
   const modeRef = useRef<EditorMode>(mode);
   const onAddAnnotationRef = useRef(onAddAnnotation);
@@ -110,12 +123,26 @@ export const PlanCleanDiffView: React.FC<PlanCleanDiffViewProps> = ({
     return set;
   }, [annotations]);
 
-  /** Resolve content for a diff block section (handles modified blocks with old/new sides) */
-  const getBlockContent = useCallback((block: PlanDiffBlock, diffContext: Annotation['diffContext']) =>
-    block.type === 'modified' && diffContext === 'removed'
-      ? block.oldContent || block.content
-      : block.content
-  , []);
+  /**
+   * Resolve content for a diff block section (handles modified blocks with
+   * old/new sides). For inline-diff modified blocks — one clickable target
+   * with diffContext 'modified' — we capture BOTH sides in git-diff shape
+   * so comments about a struck-through deleted word preserve that word in
+   * the exported feedback, instead of sending only the new content.
+   */
+  const getBlockContent = useCallback((block: PlanDiffBlock, diffContext: Annotation['diffContext']) => {
+    if (block.type === 'modified') {
+      if (diffContext === 'removed') return block.oldContent || block.content;
+      if (
+        diffContext === 'modified' &&
+        block.oldContent &&
+        block.oldContent !== block.content
+      ) {
+        return `- ${block.oldContent.trimEnd()}\n+ ${block.content.trimEnd()}`;
+      }
+    }
+    return block.content;
+  }, []);
 
   const createDiffAnnotation = useCallback((
     block: PlanDiffBlock,
@@ -239,7 +266,10 @@ export const PlanCleanDiffView: React.FC<PlanCleanDiffViewProps> = ({
   const handleBlockClick = useCallback((block: PlanDiffBlock, index: number, element: HTMLElement, diffContext: Annotation['diffContext']) => {
     if (modeRef.current === 'redline') {
       createDiffAnnotation(block, index, diffContext, AnnotationType.DELETION);
-    } else if (modeRef.current === 'comment') {
+    } else if (modeRef.current === 'quickLabel') {
+      setQuickLabelPicker({ anchorEl: element, block, index, diffContext });
+    } else {
+      // selection or comment → open the comment popover directly on click
       const content = getBlockContent(block, diffContext);
       setCommentPopover({
         anchorEl: element,
@@ -248,8 +278,6 @@ export const PlanCleanDiffView: React.FC<PlanCleanDiffViewProps> = ({
         index,
         diffContext,
       });
-    } else if (modeRef.current === 'quickLabel') {
-      setQuickLabelPicker({ anchorEl: element, block, index, diffContext });
     }
   }, [createDiffAnnotation, getBlockContent]);
 
@@ -266,9 +294,10 @@ export const PlanCleanDiffView: React.FC<PlanCleanDiffViewProps> = ({
           hoveredIndex={hoveredBlock?.index ?? null}
           hoveredDiffContext={hoveredBlock?.diffContext}
           isBlockAnnotated={isBlockAnnotated}
+          wordLevel={wordLevel}
           onHover={onAddAnnotation ? (el, diffContext) => handleHover(el, block, index, diffContext) : undefined}
           onLeave={onAddAnnotation ? handleLeave : undefined}
-          onClick={onAddAnnotation && mode !== 'selection' ? (el, diffContext) => handleBlockClick(block, index, el, diffContext) : undefined}
+          onClick={onAddAnnotation ? (el, diffContext) => handleBlockClick(block, index, el, diffContext) : undefined}
         />
       ))}
 
@@ -325,18 +354,20 @@ interface DiffBlockRendererProps {
   hoveredIndex: number | null;
   hoveredDiffContext?: Annotation['diffContext'];
   isBlockAnnotated: (index: number) => boolean;
+  /** When false, force block-level fallback even if inlineTokens is populated. */
+  wordLevel: boolean;
   onHover?: (element: HTMLElement, diffContext: Annotation['diffContext']) => void;
   onLeave?: () => void;
   onClick?: (element: HTMLElement, diffContext: Annotation['diffContext']) => void;
 }
 
 const DiffBlockRenderer: React.FC<DiffBlockRendererProps> = ({
-  block, index, hoveredIndex, hoveredDiffContext, isBlockAnnotated, onHover, onLeave, onClick,
+  block, index, hoveredIndex, hoveredDiffContext, isBlockAnnotated, wordLevel, onHover, onLeave, onClick,
 }) => {
   const hoverProps = (diffContext: Annotation['diffContext']) => onHover ? {
-    onMouseEnter: (e: React.MouseEvent<HTMLDivElement>) => onHover(e.currentTarget, diffContext),
+    onMouseEnter: (e: React.MouseEvent<HTMLElement>) => onHover(e.currentTarget, diffContext),
     onMouseLeave: () => onLeave?.(),
-    onClick: onClick ? (e: React.MouseEvent<HTMLDivElement>) => onClick(e.currentTarget, diffContext) : undefined,
+    onClick: onClick ? (e: React.MouseEvent<HTMLElement>) => onClick(e.currentTarget, diffContext) : undefined,
     style: { cursor: 'pointer' } as React.CSSProperties,
   } : {};
 
@@ -380,6 +411,21 @@ const DiffBlockRenderer: React.FC<DiffBlockRendererProps> = ({
       );
 
     case "modified":
+      // When the engine populated inlineTokens, we render a single in-context
+      // block with <ins>/<del> spans inside the structural wrapper. Falls
+      // back to the stacked strike-through rendering when tokens are absent
+      // (gate rejected: code/table/structural mismatch/inline-code hazard).
+      if (wordLevel && block.inlineTokens && block.inlineWrap) {
+        return (
+          <InlineModifiedBlock
+            tokens={block.inlineTokens}
+            wrap={block.inlineWrap}
+            index={index}
+            ringClass={ringClass('modified')}
+            hoverProps={hoverProps('modified')}
+          />
+        );
+      }
       return (
         <div data-diff-block-index={index}>
           <div
@@ -402,6 +448,119 @@ const DiffBlockRenderer: React.FC<DiffBlockRendererProps> = ({
   }
 };
 
+// --- Shared block-rendering style helpers ---
+// Kept as module-scope constants so InlineModifiedBlock and SimpleBlockRenderer
+// share a single source of truth for heading/paragraph/list-item styling.
+
+const HEADING_STYLE_BY_LEVEL: Record<number, string> = {
+  1: "text-2xl font-bold mb-4 mt-6 first:mt-0 tracking-tight",
+  2: "text-xl font-semibold mb-3 mt-8 text-foreground/90",
+  3: "text-base font-semibold mb-2 mt-6 text-foreground/80",
+};
+const HEADING_STYLE_FALLBACK = "text-base font-semibold mb-2 mt-4";
+const headingStyleFor = (level: number): string =>
+  HEADING_STYLE_BY_LEVEL[level] || HEADING_STYLE_FALLBACK;
+
+const PARAGRAPH_CLASS = "mb-4 leading-relaxed text-foreground/90 text-[15px]";
+const LIST_ITEM_ROW_CLASS = "flex items-start gap-3 my-1.5";
+const listItemIndentRem = (level: number): string => `${level * 1.25}rem`;
+const listItemTextClass = (isCheckbox: boolean, checked?: boolean): string =>
+  `text-sm leading-relaxed ${isCheckbox && checked ? "text-muted-foreground line-through" : "text-foreground/90"}`;
+
+// --- Inline word-diff renderer for modified blocks ---
+
+interface InlineModifiedBlockProps {
+  tokens: InlineDiffToken[];
+  wrap: InlineDiffWrap;
+  index: number;
+  ringClass: string;
+  hoverProps: {
+    onMouseEnter?: (e: React.MouseEvent<HTMLElement>) => void;
+    onMouseLeave?: () => void;
+    onClick?: (e: React.MouseEvent<HTMLElement>) => void;
+    style?: React.CSSProperties;
+  };
+}
+
+/**
+ * Renders a 'modified' diff block in-context: one structural wrapper
+ * (h1-h6, p, or list-item div) containing a single InlineMarkdown parse
+ * over a unified string with <ins>/<del> tags wrapping changed tokens.
+ * Preserves markdown AST context across token boundaries (bold pairs,
+ * links) which per-token rendering would break.
+ */
+const InlineModifiedBlock: React.FC<InlineModifiedBlockProps> = ({
+  tokens,
+  wrap,
+  index,
+  ringClass,
+  hoverProps,
+}) => {
+  const unified = tokens
+    .map((t) => {
+      if (t.type === "added") return `<ins>${t.value}</ins>`;
+      if (t.type === "removed") return `<del>${t.value}</del>`;
+      return t.value;
+    })
+    .join("");
+
+  // Modified blocks rendered inline carry BOTH additions and deletions, so
+  // their border/background uses the amber "modified" class — not the green
+  // "added" one. Inline <ins>/<del> word highlights render on top unchanged.
+  const wrapperBase = `plan-diff-modified transition-shadow ${ringClass}`;
+  const { style: hoverStyle, ...hoverRest } = hoverProps;
+
+  if (wrap.type === "heading") {
+    const level = wrap.level || 1;
+    const Tag = `h${level}` as 'h1' | 'h2' | 'h3' | 'h4' | 'h5' | 'h6';
+    return (
+      <Tag
+        data-diff-block-index={index}
+        className={`${headingStyleFor(level)} ${wrapperBase}`}
+        style={hoverStyle}
+        {...hoverRest}
+      >
+        <InlineMarkdown text={unified} />
+      </Tag>
+    );
+  }
+
+  if (wrap.type === "list-item") {
+    const listLevel = wrap.listLevel || 0;
+    const isCheckbox = wrap.checked !== undefined;
+    return (
+      <div
+        data-diff-block-index={index}
+        className={`${LIST_ITEM_ROW_CLASS} ${wrapperBase}`}
+        style={{ marginLeft: listItemIndentRem(listLevel), ...hoverStyle }}
+        {...hoverRest}
+      >
+        <ListItemBody
+          level={listLevel}
+          ordered={wrap.ordered}
+          orderedIndex={wrap.orderedStart ?? 1}
+          checked={wrap.checked}
+          textClassName={listItemTextClass(isCheckbox, wrap.checked)}
+          content={unified}
+          renderInline={(text) => <InlineMarkdown text={text} />}
+        />
+      </div>
+    );
+  }
+
+  // paragraph
+  return (
+    <p
+      data-diff-block-index={index}
+      className={`${PARAGRAPH_CLASS} ${wrapperBase}`}
+      style={hoverStyle}
+      {...hoverRest}
+    >
+      <InlineMarkdown text={unified} />
+    </p>
+  );
+};
+
 // --- Rendering components (unchanged from main) ---
 
 const MarkdownChunk: React.FC<{ content: string }> = ({ content }) => {
@@ -409,91 +568,72 @@ const MarkdownChunk: React.FC<{ content: string }> = ({ content }) => {
     () => parseMarkdownToBlocks(content),
     [content]
   );
+  // Compute ordered-list display indices across the entire chunk so every
+  // list-item gets the right numeral even though we don't group here.
+  // Non-list blocks pass through as `null` and act as streak-breaks — same
+  // behavior as the main Viewer's per-group counter.
+  const orderedIndices = React.useMemo(
+    () => computeListIndices(blocks),
+    [blocks]
+  );
 
   return (
     <>
-      {blocks.map((block) => (
-        <SimpleBlockRenderer key={block.id} block={block} />
+      {blocks.map((block, i) => (
+        <SimpleBlockRenderer
+          key={block.id}
+          block={block}
+          orderedIndex={orderedIndices[i]}
+        />
       ))}
     </>
   );
 };
 
-const SimpleBlockRenderer: React.FC<{ block: Block }> = ({ block }) => {
+const SimpleBlockRenderer: React.FC<{ block: Block; orderedIndex?: number | null }> = ({ block, orderedIndex }) => {
   switch (block.type) {
     case "heading": {
-      const Tag = `h${block.level || 1}` as keyof React.JSX.IntrinsicElements;
-      const styles =
-        {
-          1: "text-2xl font-bold mb-4 mt-6 first:mt-0 tracking-tight",
-          2: "text-xl font-semibold mb-3 mt-8 text-foreground/90",
-          3: "text-base font-semibold mb-2 mt-6 text-foreground/80",
-        }[block.level || 1] || "text-base font-semibold mb-2 mt-4";
-
+      const level = block.level || 1;
+      const Tag = `h${level}` as keyof React.JSX.IntrinsicElements;
       return (
-        <Tag className={styles}>
+        <Tag className={headingStyleFor(level)}>
           <InlineMarkdown text={block.content} />
         </Tag>
       );
     }
 
-    case "blockquote":
+    case "blockquote": {
+      // Split on blank-line paragraph breaks so merged `> a\n>\n> b`
+      // renders as two <p> children instead of collapsing to one line.
+      const paragraphs = block.content.split(/\n\n+/);
       return (
         <blockquote className="border-l-2 border-primary/50 pl-4 my-4 text-muted-foreground italic">
-          <InlineMarkdown text={block.content} />
+          {paragraphs.map((para, i) => (
+            <p key={i} className={i > 0 ? "mt-2" : ""}>
+              <InlineMarkdown text={para} />
+            </p>
+          ))}
         </blockquote>
       );
+    }
 
     case "list-item": {
-      const indent = (block.level || 0) * 1.25;
+      const listLevel = block.level || 0;
       const isCheckbox = block.checked !== undefined;
       return (
         <div
-          className="flex gap-3 my-1.5"
-          style={{ marginLeft: `${indent}rem` }}
+          className={LIST_ITEM_ROW_CLASS}
+          style={{ marginLeft: listItemIndentRem(listLevel) }}
         >
-          <span className="select-none shrink-0 flex items-center">
-            {isCheckbox ? (
-              block.checked ? (
-                <svg
-                  className="w-4 h-4 text-success"
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  stroke="currentColor"
-                  strokeWidth={2.5}
-                >
-                  <path
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                    d="M9 12.75L11.25 15 15 9.75M21 12a9 9 0 11-18 0 9 9 0 0118 0z"
-                  />
-                </svg>
-              ) : (
-                <svg
-                  className="w-4 h-4 text-muted-foreground/50"
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  stroke="currentColor"
-                  strokeWidth={2}
-                >
-                  <circle cx="12" cy="12" r="9" />
-                </svg>
-              )
-            ) : (
-              <span className="text-primary/60">
-                {(block.level || 0) === 0
-                  ? "\u2022"
-                  : (block.level || 0) === 1
-                    ? "\u25E6"
-                    : "\u25AA"}
-              </span>
-            )}
-          </span>
-          <span
-            className={`text-sm leading-relaxed ${isCheckbox && block.checked ? "text-muted-foreground line-through" : "text-foreground/90"}`}
-          >
-            <InlineMarkdown text={block.content} />
-          </span>
+          <ListItemBody
+            level={listLevel}
+            ordered={block.ordered}
+            orderedIndex={orderedIndex}
+            checked={block.checked}
+            textClassName={listItemTextClass(isCheckbox, block.checked)}
+            content={block.content}
+            renderInline={(text) => <InlineMarkdown text={text} />}
+          />
         </div>
       );
     }
@@ -508,7 +648,7 @@ const SimpleBlockRenderer: React.FC<{ block: Block }> = ({ block }) => {
       const lines = block.content.split('\n').filter(line => line.trim());
       if (lines.length === 0) return null;
       const parseRow = (line: string): string[] =>
-        line.replace(/^\|/, '').replace(/\|$/, '').split('|').map(cell => cell.trim());
+        line.replace(/^\|/, '').replace(/\|$/, '').split(/(?<!\\)\|/).map(cell => cell.trim().replace(/\\\|/g, '|'));
       const headers = parseRow(lines[0]);
       const rows: string[][] = [];
       for (let i = 1; i < lines.length; i++) {
@@ -546,7 +686,7 @@ const SimpleBlockRenderer: React.FC<{ block: Block }> = ({ block }) => {
 
     default:
       return (
-        <p className="mb-4 leading-relaxed text-foreground/90 text-[15px]">
+        <p className={PARAGRAPH_CLASS}>
           <InlineMarkdown text={block.content} />
         </p>
       );
@@ -583,13 +723,58 @@ const SimpleCodeBlock: React.FC<{ block: Block }> = ({ block }) => {
   );
 };
 
+/**
+ * Block dangerous link protocols (javascript:, data:, vbscript:, file:) from
+ * rendering as clickable anchors in the diff view. Plan content is attacker-
+ * influenced (Claude pulls from source comments, READMEs, fetched URLs), so
+ * a malicious `[click me](javascript:...)` link embedded in a plan must not
+ * render as a live <a>. Mirrors the same guard in Viewer.tsx; returns null
+ * for blocked schemes so the caller can render the anchor text as plain
+ * text instead of a clickable link.
+ */
+const DANGEROUS_PROTOCOL = /^\s*(javascript|data|vbscript|file)\s*:/i;
+function sanitizeLinkUrl(url: string): string | null {
+  if (DANGEROUS_PROTOCOL.test(url)) return null;
+  return url;
+}
+
 const InlineMarkdown: React.FC<{ text: string }> = ({ text }) => {
   const parts: React.ReactNode[] = [];
   let remaining = text;
   let key = 0;
+  let previousChar = "";
 
   while (remaining.length > 0) {
-    let match = remaining.match(/^\*\*(.+?)\*\*/);
+    // Plan-diff word markers: <ins>...</ins> and <del>...</del>. These are
+    // emitted by PlanCleanDiffView's modified-block renderer when the
+    // diff engine populates `inlineTokens`. Content is recursively parsed
+    // so inline formatting inside a diff token (e.g., **bold** on an
+    // added word) still renders.
+    let match = remaining.match(/^<(ins|del)>([\s\S]+?)<\/\1>/);
+    if (match) {
+      const tag = match[1] as "ins" | "del";
+      const className =
+        tag === "ins" ? "plan-diff-word-added" : "plan-diff-word-removed";
+      if (tag === "ins") {
+        parts.push(
+          <ins key={key++} className={className}>
+            <InlineMarkdown text={match[2]} />
+          </ins>
+        );
+      } else {
+        parts.push(
+          <del key={key++} className={className}>
+            <InlineMarkdown text={match[2]} />
+          </del>
+        );
+      }
+      remaining = remaining.slice(match[0].length);
+      previousChar = match[0][match[0].length - 1] || previousChar;
+      continue;
+    }
+
+    // Bold: **text** ([\s\S]+? allows matching across hard line breaks)
+    match = remaining.match(/^\*\*([\s\S]+?)\*\*/);
     if (match) {
       parts.push(
         <strong key={key++} className="font-semibold">
@@ -597,13 +782,26 @@ const InlineMarkdown: React.FC<{ text: string }> = ({ text }) => {
         </strong>
       );
       remaining = remaining.slice(match[0].length);
+      previousChar = match[0][match[0].length - 1] || previousChar;
       continue;
     }
 
-    match = remaining.match(/^\*(.+?)\*/);
+    // Italic: *text* or _text_ (avoid intraword underscores)
+    match = remaining.match(/^\*([\s\S]+?)\*/);
     if (match) {
       parts.push(<em key={key++}><InlineMarkdown text={match[1]} /></em>);
       remaining = remaining.slice(match[0].length);
+      previousChar = match[0][match[0].length - 1] || previousChar;
+      continue;
+    }
+
+    match = !/\w/.test(previousChar)
+      ? remaining.match(/^_([^_\s](?:[\s\S]*?[^_\s])?)_(?!\w)/)
+      : null;
+    if (match) {
+      parts.push(<em key={key++}><InlineMarkdown text={match[1]} /></em>);
+      remaining = remaining.slice(match[0].length);
+      previousChar = match[0][match[0].length - 1] || previousChar;
       continue;
     }
 
@@ -618,33 +816,67 @@ const InlineMarkdown: React.FC<{ text: string }> = ({ text }) => {
         </code>
       );
       remaining = remaining.slice(match[0].length);
+      previousChar = match[0][match[0].length - 1] || previousChar;
       continue;
     }
 
     match = remaining.match(/^\[([^\]]+)\]\(([^)]+)\)/);
     if (match) {
-      parts.push(
-        <a
-          key={key++}
-          href={match[2]}
-          target="_blank"
-          rel="noopener noreferrer"
-          className="text-primary underline underline-offset-2 hover:text-primary/80"
-        >
-          {match[1]}
-        </a>
-      );
+      // Recursively parse the anchor text so <ins>/<del> diff tags (and
+      // other inline markdown) inside the link render correctly instead of
+      // showing up as literal HTML tag text. Sanitize the href: dangerous
+      // schemes (javascript:, data:, vbscript:, file:) are rendered as
+      // plain text instead of a live anchor to block XSS via plan content.
+      const safeHref = sanitizeLinkUrl(match[2]);
+      if (safeHref === null) {
+        parts.push(
+          <span key={key++}>
+            <InlineMarkdown text={match[1]} />
+          </span>
+        );
+      } else {
+        parts.push(
+          <a
+            key={key++}
+            href={safeHref}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="text-primary underline underline-offset-2 hover:text-primary/80"
+          >
+            <InlineMarkdown text={match[1]} />
+          </a>
+        );
+      }
       remaining = remaining.slice(match[0].length);
+      previousChar = match[0][match[0].length - 1] || previousChar;
       continue;
     }
 
-    const nextSpecial = remaining.slice(1).search(/[*`[]/);
+    // Hard line break: two+ trailing spaces + newline, or backslash + newline
+    match = remaining.match(/ {2,}\n|\\\n/);
+    if (match && match.index !== undefined) {
+      const before = remaining.slice(0, match.index);
+      if (before) {
+        parts.push(<InlineMarkdown key={key++} text={before} />);
+      }
+      parts.push(<br key={key++} />);
+      remaining = remaining.slice(match.index + match[0].length);
+      previousChar = "\n";
+      continue;
+    }
+
+    // Include '<' so the loop re-enters when an <ins>/<del> tag is next,
+    // rather than swallowing it as plain text.
+    const nextSpecial = remaining.slice(1).search(/[\*_`\[!<]/);
     if (nextSpecial === -1) {
       parts.push(remaining);
+      previousChar = remaining[remaining.length - 1] || previousChar;
       break;
     } else {
-      parts.push(remaining.slice(0, nextSpecial + 1));
+      const plainText = remaining.slice(0, nextSpecial + 1);
+      parts.push(plainText);
       remaining = remaining.slice(nextSpecial + 1);
+      previousChar = plainText[plainText.length - 1] || previousChar;
     }
   }
 

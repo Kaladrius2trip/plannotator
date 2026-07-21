@@ -3,10 +3,27 @@ import { createPortal } from 'react-dom';
 import type { ImageAttachment } from '../types';
 import { AttachmentsButton } from './AttachmentsButton';
 import { submitHint } from '../utils/platform';
+import { useDraggable } from '../hooks/useDraggable';
+import { SparklesIcon } from './SparklesIcon';
+import { hasUnsavedCommentContent } from '../utils/commentContent';
+
+export interface CommentAskAIContext {
+  kind: 'general' | 'selection';
+  label?: string;
+  text?: string;
+  sourcePath?: string;
+}
+
+export type CommentAskAIHandler = (
+  question: string,
+  context: CommentAskAIContext,
+) => boolean | void | Promise<boolean | void>;
 
 interface CommentPopoverProps {
   /** Element to anchor the popover near (re-reads position on scroll) */
-  anchorEl: HTMLElement;
+  anchorEl?: HTMLElement;
+  /** Static viewport rect to anchor near when no stable DOM element exists */
+  anchorRect?: DOMRect;
   /** Truncated selected text shown in header, or empty for global */
   contextText: string;
   /** Whether this is a global comment */
@@ -15,12 +32,39 @@ interface CommentPopoverProps {
   initialText?: string;
   /** Called on submit with comment text and optional images */
   onSubmit: (text: string, images?: ImageAttachment[]) => void;
+  /** Optional live draft observer for submit paths outside the popover. */
+  onDraftChange?: (text: string, images?: ImageAttachment[]) => void;
   /** Called when popover is closed/cancelled */
   onClose: () => void;
+  /** Opt-in: persist text + images across close/reopen, keyed by this string. Cleared on submit. */
+  draftKey?: string;
+  /** Whether image attachments are available in this comment surface. */
+  allowImages?: boolean;
+  /** Whether submitting empty text is allowed, for editors that support clearing. */
+  allowEmptySubmit?: boolean;
+  /** Optional Ask AI action. Absent by default so existing comment surfaces are unchanged. */
+  onAskAI?: CommentAskAIHandler;
+  askAIContext?: CommentAskAIContext;
+  askAIDisabled?: boolean;
 }
 
 const MAX_POPOVER_WIDTH = 384;
 const GAP = 8;
+
+// Module-level draft store: survives popover unmount so reopening the same key restores in-progress text.
+const draftStore = new Map<string, { text: string; images: ImageAttachment[] }>();
+
+/** Mirrors the latest text + images into `draftStore[draftKey]` so they outlive popover unmount. No-op without a key. */
+function useCommentDraftSync(draftKey: string | undefined, text: string, images: ImageAttachment[]) {
+  useEffect(() => {
+    if (!draftKey) return;
+    if (hasUnsavedCommentContent(text, images)) {
+      draftStore.set(draftKey, { text, images });
+    } else {
+      draftStore.delete(draftKey);
+    }
+  }, [draftKey, text, images]);
+}
 
 function computePosition(anchorRect: DOMRect): { top: number; left: number; flipAbove: boolean; width: number } {
   const spaceBelow = window.innerHeight - anchorRect.bottom;
@@ -39,25 +83,57 @@ function computePosition(anchorRect: DOMRect): { top: number; left: number; flip
 
 export const CommentPopover: React.FC<CommentPopoverProps> = ({
   anchorEl,
+  anchorRect,
   contextText,
   isGlobal,
   initialText = '',
   onSubmit,
+  onDraftChange,
   onClose,
+  draftKey,
+  allowImages = true,
+  allowEmptySubmit = false,
+  onAskAI,
+  askAIContext,
+  askAIDisabled = false,
 }) => {
   const [mode, setMode] = useState<'popover' | 'dialog'>('popover');
-  const [text, setText] = useState(initialText);
-  const [images, setImages] = useState<ImageAttachment[]>([]);
-  const [position, setPosition] = useState<{ top: number; left: number; flipAbove: boolean } | null>(null);
+  const initialDraft = draftKey ? draftStore.get(draftKey) : undefined;
+  const [text, setText] = useState(initialDraft?.text ?? initialText);
+  const [images, setImages] = useState<ImageAttachment[]>(allowImages ? initialDraft?.images ?? [] : []);
+  const [position, setPosition] = useState<{ top: number; left: number; flipAbove: boolean; width: number } | null>(null);
+  // Direction of an open popover that has scrolled out of view, or null when on-screen.
+  const [offscreen, setOffscreen] = useState<'above' | 'below' | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const popoverRef = useRef<HTMLDivElement>(null);
+  const hasUnsavedContent = hasUnsavedCommentContent(text, allowImages ? images : []);
+  const hasUnsavedContentRef = useRef(hasUnsavedContent);
+  hasUnsavedContentRef.current = hasUnsavedContent;
+  const { dragPosition, dragHandleProps, wasDragged, reset: resetDrag } = useDraggable(popoverRef);
 
-  // Track anchor position on scroll/resize (popover mode only)
   useEffect(() => {
-    if (mode !== 'popover') return;
+    const nextDraft = draftKey ? draftStore.get(draftKey) : undefined;
+    setText(nextDraft?.text ?? initialText);
+    setImages(allowImages ? nextDraft?.images ?? [] : []);
+  }, [draftKey, initialText, allowImages]);
+
+  useCommentDraftSync(draftKey, text, allowImages ? images : []);
+
+  useEffect(() => {
+    onDraftChange?.(text, allowImages ? images : undefined);
+  }, [allowImages, images, onDraftChange, text]);
+
+  // Reset drag when anchor changes (new annotation) or mode switches
+  useEffect(() => { resetDrag(); }, [anchorEl, anchorRect, resetDrag]);
+  useEffect(() => { if (mode === 'popover') resetDrag(); }, [mode, resetDrag]);
+
+  // Track anchor position on scroll/resize (popover mode only, not after user drag)
+  useEffect(() => {
+    if (mode !== 'popover' || wasDragged) return;
 
     const update = () => {
-      setPosition(computePosition(anchorEl.getBoundingClientRect()));
+      const rect = anchorEl?.getBoundingClientRect() ?? anchorRect;
+      if (rect) setPosition(computePosition(rect));
     };
 
     update();
@@ -67,19 +143,44 @@ export const CommentPopover: React.FC<CommentPopoverProps> = ({
       window.removeEventListener('scroll', update, true);
       window.removeEventListener('resize', update);
     };
-  }, [anchorEl, mode]);
+  }, [anchorEl, anchorRect, mode, wasDragged]);
 
-  // Focus textarea on mount and mode changes
+  // Surface a "jump back" arrow when an open popover scrolls out of view.
+  // Re-measures whenever the popover repositions (position updates every scroll
+  // step in tracked mode) so the indicator is accurate at rest, plus on resize.
   useEffect(() => {
-    const id = setTimeout(() => {
-      const el = textareaRef.current;
-      if (el) {
-        el.focus();
-        el.selectionStart = el.selectionEnd = el.value.length;
-      }
+    if (mode !== 'popover') { setOffscreen(null); return; }
+    const measure = () => {
+      const el = popoverRef.current;
+      if (!el) return;
+      const rect = el.getBoundingClientRect();
+      if (rect.bottom < 8) setOffscreen('above');
+      else if (rect.top > window.innerHeight - 8) setOffscreen('below');
+      else setOffscreen(null);
+    };
+    measure();
+    window.addEventListener('resize', measure);
+    return () => window.removeEventListener('resize', measure);
+  }, [position, dragPosition, mode]);
+
+  const scrollToPopover = useCallback(() => {
+    anchorEl?.scrollIntoView({ block: 'center', behavior: 'smooth' });
+  }, [anchorEl]);
+
+  // Focus the textarea when it mounts (initial open and popover/dialog switches).
+  // A ref callback rather than a mount effect: in popover mode the textarea only
+  // renders after `position` is measured, and WebKit fires 0ms timers ahead of
+  // that commit, so an effect keyed on mode alone can run before the textarea
+  // exists and never focus it (e.g. in WKWebView hosts like Glimpse).
+  const focusOnMountRef = useCallback((el: HTMLTextAreaElement | null) => {
+    textareaRef.current = el;
+    if (!el) return;
+    setTimeout(() => {
+      if (!el.isConnected) return;
+      el.focus();
+      el.selectionStart = el.selectionEnd = el.value.length;
     }, 0);
-    return () => clearTimeout(id);
-  }, [mode]);
+  }, []);
 
   // Click-outside for popover mode
   useEffect(() => {
@@ -92,6 +193,7 @@ export const CommentPopover: React.FC<CommentPopoverProps> = ({
       // Don't close if clicking inside a child portal (AttachmentsButton, ImageAnnotator, etc.)
       const el = target as HTMLElement;
       if (el.closest?.('[data-popover-layer]')) return;
+      if (hasUnsavedContentRef.current) return;
       onClose();
     };
 
@@ -100,10 +202,38 @@ export const CommentPopover: React.FC<CommentPopoverProps> = ({
   }, [mode, onClose]);
 
   const handleSubmit = useCallback(() => {
-    if (text.trim() || images.length > 0) {
-      onSubmit(text, images.length > 0 ? images : undefined);
+    const canSubmitEmpty = allowEmptySubmit && initialText.trim().length > 0;
+    if (hasUnsavedContent || canSubmitEmpty) {
+      if (draftKey) draftStore.delete(draftKey);
+      onSubmit(text, allowImages && images.length > 0 ? images : undefined);
     }
-  }, [text, images, onSubmit]);
+  }, [text, images, onSubmit, draftKey, allowImages, allowEmptySubmit, initialText, hasUnsavedContent]);
+
+  const handleAskAI = useCallback(async () => {
+    const question = text.trim();
+    if (!question || !onAskAI) {
+      textareaRef.current?.focus();
+      return;
+    }
+    let accepted: boolean | void;
+    try {
+      accepted = await onAskAI(question, askAIContext ?? {
+        kind: isGlobal ? 'general' : 'selection',
+        text: contextText,
+      });
+    } catch (error) {
+      console.error('Ask AI action failed:', error);
+      textareaRef.current?.focus();
+      return;
+    }
+    if (accepted === false) {
+      textareaRef.current?.focus();
+      return;
+    }
+    if (draftKey) draftStore.delete(draftKey);
+    onDraftChange?.('', allowImages ? [] : undefined);
+    onClose();
+  }, [allowImages, askAIContext, contextText, draftKey, isGlobal, onAskAI, onClose, onDraftChange, text]);
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === 'Escape') {
@@ -127,11 +257,14 @@ export const CommentPopover: React.FC<CommentPopoverProps> = ({
       ? `"${contextText.length > 50 ? contextText.slice(0, 50) + '...' : contextText}"`
       : 'Comment';
 
-  const canSubmit = text.trim().length > 0 || images.length > 0;
+  const canSubmit =
+    hasUnsavedContent ||
+    (allowEmptySubmit && initialText.trim().length > 0);
+  const canAskAI = !!onAskAI && !askAIDisabled && text.trim().length > 0;
 
   if (mode === 'dialog') {
     return createPortal(
-      <div className="fixed inset-0 z-[100] flex items-center justify-center p-4">
+      <div data-comment-popover="true" className="fixed inset-0 z-[100] flex items-center justify-center p-4">
         {/* Backdrop */}
         <div className="absolute inset-0 bg-background/80 backdrop-blur-sm" />
 
@@ -177,7 +310,7 @@ export const CommentPopover: React.FC<CommentPopoverProps> = ({
           {/* Textarea */}
           <div className="px-4 py-3 flex-1">
             <textarea
-              ref={textareaRef}
+              ref={focusOnMountRef}
               value={text}
               onChange={(e) => setText(e.target.value)}
               onKeyDown={handleKeyDown}
@@ -190,14 +323,27 @@ export const CommentPopover: React.FC<CommentPopoverProps> = ({
           {/* Footer */}
           <div className="flex items-center justify-between px-4 py-3 border-t border-border/50">
             <div className="flex items-center gap-2">
-              <AttachmentsButton
-                images={images}
-                onAdd={(img) => setImages((prev) => [...prev, img])}
-                onRemove={(path) => setImages((prev) => prev.filter((i) => i.path !== path))}
-                variant="inline"
-              />
+              {allowImages && (
+                <AttachmentsButton
+                  images={images}
+                  onAdd={(img) => setImages((prev) => [...prev, img])}
+                  onRemove={(path) => setImages((prev) => prev.filter((i) => i.path !== path))}
+                  variant="inline"
+                />
+              )}
             </div>
             <div className="flex items-center gap-3">
+              {onAskAI && (
+                <button
+                  onClick={handleAskAI}
+                  disabled={!canAskAI}
+                  className="inline-flex items-center gap-1 px-2 py-1.5 text-xs font-medium rounded-md text-muted-foreground hover:text-primary hover:bg-muted disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                  title={canAskAI ? 'Ask AI this question' : 'Type a question to ask AI'}
+                >
+                  <SparklesIcon className="w-3 h-3" />
+                  Ask AI
+                </button>
+              )}
               <span className="text-[10px] text-muted-foreground">{submitHint}</span>
               <button
                 onClick={handleSubmit}
@@ -218,18 +364,35 @@ export const CommentPopover: React.FC<CommentPopoverProps> = ({
   if (!position) return null;
 
   return createPortal(
-    <div
-      ref={popoverRef}
+    <>
+      {offscreen && (
+        <button
+          type="button"
+          data-popover-layer="true"
+          onClick={scrollToPopover}
+          title="Scroll back to your open comment"
+          className={`fixed left-1/2 -translate-x-1/2 z-[101] flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-popover border border-border shadow-lg text-xs text-muted-foreground hover:text-foreground transition-colors ${offscreen === 'above' ? 'top-3' : 'bottom-3'}`}
+        >
+          {offscreen === 'above' ? <ChevronUpIcon /> : <ChevronDownIcon />}
+          <span>Open comment</span>
+        </button>
+      )}
+      <div
+        ref={popoverRef}
+        data-comment-popover="true"
       className="fixed z-[100] bg-popover border border-border rounded-xl shadow-2xl flex flex-col"
-      style={{
-        top: position.top,
-        left: position.left,
-        width: position.width,
-        ...(position.flipAbove ? { transform: 'translateY(-100%)' } : {}),
-        animation: position.flipAbove
-          ? 'comment-popover-in-above 0.15s ease-out'
-          : 'comment-popover-in 0.15s ease-out',
-      }}
+      style={dragPosition
+        ? { top: dragPosition.top, left: dragPosition.left, width: position.width }
+        : {
+            top: position.top,
+            left: position.left,
+            width: position.width,
+            ...(position.flipAbove ? { transform: 'translateY(-100%)' } : {}),
+            animation: position.flipAbove
+              ? 'comment-popover-in-above 0.15s ease-out'
+              : 'comment-popover-in 0.15s ease-out',
+          }
+      }
       onPointerDown={(e) => e.stopPropagation()}
     >
       <style>{`
@@ -243,8 +406,8 @@ export const CommentPopover: React.FC<CommentPopoverProps> = ({
         }
       `}</style>
 
-      {/* Header */}
-      <div className="flex items-center justify-between px-3 py-2 border-b border-border/50">
+      {/* Header (draggable) */}
+      <div className="flex items-center justify-between px-3 py-2 border-b border-border/50" {...dragHandleProps}>
         <span className="text-xs text-muted-foreground truncate max-w-[260px]">
           {headerLabel}
         </span>
@@ -269,7 +432,7 @@ export const CommentPopover: React.FC<CommentPopoverProps> = ({
       {/* Textarea */}
       <div className="px-3 py-2">
         <textarea
-          ref={textareaRef}
+          ref={focusOnMountRef}
           value={text}
           onChange={(e) => setText(e.target.value)}
           onKeyDown={handleKeyDown}
@@ -282,14 +445,27 @@ export const CommentPopover: React.FC<CommentPopoverProps> = ({
       {/* Footer */}
       <div className="flex items-center justify-between px-3 py-2 border-t border-border/50">
         <div className="flex items-center gap-2">
-          <AttachmentsButton
-            images={images}
-            onAdd={(img) => setImages((prev) => [...prev, img])}
-            onRemove={(path) => setImages((prev) => prev.filter((i) => i.path !== path))}
-            variant="inline"
-          />
+          {allowImages && (
+            <AttachmentsButton
+              images={images}
+              onAdd={(img) => setImages((prev) => [...prev, img])}
+              onRemove={(path) => setImages((prev) => prev.filter((i) => i.path !== path))}
+              variant="inline"
+            />
+          )}
         </div>
         <div className="flex items-center gap-3">
+          {onAskAI && (
+            <button
+              onClick={handleAskAI}
+              disabled={!canAskAI}
+              className="inline-flex items-center gap-1 px-2 py-1.5 text-xs font-medium rounded-md text-muted-foreground hover:text-primary hover:bg-muted disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+              title={canAskAI ? 'Ask AI this question' : 'Type a question to ask AI'}
+            >
+              <SparklesIcon className="w-3 h-3" />
+              Ask AI
+            </button>
+          )}
           <span className="text-[10px] text-muted-foreground">{submitHint}</span>
           <button
             onClick={handleSubmit}
@@ -300,12 +476,25 @@ export const CommentPopover: React.FC<CommentPopoverProps> = ({
           </button>
         </div>
       </div>
-    </div>,
+      </div>
+    </>,
     document.body
   );
 };
 
 // Icons
+
+const ChevronUpIcon = () => (
+  <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+    <path strokeLinecap="round" strokeLinejoin="round" d="M4.5 15.75l7.5-7.5 7.5 7.5" />
+  </svg>
+);
+
+const ChevronDownIcon = () => (
+  <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+    <path strokeLinecap="round" strokeLinejoin="round" d="M19.5 8.25l-7.5 7.5-7.5-7.5" />
+  </svg>
+);
 
 const ExpandIcon = () => (
   <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>

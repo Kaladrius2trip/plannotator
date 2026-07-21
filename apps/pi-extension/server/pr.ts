@@ -6,17 +6,24 @@
 import { spawn } from "node:child_process";
 
 import {
+	type PRMetadata,
+	type PRRef,
+	type PRReviewFileComment,
+	type PRRuntime,
+	type PRStackTree,
+	type PRListItem,
+	parsePRUrl as parsePRUrlCore,
+} from "../generated/pr-types.js";
+import {
 	checkAuth as checkAuthCore,
 	fetchPRContext as fetchPRContextCore,
 	fetchPR as fetchPRCore,
 	fetchPRFileContent as fetchPRFileContentCore,
 	fetchPRViewedFiles as fetchPRViewedFilesCore,
+	fetchPRStack as fetchPRStackCore,
+	fetchPRList as fetchPRListCore,
 	getUser as getUserCore,
 	markPRFilesViewed as markPRFilesViewedCore,
-	type PRRef,
-	type PRReviewFileComment,
-	type PRRuntime,
-	parsePRUrl as parsePRUrlCore,
 	submitPRReview as submitPRReviewCore,
 } from "../generated/pr-provider.js";
 
@@ -58,6 +65,9 @@ const prRuntime: PRRuntime = {
 		});
 	},
 };
+
+/** The Node command runner, exported for non-PR CLI consumers (commit avatars). */
+export const prCommandRuntime: PRRuntime = prRuntime;
 
 export const parsePRUrl = parsePRUrlCore;
 export function checkPRAuth(ref: PRRef) {
@@ -103,4 +113,17 @@ export function markPRFilesViewed(
 	viewed: boolean,
 ): Promise<void> {
 	return markPRFilesViewedCore(prRuntime, ref, prNodeId, filePaths, viewed);
+}
+
+export function fetchPRStack(
+	ref: PRRef,
+	metadata: PRMetadata,
+): Promise<PRStackTree | null> {
+	return fetchPRStackCore(prRuntime, ref, metadata);
+}
+
+export function fetchPRList(
+	ref: PRRef,
+): Promise<PRListItem[]> {
+	return fetchPRListCore(prRuntime, ref);
 }

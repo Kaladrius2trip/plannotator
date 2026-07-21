@@ -5,8 +5,11 @@
  * Self-hosted instances are supported via the --hostname flag.
  */
 
-import type { PRRuntime, PRMetadata, PRContext, PRReviewFileComment, CommandResult } from "./pr-provider";
-import { encodeApiFilePath } from "./pr-provider";
+import { join } from "path";
+import { mkdirSync, writeFileSync } from "fs";
+import type { PRRuntime, PRMetadata, PRContext, PRReviewFileComment, CommandResult } from "./pr-types";
+import { encodeApiFilePath } from "./pr-types";
+import { getPlannotatorDataDir } from "./data-dir";
 
 // GitLab-specific MRRef shape (used internally)
 interface GlMRRef {
@@ -30,59 +33,57 @@ function apiArgs(host: string, endpoint: string, extra: string[] = []): string[]
   return args;
 }
 
-/** Build glab mr subcommand args with optional --hostname */
-function mrArgs(host: string, subcmd: string, iid: number, projectPath: string, extra: string[] = []): string[] {
-  const args = ["mr", subcmd, String(iid), "-R", projectPath, ...extra];
-  if (host !== "gitlab.com") {
-    args.push("--hostname", host);
-  }
-  return args;
+/** Shape of each entry from the GitLab merge_request diffs API */
+interface GitLabDiffEntry {
+  diff: string;
+  old_path: string;
+  new_path: string;
+  new_file: boolean;
+  deleted_file: boolean;
+  renamed_file: boolean;
+  /** Content withheld because the file's diff exceeds GitLab's size limits. Absent on older GitLab. */
+  too_large?: boolean | null;
+  /** Diff collapsed (content omitted from the response). Absent on older GitLab. */
+  collapsed?: boolean | null;
 }
 
+export { parsePaginatedArray } from "./cli-pagination";
+import { parsePaginatedArray } from "./cli-pagination";
+
 /**
- * Normalize glab mr diff output to standard git diff format.
+ * Reconstruct a unified patch from GitLab's merge_request diffs API response.
  *
- * glab outputs bare diffs:
- *   --- README.md
- *   +++ README.md
- *
- * The UI parser expects git-style:
- *   diff --git a/README.md b/README.md
- *   --- a/README.md
- *   +++ b/README.md
+ * Each entry has: { diff, old_path, new_path, new_file, deleted_file, renamed_file }
+ * We construct proper `diff --git` headers that the UI parser expects.
  */
-function normalizeGlabDiff(raw: string): string {
-  const lines = raw.split("\n");
-  const out: string[] = [];
+function reconstructPatch(diffs: GitLabDiffEntry[]): string {
+  const parts: string[] = [];
 
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    const nextLine = lines[i + 1];
+  for (const d of diffs) {
+    const aPath = d.new_file ? "/dev/null" : `a/${d.old_path}`;
+    const bPath = d.deleted_file ? "/dev/null" : `b/${d.new_path}`;
+    const displayOld = d.new_file ? d.new_path : d.old_path;
+    const displayNew = d.deleted_file ? d.old_path : d.new_path;
 
-    // Detect a file boundary: `--- <path>` followed by `+++ <path>`
-    if (
-      line.startsWith("--- ") && !line.startsWith("--- a/") &&
-      nextLine?.startsWith("+++ ") && !nextLine.startsWith("+++ b/")
-    ) {
-      const oldPath = line.slice(4).trim();
-      const newPath = nextLine.slice(4).trim();
-
-      // Handle new files (--- /dev/null) and deleted files (+++ /dev/null)
-      const aPath = oldPath === "/dev/null" ? "/dev/null" : `a/${oldPath}`;
-      const bPath = newPath === "/dev/null" ? "/dev/null" : `b/${newPath}`;
-      const displayOld = oldPath === "/dev/null" ? newPath : oldPath;
-      const displayNew = newPath === "/dev/null" ? oldPath : newPath;
-
-      out.push(`diff --git a/${displayOld} b/${displayNew}`);
-      out.push(`--- ${aPath}`);
-      out.push(`+++ ${bPath}`);
-      i++; // Skip the +++ line, we already handled it
-    } else {
-      out.push(line);
+    let header = `diff --git a/${displayOld} b/${displayNew}`;
+    if (d.renamed_file) {
+      // Diff parsers (e.g. Pierre's) key rename classification off the
+      // similarity line; the API doesn't expose the score, so emit 100% for
+      // pure renames (empty diff) and a synthetic <100% otherwise.
+      header += d.diff.trim() === "" ? "\nsimilarity index 100%" : "\nsimilarity index 99%";
+      header += `\nrename from ${d.old_path}\nrename to ${d.new_path}`;
     }
+    if (d.new_file) {
+      header += "\nnew file mode 100644";
+    }
+    if (d.deleted_file) {
+      header += "\ndeleted file mode 100644";
+    }
+
+    parts.push(`${header}\n--- ${aPath}\n+++ ${bPath}\n${d.diff}`);
   }
 
-  return out.join("\n");
+  return parts.join("");
 }
 
 // --- Auth ---
@@ -117,23 +118,42 @@ export async function getGlUser(runtime: PRRuntime, host: string): Promise<strin
 
 // --- Fetch MR ---
 
+/**
+ * True when a JSON diffs-API entry should carry diff content but doesn't.
+ *
+ * Modern GitLab marks withheld content explicitly per entry (`too_large`,
+ * `collapsed`) — authoritative both ways: a too-large ADDED file is caught
+ * (it would otherwise be indistinguishable from a legitimately empty new
+ * file), and binaries/empty files are never misflagged.
+ *
+ * Older GitLab (the same versions this JSON fallback exists for) omits the
+ * flags entirely; there an empty diff on a plain modification is the only
+ * reliable withheld signal — empty adds/deletes/renames stay exempt.
+ */
+function entryMissingContent(d: GitLabDiffEntry): boolean {
+  if (d.diff.trim() !== "") return false;
+  if (d.too_large || d.collapsed) return true;
+  // == null catches both absent (old GitLab) and explicit null (GitLab emits
+  // null for unknown on sibling fields like generated_file) — either way the
+  // flags are inconclusive and the heuristic must decide.
+  if (d.too_large == null && d.collapsed == null) {
+    return !d.renamed_file && !d.new_file && !d.deleted_file;
+  }
+  return false;
+}
+
 export async function fetchGlMR(
   runtime: PRRuntime,
   ref: GlMRRef,
-): Promise<{ metadata: PRMetadata; rawPatch: string }> {
+): Promise<{ metadata: PRMetadata; rawPatch: string; patchIncomplete?: boolean }> {
   const encoded = encodeProject(ref.projectPath);
 
-  // Fetch diff and metadata in parallel
+  // Primary: raw_diffs — preserves Git's binary-marker shape and includes
+  // collapsed/generated file contents that the JSON diffs API can omit.
   const [diffResult, viewResult] = await Promise.all([
-    runtime.runCommand("glab", mrArgs(ref.host, "diff", ref.iid, ref.projectPath)),
+    runtime.runCommand("glab", apiArgs(ref.host, `projects/${encoded}/merge_requests/${ref.iid}/raw_diffs`)),
     runtime.runCommand("glab", apiArgs(ref.host, `projects/${encoded}/merge_requests/${ref.iid}`)),
   ]);
-
-  if (diffResult.exitCode !== 0) {
-    throw new Error(
-      `Failed to fetch MR diff: ${diffResult.stderr.trim() || `exit code ${diffResult.exitCode}`}`,
-    );
-  }
 
   if (viewResult.exitCode !== 0) {
     throw new Error(
@@ -141,15 +161,46 @@ export async function fetchGlMR(
     );
   }
 
-  // glab mr diff outputs bare diffs (--- file / +++ file) without git-style headers.
-  // Normalize to standard `diff --git a/path b/path` format that the UI parser expects.
-  const rawPatch = normalizeGlabDiff(diffResult.stdout);
+  // Fall back to the paginated JSON diffs API when raw_diffs is unavailable
+  // (older self-hosted GitLab that doesn't expose the raw_diffs endpoint) or
+  // returns empty (very large MRs that exceed its safety limit). Reconstruct a
+  // unified patch from the JSON entries — the long-standing pre-raw_diffs path.
+  let rawPatch: string;
+  let patchIncomplete = false;
+  if (diffResult.exitCode === 0 && diffResult.stdout.trim()) {
+    rawPatch = diffResult.stdout;
+  } else {
+    const fallback = await runtime.runCommand(
+      "glab",
+      apiArgs(ref.host, `projects/${encoded}/merge_requests/${ref.iid}/diffs?per_page=100`, ["--paginate"]),
+    );
+    if (fallback.exitCode !== 0) {
+      const rawErr = diffResult.stderr.trim() || `exit code ${diffResult.exitCode}`;
+      const fbErr = fallback.stderr.trim() || `exit code ${fallback.exitCode}`;
+      throw new Error(`Failed to fetch MR diff (raw_diffs: ${rawErr}; diffs: ${fbErr}).`);
+    }
+    const entries = parsePaginatedArray<GitLabDiffEntry>(fallback.stdout);
+    rawPatch = reconstructPatch(entries);
+    if (!rawPatch.trim()) {
+      throw new Error(
+        "MR diff is empty — the diff may be too large to fetch via the GitLab API. Review it on the GitLab web UI.",
+      );
+    }
+    const missingContent = entries.filter(entryMissingContent).length;
+    if (missingContent > 0) {
+      console.error(
+        `Warning: GitLab omitted diff content for ${missingContent} file(s) (MR too large). They appear in the review without hunks; the full diff can be recomputed locally once the checkout is ready.`,
+      );
+      patchIncomplete = true;
+    }
+  }
 
   const raw = JSON.parse(viewResult.stdout) as {
     title: string;
     author: { username: string };
     source_branch: string;
     target_branch: string;
+    target_project_id?: number;
     diff_refs: { base_sha: string; head_sha: string; start_sha: string } | null;
     web_url: string;
   };
@@ -157,6 +208,18 @@ export async function fetchGlMR(
   if (!raw.diff_refs) {
     throw new Error("MR has no diff refs — it may have been merged or the source branch deleted.");
   }
+
+  let defaultBranch: string | undefined;
+  const projectEndpoint = typeof raw.target_project_id === "number"
+    ? `projects/${raw.target_project_id}`
+    : `projects/${encoded}`;
+  try {
+    const projectResult = await runtime.runCommand("glab", apiArgs(ref.host, projectEndpoint));
+    if (projectResult.exitCode === 0 && projectResult.stdout.trim()) {
+      const project = JSON.parse(projectResult.stdout) as { default_branch?: string };
+      defaultBranch = project.default_branch;
+    }
+  } catch { /* default branch is best-effort metadata */ }
 
   const metadata: PRMetadata = {
     platform: "gitlab",
@@ -167,15 +230,36 @@ export async function fetchGlMR(
     author: raw.author.username,
     baseBranch: raw.target_branch,
     headBranch: raw.source_branch,
+    defaultBranch,
     baseSha: raw.diff_refs.base_sha,
     headSha: raw.diff_refs.head_sha,
     url: raw.web_url,
   };
 
-  return { metadata, rawPatch };
+  return { metadata, rawPatch, ...(patchIncomplete && { patchIncomplete }) };
 }
 
 // --- MR Context ---
+
+/**
+ * Best-effort GitLab bot detection. GitLab's note/approval user objects don't
+ * reliably carry a `bot` flag (unlike GitHub's `__typename`), so check it when
+ * present and otherwise fall back to the username conventions GitLab uses for
+ * automation accounts: project/group access-token bots (`project_<id>_bot…`,
+ * `group_<id>_bot…`), a `_bot`/`[bot]` suffix, and the `ghost` placeholder.
+ * Conservative on purpose — better to miss a bot than hide a real person.
+ */
+function isGitlabBot(user: any): boolean {
+  if (!user) return false;
+  if (user.bot === true) return true;
+  const name = String(user.username ?? "").toLowerCase();
+  return (
+    /^(project|group)_\d+_bot/.test(name) ||
+    name.endsWith("_bot") ||
+    name.endsWith("[bot]") ||
+    name === "ghost"
+  );
+}
 
 export async function fetchGlMRContext(
   runtime: PRRuntime,
@@ -185,9 +269,10 @@ export async function fetchGlMRContext(
   const mrEndpoint = `projects/${encoded}/merge_requests/${ref.iid}`;
 
   // Fetch all context in parallel
-  const [mrResult, notesResult, approvalsResult, pipelinesResult, issuesResult] = await Promise.all([
+  const [mrResult, notesResult, discussionsResult, approvalsResult, pipelinesResult, issuesResult] = await Promise.all([
     runtime.runCommand("glab", apiArgs(ref.host, mrEndpoint)),
-    runtime.runCommand("glab", apiArgs(ref.host, `${mrEndpoint}/notes?sort=asc&per_page=100`)),
+    runtime.runCommand("glab", apiArgs(ref.host, `${mrEndpoint}/notes?sort=asc&per_page=100`, ["--paginate"])),
+    runtime.runCommand("glab", apiArgs(ref.host, `${mrEndpoint}/discussions?per_page=100`, ["--paginate"])),
     runtime.runCommand("glab", apiArgs(ref.host, `${mrEndpoint}/approvals`)),
     runtime.runCommand("glab", apiArgs(ref.host, `${mrEndpoint}/pipelines?per_page=5`)),
     runtime.runCommand("glab", apiArgs(ref.host, `${mrEndpoint}/closes_issues`)),
@@ -195,11 +280,31 @@ export async function fetchGlMRContext(
 
   const str = (v: unknown): string => (typeof v === "string" ? v : "");
   const arr = (v: unknown): unknown[] => (Array.isArray(v) ? v : []);
+  // GitLab returns avatar URLs that are absolute on gitlab.com but often
+  // relative (`/uploads/...`) on self-hosted instances. A relative URL would
+  // resolve against our local server, not the GitLab host, so make it absolute.
+  const resolveAvatar = (v: unknown): string | undefined => {
+    const s = str(v);
+    if (!s) return undefined;
+    return s.startsWith("/") ? `https://${ref.host}${s}` : s;
+  };
 
   // --- MR details ---
-  let mr: Record<string, unknown> = {};
-  if (mrResult.exitCode === 0) {
-    try { mr = JSON.parse(mrResult.stdout); } catch { /* non-JSON response */ }
+  if (mrResult.exitCode !== 0) {
+    throw new Error(
+      `Failed to fetch MR context: ${mrResult.stderr.trim() || `exit code ${mrResult.exitCode}`}`,
+    );
+  }
+
+  let mr: Record<string, unknown>;
+  try {
+    const parsed: unknown = JSON.parse(mrResult.stdout);
+    if (!isRecord(parsed)) {
+      throw new Error("non-object MR response");
+    }
+    mr = parsed;
+  } catch {
+    throw new Error("Failed to fetch MR context: invalid MR response");
   }
 
   // Normalize state: GitLab uses "opened"/"closed"/"merged" → uppercase
@@ -243,19 +348,86 @@ export async function fetchGlMRContext(
     ? (mergeStateMap[detailedStatus] ?? detailedStatus.toUpperCase())
     : mergeable;
 
+  // --- Discussions (inline review threads) ---
+  const reviewThreads: PRContext["reviewThreads"] = [];
+  const discussionNoteIds = new Set<string>();
+  if (discussionsResult.exitCode === 0) {
+    try {
+      const parsed: unknown = parsePaginatedArray<unknown>(discussionsResult.stdout);
+      if (Array.isArray(parsed)) {
+        for (const rawDiscussion of parsed) {
+          if (!isRecord(rawDiscussion) || rawDiscussion.individual_note === true) continue;
+          const rawDiscussionNotes = Array.isArray(rawDiscussion.notes)
+            ? rawDiscussion.notes.filter(isRecord)
+            : [];
+          const visibleNotes = rawDiscussionNotes.filter((note) => note.system !== true);
+          const positionNote = visibleNotes.find((note) => isRecord(note.position));
+          const resolvableNotes = visibleNotes.filter((note) => note.resolvable === true);
+          if (positionNote === undefined && resolvableNotes.length === 0) continue;
+
+          const position = positionNote && isRecord(positionNote.position)
+            ? positionNote.position
+            : null;
+          const lineRange = position && isRecord(position.line_range) ? position.line_range : null;
+          const rangeStart = lineRange && isRecord(lineRange.start) ? lineRange.start : null;
+          const newLine = position ? numberValue(position.new_line) : null;
+          const oldLine = position ? numberValue(position.old_line) : null;
+          const startNewLine = rangeStart ? numberValue(rangeStart.new_line) : null;
+          const startOldLine = rangeStart ? numberValue(rangeStart.old_line) : null;
+          const comments = visibleNotes.map((note) => {
+            const id = stringValue(note.id);
+            if (id !== "") discussionNoteIds.add(id);
+            const author = isRecord(note.author) ? note.author : null;
+            const avatarUrl = resolveAvatar(author?.avatar_url);
+            const fallbackUrl = `${str(mr.web_url)}#note_${id}`;
+            return {
+              id,
+              author: str(author?.username),
+              ...(avatarUrl ? { avatarUrl } : {}),
+              ...(isGitlabBot(author) ? { isBot: true } : {}),
+              body: str(note.body),
+              createdAt: str(note.created_at),
+              url: str(note.web_url) || fallbackUrl,
+            };
+          });
+          if (comments.length === 0) continue;
+
+          reviewThreads.push({
+            id: stringValue(rawDiscussion.id),
+            isResolved: resolvableNotes.length > 0
+              && resolvableNotes.every((note) => note.resolved === true),
+            // GitLab does not expose an isOutdated equivalent on discussions.
+            isOutdated: false,
+            path: position ? str(position.new_path) || str(position.old_path) : "",
+            line: newLine ?? oldLine,
+            startLine: startNewLine ?? startOldLine,
+            diffSide: newLine !== null ? "RIGHT" : oldLine !== null ? "LEFT" : null,
+            comments,
+          });
+        }
+      }
+    } catch { /* non-JSON response */ }
+  }
+
   // --- Notes (comments) ---
   const notes: PRContext["comments"] = [];
   if (notesResult.exitCode === 0) {
     try {
-      const rawNotes = JSON.parse(notesResult.stdout) as any[];
-      for (const n of rawNotes) {
-        if (n.system) continue;
+      const rawNotes = parsePaginatedArray<unknown>(notesResult.stdout);
+      for (const rawNote of rawNotes) {
+        if (!isRecord(rawNote)) continue;
+        const id = stringValue(rawNote.id);
+        if (rawNote.system === true || discussionNoteIds.has(id)) continue;
+        const author = isRecord(rawNote.author) ? rawNote.author : null;
+        const avatarUrl = resolveAvatar(author?.avatar_url);
         notes.push({
-          id: String(n.id ?? ""),
-          author: str(n.author?.username),
-          body: str(n.body),
-          createdAt: str(n.created_at),
-          url: str(n.web_url) || "",
+          id,
+          author: str(author?.username),
+          ...(avatarUrl ? { avatarUrl } : {}),
+          ...(isGitlabBot(author) ? { isBot: true } : {}),
+          body: str(rawNote.body),
+          createdAt: str(rawNote.created_at),
+          url: str(rawNote.web_url) || "",
         });
       }
     } catch { /* non-JSON response */ }
@@ -274,9 +446,12 @@ export async function fetchGlMRContext(
       for (const a of approvedBy) {
         const user = (a as any)?.user;
         if (!user) continue;
+        const avatarUrl = resolveAvatar(user.avatar_url);
         reviews.push({
           id: String(user.id ?? ""),
           author: str(user.username),
+          ...(avatarUrl ? { avatarUrl } : {}),
+          ...(isGitlabBot(user) ? { isBot: true } : {}),
           state: "APPROVED",
           body: "",
           submittedAt: "",
@@ -350,9 +525,22 @@ export async function fetchGlMRContext(
     mergeStateStatus,
     comments: notes,
     reviews,
+    reviewThreads,
     checks,
     linkedIssues,
   };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function stringValue(value: unknown): string {
+  return typeof value === "string" || typeof value === "number" ? String(value) : "";
+}
+
+function numberValue(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
 // --- File Content ---
@@ -488,13 +676,42 @@ export async function submitGlMRReview(
       }
     }
 
-    if (errors.length > 0 && errors.length === fileComments.length) {
-      // All failed — throw
-      throw new Error(`Failed to post inline comments:\n${errors.join("\n")}`);
-    }
-    // Partial failures: some comments posted, some didn't — log but don't throw
     if (errors.length > 0) {
-      console.error(`Warning: ${errors.length}/${fileComments.length} inline comments failed:\n${errors.join("\n")}`);
+      // Persist unposted bodies to disk so the work survives transient GitLab errors.
+      // We keep the original throw-vs-warn split intentionally:
+      //  - all-fail → throw (nothing was posted, caller retries from clean state)
+      //  - partial-fail → warn only (some discussions + the MR note are already on
+      //    the server; throwing would have the client re-submit the whole review
+      //    and create duplicates).
+      const failed = results
+        .map((r, i) => (r.status === "rejected" ? fileComments[i] : null))
+        .filter((c): c is PRReviewFileComment => c !== null);
+      let savedTo: string | null = null;
+      try {
+        const dir = join(getPlannotatorDataDir(), "failed-comments");
+        mkdirSync(dir, { recursive: true });
+        const slug = `${ref.host}-${ref.projectPath.replace(/\//g, "_")}-mr${ref.iid}-${Date.now()}`;
+        savedTo = join(dir, `${slug}.json`);
+        writeFileSync(
+          savedTo,
+          JSON.stringify({ ref, headSha, baseSha, startSha, errors, failedComments: failed }, null, 2),
+        );
+      } catch (writeErr) {
+        console.error(`[plannotator] Failed to persist unposted comments: ${writeErr instanceof Error ? writeErr.message : String(writeErr)}`);
+      }
+      const suffix = savedTo ? ` (unposted bodies saved to ${savedTo})` : "";
+
+      if (errors.length === fileComments.length) {
+        // All failed — safe to throw, nothing was posted.
+        throw new Error(
+          `Failed to post inline comments${suffix}:\n${errors.join("\n")}`,
+        );
+      }
+      // Partial failure — some comments and the MR note are already posted.
+      // Don't throw, or the UI will resubmit the whole review and duplicate them.
+      console.error(
+        `[plannotator] ${errors.length}/${fileComments.length} inline comments failed${suffix}:\n${errors.join("\n")}`,
+      );
     }
   }
 

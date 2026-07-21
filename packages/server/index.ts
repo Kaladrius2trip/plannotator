@@ -4,13 +4,17 @@
  * Provides a consistent server implementation for both Claude Code and OpenCode plugins.
  *
  * Environment variables:
- *   PLANNOTATOR_REMOTE - Set to "1" or "true" for remote/devcontainer mode
- *   PLANNOTATOR_PORT   - Fixed port to use (default: random locally, 19432 for remote)
- *   PLANNOTATOR_ORIGIN - Origin identifier ("claude-code" or "opencode")
+ *   PLANNOTATOR_REMOTE - Set to "1"/"true" for remote, "0"/"false" for local
+ *   PLANNOTATOR_PORT   - Fixed port or inclusive range (default: random locally, 19432 for remote)
+ *   PLANNOTATOR_ORIGIN - Explicit origin override; validated against AGENT_CONFIG
+ *                        in packages/shared/agents.ts. Supported values:
+ *                        "claude-code", "opencode", "codex", "copilot-cli",
+ *                        "gemini-cli", "pi".
  */
 
+import type { Origin } from "@plannotator/shared/agents";
 import { resolve } from "path";
-import { isRemoteSession, getServerPort } from "./remote";
+import { isRemoteSession, getServerHostname, startBunServerOnAvailablePort } from "./remote";
 import { openEditorDiff } from "./ide";
 import {
   saveToObsidian,
@@ -37,28 +41,19 @@ import {
 } from "./storage";
 import { getRepoInfo } from "./repo";
 import { detectProjectName } from "./project";
-import { saveConfig, detectGitUser, getServerConfig } from "./config";
-import {
-  handleImage,
-  handleUpload,
-  handleAgents,
-  handleServerReady,
-  handleDraftSave,
-  handleDraftLoad,
-  handleDraftDelete,
-  handleFavicon,
-  type OpencodeClient,
-} from "./shared-handlers";
+import { loadConfig, saveConfig, detectGitUser, getServerConfig } from "./config";
+import { readImprovementHook, getImprovementHookExpectedPath } from "@plannotator/shared/improvement-hooks";
+import { composeImproveContext } from "@plannotator/shared/pfm-reminder";
+import { handleImage, handleUpload, handleAgents, handleServerReady, handleDraftSave, handleDraftLoad, handleDraftDelete, handleApiNotFound, handleFavicon, handleSaveNotes, readDraftGenerationFromBody, type OpencodeClient } from "./shared-handlers";
 import { contentHash, deleteDraft } from "./draft";
-import {
-  handleDoc,
-  handleObsidianVaults,
-  handleObsidianFiles,
-  handleObsidianDoc,
-  handleFileBrowserFiles,
-} from "./reference-handlers";
+import { handleDoc, handleDocExists, handleObsidianVaults, handleObsidianFiles, handleObsidianDoc, handleFileBrowserFiles } from "./reference-handlers";
+import { handleFileBrowserFilesStream } from "./reference-watch";
+import { warmFileListCache } from "@plannotator/shared/resolve-file";
 import { createEditorAnnotationHandler } from "./editor-annotations";
+import { createExternalAnnotationHandler } from "./external-annotations";
 import { isWSL } from "./browser";
+import { AI_QUERY_ENDPOINT, createAIRuntime } from "./ai-runtime";
+import { isAIEndpointPath, type AIEndpoints } from "@plannotator/ai";
 
 // Re-export utilities
 export { isRemoteSession, getServerPort } from "./remote";
@@ -66,10 +61,7 @@ export { openBrowser } from "./browser";
 export * from "./integrations";
 export * from "./storage";
 export { handleServerReady } from "./shared-handlers";
-export {
-  type VaultNode,
-  buildFileTree,
-} from "@plannotator/shared/reference-common";
+export { type VaultNode, buildFileTree } from "@plannotator/shared/reference-common";
 
 // --- Types ---
 
@@ -77,7 +69,7 @@ export interface ServerOptions {
   /** The plan markdown content */
   plan: string;
   /** Origin identifier (e.g., "claude-code", "opencode") */
-  origin: string;
+  origin: Origin;
   /** HTML content to serve for the UI */
   htmlContent: string;
   /** Current permission mode to preserve (Claude Code only) */
@@ -89,15 +81,13 @@ export interface ServerOptions {
   /** Base URL of the paste service API for short URL sharing */
   pasteApiUrl?: string;
   /** Called when server starts with the URL, remote status, and port */
-  onReady?: (url: string, isRemote: boolean, port: number) => void;
+  onReady?: (url: string, isRemote: boolean, port: number) => void | Promise<void>;
   /** OpenCode client for querying available agents (OpenCode only) */
   opencodeClient?: OpencodeClient;
   /** When set to "archive", server runs in read-only archive browser mode */
   mode?: "archive";
   /** Custom plan save path — used by archive mode to find saved plans */
   customPlanPath?: string | null;
-  /** AFK auto-approve countdown seconds shown in client popup (0 = disabled) */
-  afkSeconds?: number;
 }
 
 export interface ServerResult {
@@ -114,20 +104,14 @@ export interface ServerResult {
     savedPath?: string;
     agentSwitch?: string;
     permissionMode?: string;
-    saveOnly?: boolean;
   }>;
-  /** Resolves when the browser first loads the page */
-  waitForViewing: () => Promise<void>;
   /** Wait for user to close (archive mode only) */
   waitForDone?: () => Promise<void>;
-  /** Stop the server */
-  stop: () => void;
+  /** Stop the server and close active browser connections. */
+  stop: () => Promise<void>;
 }
 
 // --- Server Implementation ---
-
-const MAX_RETRIES = 5;
-const RETRY_DELAY_MS = 500;
 
 /**
  * Start the Plannotator server
@@ -139,23 +123,11 @@ const RETRY_DELAY_MS = 500;
  * - Port conflict retries
  */
 export async function startPlannotatorServer(
-  options: ServerOptions,
+  options: ServerOptions
 ): Promise<ServerResult> {
-  const {
-    plan,
-    origin,
-    htmlContent,
-    permissionMode,
-    sharingEnabled = true,
-    shareBaseUrl,
-    pasteApiUrl,
-    onReady,
-    mode,
-    customPlanPath,
-  } = options;
+  const { plan, origin, htmlContent, permissionMode, sharingEnabled = true, shareBaseUrl, pasteApiUrl, onReady, mode, customPlanPath } = options;
 
   const isRemote = isRemoteSession();
-  const configuredPort = getServerPort();
   const wslFlag = await isWSL();
   const gitUser = detectGitUser();
 
@@ -167,22 +139,17 @@ export async function startPlannotatorServer(
 
   if (mode === "archive") {
     archivePlans = listArchivedPlans(customPlanPath ?? undefined);
-    initialArchivePlan =
-      archivePlans.length > 0
-        ? (readArchivedPlan(
-            archivePlans[0].filename,
-            customPlanPath ?? undefined,
-          ) ?? "")
-        : "";
-    donePromise = new Promise<void>((resolve) => {
-      resolveDone = resolve;
-    });
+    initialArchivePlan = archivePlans.length > 0
+      ? readArchivedPlan(archivePlans[0].filename, customPlanPath ?? undefined) ?? ""
+      : "";
+    donePromise = new Promise<void>((resolve) => { resolveDone = resolve; });
   }
 
   // --- Plan review mode setup (skip in archive mode) ---
   const draftKey = mode !== "archive" ? contentHash(plan) : "";
-  const editorAnnotations =
-    mode !== "archive" ? createEditorAnnotationHandler() : null;
+  const editorAnnotations = mode !== "archive" ? createEditorAnnotationHandler() : null;
+  const externalAnnotations = mode !== "archive" ? createExternalAnnotationHandler("plan") : null;
+  const aiRuntime = mode !== "archive" ? await createAIRuntime() : null;
   const slug = mode !== "archive" ? generateSlug(plan) : "";
 
   // Lazy cache for in-session archive browsing (plan review sidebar tab)
@@ -201,7 +168,6 @@ export async function startPlannotatorServer(
     savedPath?: string;
     agentSwitch?: string;
     permissionMode?: string;
-    saveOnly?: boolean;
   }) => void;
   let decisionPromise: Promise<{
     approved: boolean;
@@ -209,7 +175,6 @@ export async function startPlannotatorServer(
     savedPath?: string;
     agentSwitch?: string;
     permissionMode?: string;
-    saveOnly?: boolean;
   }>;
 
   if (mode !== "archive") {
@@ -235,21 +200,15 @@ export async function startPlannotatorServer(
     decisionPromise = new Promise(() => {});
   }
 
-  let resolveViewing: () => void;
-  const viewingPromise = new Promise<void>((resolve) => {
-    resolveViewing = resolve;
-  });
-  let viewed = false;
+  const server = await startBunServerOnAvailablePort((port) =>
+    Bun.serve({
+        hostname: getServerHostname(),
+        port,
+        // Bun's default 10s idleTimeout kills AI SSE streams that stall
+        // between bytes (e.g. while a permission prompt waits on the user).
+        idleTimeout: 0,
 
-  // Start server with retry logic
-  let server: ReturnType<typeof Bun.serve> | null = null;
-
-  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
-    try {
-      server = Bun.serve({
-        port: configuredPort,
-
-        async fetch(req) {
+        async fetch(req, server) {
           const url = new URL(req.url);
 
           // API: Get a specific plan version from history
@@ -264,10 +223,7 @@ export async function startPlannotatorServer(
             }
             const content = getPlanVersion(project, slug, v);
             if (content === null) {
-              return Response.json(
-                { error: "Version not found" },
-                { status: 404 },
-              );
+              return Response.json({ error: "Version not found" }, { status: 404 });
             }
             return Response.json({ plan: content, version: v });
           }
@@ -285,8 +241,7 @@ export async function startPlannotatorServer(
           // Cached for session lifetime — new plans won't appear during a single review
           if (url.pathname === "/api/archive/plans" && req.method === "GET") {
             const customPath = url.searchParams.get("customPath") || undefined;
-            if (!cachedArchivePlans)
-              cachedArchivePlans = listArchivedPlans(customPath);
+            if (!cachedArchivePlans) cachedArchivePlans = listArchivedPlans(customPath);
             return Response.json({ plans: cachedArchivePlans });
           }
 
@@ -294,18 +249,12 @@ export async function startPlannotatorServer(
           if (url.pathname === "/api/archive/plan" && req.method === "GET") {
             const filename = url.searchParams.get("filename");
             if (!filename) {
-              return Response.json(
-                { error: "Missing filename parameter" },
-                { status: 400 },
-              );
+              return Response.json({ error: "Missing filename parameter" }, { status: 400 });
             }
             const customPath = url.searchParams.get("customPath") || undefined;
             const content = readArchivedPlan(filename, customPath);
             if (content === null) {
-              return Response.json(
-                { error: "Plan not found" },
-                { status: 404 },
-              );
+              return Response.json({ error: "Plan not found" }, { status: 404 });
             }
             return Response.json({ markdown: content, filepath: filename });
           }
@@ -330,21 +279,7 @@ export async function startPlannotatorServer(
                 serverConfig: getServerConfig(gitUser),
               });
             }
-            return Response.json({
-              plan,
-              origin,
-              permissionMode,
-              sharingEnabled,
-              shareBaseUrl,
-              pasteApiUrl,
-              repoInfo,
-              previousPlan,
-              versionInfo,
-              projectRoot: process.cwd(),
-              isWSL: wslFlag,
-              serverConfig: getServerConfig(gitUser),
-              afkSeconds: options.afkSeconds,
-            });
+            return Response.json({ plan, origin, permissionMode, sharingEnabled, shareBaseUrl, pasteApiUrl, repoInfo, previousPlan, versionInfo, projectRoot: process.cwd(), isWSL: wslFlag, serverConfig: getServerConfig(gitUser) });
           }
 
           // API: Serve a linked markdown document
@@ -352,19 +287,46 @@ export async function startPlannotatorServer(
             return handleDoc(req);
           }
 
+          // API: Batch existence check for code-file paths the renderer detected
+          if (url.pathname === "/api/doc/exists" && req.method === "POST") {
+            return handleDocExists(req);
+          }
+
+          // API: Hook status for the Settings Hooks tab
+          if (url.pathname === "/api/hooks/status" && req.method === "GET") {
+            const config = loadConfig();
+            const hook = readImprovementHook("enterplanmode-improve");
+            const pfmEnabled = config.pfmReminder === true;
+            const composed = composeImproveContext({
+              pfmEnabled,
+              improvementHookContent: hook?.content ?? null,
+            });
+            return Response.json({
+              pfmReminder: { enabled: pfmEnabled },
+              improvementHook: {
+                present: !!hook,
+                filePath: hook?.filePath ?? getImprovementHookExpectedPath("enterplanmode-improve"),
+                fileSize: hook?.content?.length ?? null,
+                content: hook?.content ?? null,
+              },
+              composedLength: composed?.length ?? null,
+            });
+          }
+
           // API: Update user config (write-back to ~/.plannotator/config.json)
           if (url.pathname === "/api/config" && req.method === "POST") {
             try {
-              const body = (await req.json()) as { displayName?: string };
-              if (body.displayName !== undefined) {
-                saveConfig({ displayName: body.displayName });
-              }
+              const body = (await req.json()) as { displayName?: string; diffOptions?: Record<string, unknown>; conventionalComments?: boolean; conventionalLabels?: unknown[] | null; pfmReminder?: boolean };
+              const toSave: Record<string, unknown> = {};
+              if (body.displayName !== undefined) toSave.displayName = body.displayName;
+              if (body.diffOptions !== undefined) toSave.diffOptions = body.diffOptions;
+              if (body.conventionalComments !== undefined) toSave.conventionalComments = body.conventionalComments;
+              if (body.conventionalLabels !== undefined) toSave.conventionalLabels = body.conventionalLabels;
+              if (body.pfmReminder !== undefined) toSave.pfmReminder = body.pfmReminder;
+              if (Object.keys(toSave).length > 0) saveConfig(toSave as Parameters<typeof saveConfig>[0]);
               return Response.json({ ok: true });
             } catch {
-              return Response.json(
-                { error: "Invalid request" },
-                { status: 400 },
-              );
+              return Response.json({ error: "Invalid request" }, { status: 400 });
             }
           }
 
@@ -379,30 +341,17 @@ export async function startPlannotatorServer(
           }
 
           // API: Open plan diff in VS Code
-          if (
-            url.pathname === "/api/plan/vscode-diff" &&
-            req.method === "POST"
-          ) {
+          if (url.pathname === "/api/plan/vscode-diff" && req.method === "POST") {
             try {
               const body = (await req.json()) as { baseVersion: number };
 
               if (!body.baseVersion) {
-                return Response.json(
-                  { error: "Missing baseVersion" },
-                  { status: 400 },
-                );
+                return Response.json({ error: "Missing baseVersion" }, { status: 400 });
               }
 
-              const basePath = getPlanVersionPath(
-                project,
-                slug,
-                body.baseVersion,
-              );
+              const basePath = getPlanVersionPath(project, slug, body.baseVersion);
               if (!basePath) {
-                return Response.json(
-                  { error: `Version ${body.baseVersion} not found` },
-                  { status: 404 },
-                );
+                return Response.json({ error: `Version ${body.baseVersion} not found` }, { status: 404 });
               }
 
               const result = await openEditorDiff(basePath, currentPlanPath);
@@ -411,10 +360,7 @@ export async function startPlannotatorServer(
               }
               return Response.json({ ok: true });
             } catch (err) {
-              const message =
-                err instanceof Error
-                  ? err.message
-                  : "Failed to open VS Code diff";
+              const message = err instanceof Error ? err.message : "Failed to open VS Code diff";
               return Response.json({ error: message }, { status: 500 });
             }
           }
@@ -425,24 +371,25 @@ export async function startPlannotatorServer(
           }
 
           // API: List Obsidian vault files as a tree
-          if (
-            url.pathname === "/api/reference/obsidian/files" &&
-            req.method === "GET"
-          ) {
+          if (url.pathname === "/api/reference/obsidian/files" && req.method === "GET") {
             return handleObsidianFiles(req);
           }
 
           // API: Read an Obsidian vault document
-          if (
-            url.pathname === "/api/reference/obsidian/doc" &&
-            req.method === "GET"
-          ) {
+          if (url.pathname === "/api/reference/obsidian/doc" && req.method === "GET") {
             return handleObsidianDoc(req);
           }
 
           // API: List markdown files in a directory as a tree
           if (url.pathname === "/api/reference/files" && req.method === "GET") {
             return handleFileBrowserFiles(req);
+          }
+
+          // API: Watch file browser roots and refresh the tree/status snapshot on changes
+          if (url.pathname === "/api/reference/files/stream" && req.method === "GET") {
+            return handleFileBrowserFilesStream(req, {
+              disableIdleTimeout: () => server.timeout(req, 0),
+            });
           }
 
           // API: Get available agents (OpenCode only)
@@ -453,7 +400,7 @@ export async function startPlannotatorServer(
           // API: Annotation draft persistence
           if (url.pathname === "/api/draft") {
             if (req.method === "POST") return handleDraftSave(req, draftKey);
-            if (req.method === "DELETE") return handleDraftDelete(draftKey);
+            if (req.method === "DELETE") return handleDraftDelete(draftKey, req);
             return handleDraftLoad(draftKey);
           }
 
@@ -461,57 +408,35 @@ export async function startPlannotatorServer(
           const editorResponse = await editorAnnotations?.handle(req, url);
           if (editorResponse) return editorResponse;
 
+          // API: External annotations (SSE-based, for any external tool)
+          const externalResponse = await externalAnnotations?.handle(req, url, {
+            disableIdleTimeout: () => server.timeout(req, 0),
+          });
+          if (externalResponse) return externalResponse;
+
+          if (url.pathname.startsWith("/api/ai/")) {
+            if (!aiRuntime) {
+              if (!isAIEndpointPath(url.pathname)) {
+                return handleApiNotFound(url.pathname);
+              }
+              if (url.pathname.slice("/api/ai/".length) === "capabilities" && req.method === "GET") {
+                return Response.json({ available: false, providers: [] });
+              }
+              return Response.json({ error: "AI backend not available" }, { status: 503 });
+            }
+            const handler = aiRuntime.endpoints[url.pathname as keyof AIEndpoints];
+            if (handler) {
+              if (url.pathname === AI_QUERY_ENDPOINT) {
+                server.timeout(req, 0);
+              }
+              return handler(req);
+            }
+            return handleApiNotFound(url.pathname);
+          }
+
           // API: Save to notes (decoupled from approve/deny)
           if (url.pathname === "/api/save-notes" && req.method === "POST") {
-            const results: {
-              obsidian?: IntegrationResult;
-              bear?: IntegrationResult;
-              octarine?: IntegrationResult;
-            } = {};
-
-            try {
-              const body = (await req.json()) as {
-                obsidian?: ObsidianConfig;
-                bear?: BearConfig;
-                octarine?: OctarineConfig;
-              };
-
-              // Run integrations in parallel — they're independent
-              const promises: Promise<void>[] = [];
-              if (body.obsidian?.vaultPath && body.obsidian?.plan) {
-                promises.push(
-                  saveToObsidian(body.obsidian).then((r) => {
-                    results.obsidian = r;
-                  }),
-                );
-              }
-              if (body.bear?.plan) {
-                promises.push(
-                  saveToBear(body.bear).then((r) => {
-                    results.bear = r;
-                  }),
-                );
-              }
-              if (body.octarine?.plan && body.octarine?.workspace) {
-                promises.push(
-                  saveToOctarine(body.octarine).then((r) => {
-                    results.octarine = r;
-                  }),
-                );
-              }
-              await Promise.allSettled(promises);
-
-              for (const [name, result] of Object.entries(results)) {
-                if (!result?.success && result) {
-                  console.error(`[${name}] Save failed: ${result.error}`);
-                }
-              }
-            } catch (err) {
-              console.error(`[Save Notes] Error:`, err);
-              return Response.json({ error: "Save failed" }, { status: 500 });
-            }
-
-            return Response.json({ ok: true, results });
+            return handleSaveNotes(req);
           }
 
           // API: Approve plan
@@ -522,7 +447,7 @@ export async function startPlannotatorServer(
             let requestedPermissionMode: string | undefined;
             let planSaveEnabled = true; // default to enabled for backwards compat
             let planSaveCustomPath: string | undefined;
-            let saveOnly = false;
+            let draftGeneration: number | undefined;
             try {
               const body = (await req.json().catch(() => ({}))) as {
                 obsidian?: ObsidianConfig;
@@ -532,8 +457,9 @@ export async function startPlannotatorServer(
                 agentSwitch?: string;
                 planSave?: { enabled: boolean; customPath?: string };
                 permissionMode?: string;
-                saveOnly?: boolean;
+                draftGeneration?: number;
               };
+              draftGeneration = readDraftGenerationFromBody(body);
 
               // Capture feedback if provided (for "approve with notes")
               if (body.feedback) {
@@ -556,31 +482,17 @@ export async function startPlannotatorServer(
                 planSaveCustomPath = body.planSave.customPath;
               }
 
-              if (body.saveOnly) saveOnly = true;
-
               // Run integrations in parallel — they're independent
               const integrationResults: Record<string, IntegrationResult> = {};
               const integrationPromises: Promise<void>[] = [];
               if (body.obsidian?.vaultPath && body.obsidian?.plan) {
-                integrationPromises.push(
-                  saveToObsidian(body.obsidian).then((r) => {
-                    integrationResults.obsidian = r;
-                  }),
-                );
+                integrationPromises.push(saveToObsidian(body.obsidian).then(r => { integrationResults.obsidian = r; }));
               }
               if (body.bear?.plan) {
-                integrationPromises.push(
-                  saveToBear(body.bear).then((r) => {
-                    integrationResults.bear = r;
-                  }),
-                );
+                integrationPromises.push(saveToBear(body.bear).then(r => { integrationResults.bear = r; }));
               }
               if (body.octarine?.plan && body.octarine?.workspace) {
-                integrationPromises.push(
-                  saveToOctarine(body.octarine).then((r) => {
-                    integrationResults.octarine = r;
-                  }),
-                );
+                integrationPromises.push(saveToOctarine(body.octarine).then(r => { integrationResults.octarine = r; }));
               }
               await Promise.allSettled(integrationPromises);
 
@@ -601,29 +513,15 @@ export async function startPlannotatorServer(
               if (annotations) {
                 saveAnnotations(slug, annotations, planSaveCustomPath);
               }
-              savedPath = saveFinalSnapshot(
-                slug,
-                "approved",
-                plan,
-                annotations,
-                planSaveCustomPath,
-              );
+              savedPath = saveFinalSnapshot(slug, "approved", plan, annotations, planSaveCustomPath);
             }
 
             // Clean up draft on successful submit
-            deleteDraft(draftKey);
+            deleteDraft(draftKey, draftGeneration);
 
             // Use permission mode from client request if provided, otherwise fall back to hook input
-            const effectivePermissionMode =
-              requestedPermissionMode || permissionMode;
-            resolveDecision({
-              approved: true,
-              feedback,
-              savedPath,
-              agentSwitch,
-              permissionMode: effectivePermissionMode,
-              saveOnly,
-            });
+            const effectivePermissionMode = requestedPermissionMode || permissionMode;
+            resolveDecision({ approved: true, feedback, savedPath, agentSwitch, permissionMode: effectivePermissionMode });
             return Response.json({ ok: true, savedPath });
           }
 
@@ -632,11 +530,14 @@ export async function startPlannotatorServer(
             let feedback = "Plan rejected by user";
             let planSaveEnabled = true; // default to enabled for backwards compat
             let planSaveCustomPath: string | undefined;
+            let draftGeneration: number | undefined;
             try {
               const body = (await req.json()) as {
                 feedback?: string;
                 planSave?: { enabled: boolean; customPath?: string };
+                draftGeneration?: number;
               };
+              draftGeneration = readDraftGenerationFromBody(body);
               feedback = body.feedback || feedback;
 
               // Capture plan save settings
@@ -652,66 +553,64 @@ export async function startPlannotatorServer(
             let savedPath: string | undefined;
             if (planSaveEnabled) {
               saveAnnotations(slug, feedback, planSaveCustomPath);
-              savedPath = saveFinalSnapshot(
-                slug,
-                "denied",
-                plan,
-                feedback,
-                planSaveCustomPath,
-              );
+              savedPath = saveFinalSnapshot(slug, "denied", plan, feedback, planSaveCustomPath);
             }
 
-            deleteDraft(draftKey);
+            deleteDraft(draftKey, draftGeneration);
             resolveDecision({ approved: false, feedback, savedPath });
             return Response.json({ ok: true, savedPath });
           }
 
           // Favicon
-          if (url.pathname === "/favicon.svg") return handleFavicon();
+          if (url.pathname === "/favicon.png") return handleFavicon();
 
-          if (!viewed) {
-            viewed = true;
-            resolveViewing();
+          // API 404 guard: unknown /api/* routes should return JSON, not HTML
+          if (url.pathname.startsWith("/api/")) {
+            return handleApiNotFound(url.pathname);
           }
+
+          // Serve embedded HTML for all other routes (SPA)
           return new Response(htmlContent, {
             headers: { "Content-Type": "text/html" },
           });
         },
-      });
 
-      break; // Success, exit retry loop
-    } catch (err: unknown) {
-      const isAddressInUse =
-        err instanceof Error && err.message.includes("EADDRINUSE");
-
-      if (isAddressInUse && attempt < MAX_RETRIES) {
-        await Bun.sleep(RETRY_DELAY_MS);
-        continue;
-      }
-
-      if (isAddressInUse) {
-        const hint = isRemote
-          ? " (set PLANNOTATOR_PORT to use different port)"
-          : "";
-        throw new Error(
-          `Port ${configuredPort} in use after ${MAX_RETRIES} retries${hint}`,
-        );
-      }
-
-      throw err;
-    }
-  }
-
-  if (!server) {
-    throw new Error("Failed to start server");
-  }
+        error(err) {
+          console.error("[plannotator] Server error:", err);
+          return new Response(
+            `Internal Server Error: ${err instanceof Error ? err.message : String(err)}`,
+            { status: 500, headers: { "Content-Type": "text/plain" } },
+          );
+        },
+    }),
+  );
 
   const port = server.port!;
   const serverUrl = `http://localhost:${port}`;
+  let stopPromise: Promise<void> | undefined;
+  const stop = () => {
+    stopPromise ??= (async () => {
+      try {
+        aiRuntime?.dispose();
+      } finally {
+        await server.stop(true);
+      }
+    })();
+    return stopPromise;
+  };
+
+  // The cache warm must never gate the listening socket. Its async filesystem
+  // walk yields between directories while requests remain serviceable.
+  void warmFileListCache(process.cwd(), "code");
 
   // Notify caller that server is ready
   if (onReady) {
-    onReady(serverUrl, isRemote, port);
+    try {
+      await onReady(serverUrl, isRemote, port);
+    } catch (error) {
+      await stop();
+      throw error;
+    }
   }
 
   return {
@@ -719,8 +618,7 @@ export async function startPlannotatorServer(
     url: serverUrl,
     isRemote,
     waitForDecision: () => decisionPromise,
-    waitForViewing: () => viewingPromise,
     ...(donePromise && { waitForDone: () => donePromise }),
-    stop: () => server.stop(),
+    stop,
   };
 }

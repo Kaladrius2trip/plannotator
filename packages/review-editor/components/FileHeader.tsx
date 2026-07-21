@@ -1,8 +1,16 @@
-import React, { useRef, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
+import { SemanticFileBadge } from './SemanticFileBadge';
+import { OpenInAppButton } from '@plannotator/ui/components/OpenInAppButton';
+import { useReviewStateOptional } from '../dock/ReviewStateContext';
+import type { DiffFileStatus } from '../types';
 
 interface FileHeaderProps {
   filePath: string;
   patch: string;
+  /** Change type — added/deleted/renamed get an icon; modified is undecorated. */
+  status?: DiffFileStatus;
+  /** Previous path for renames — rendered as "old → new" (diffshub treatment). */
+  oldPath?: string;
   isViewed?: boolean;
   onToggleViewed?: () => void;
   isStaged?: boolean;
@@ -11,12 +19,80 @@ interface FileHeaderProps {
   canStage?: boolean;
   stageError?: string | null;
   onFileComment?: (anchorEl: HTMLElement) => void;
+  /**
+   * Eager registration of the comment button element on mount/unmount (ref
+   * callback semantics: element on attach, null on detach). Lets keyboard
+   * shortcuts anchor the comment popover without the button ever being
+   * clicked. onFileComment alone only surfaces the element on click.
+   */
+  fileCommentButtonRef?: (el: HTMLButtonElement | null) => void;
+  collapseToggle?: React.ReactNode;
+  onCollapseToggle?: () => void;
+}
+
+function splitFilePath(filePath: string): { directory: string; name: string } {
+  const lastSlash = filePath.lastIndexOf('/');
+  if (lastSlash === -1) {
+    return { directory: '', name: filePath };
+  }
+
+  return {
+    directory: filePath.slice(0, lastSlash + 1),
+    name: filePath.slice(lastSlash + 1),
+  };
+}
+
+function frontEllipsize(text: string, visibleChars: number): string {
+  if (text.length <= visibleChars) return text;
+  return `...${text.slice(-visibleChars)}`;
+}
+
+/**
+ * Change-type letter shown to the right of the +/- counts (matches the file
+ * tree): A added · D deleted · R renamed, colored so the critical changes pop.
+ * Modified is bare — the +/- counts already say it changed within the file.
+ */
+const STATUS_LETTER: Record<DiffFileStatus, { letter: string; className: string; title: string }> = {
+  added: { letter: 'A', className: 'text-success', title: 'Added file' },
+  modified: { letter: 'M', className: 'text-muted-foreground', title: 'Modified file' },
+  deleted: { letter: 'D', className: 'text-destructive', title: 'Deleted file' },
+  renamed: { letter: 'R', className: 'text-[#007aff]', title: 'Renamed file' },
+};
+
+const FileStatusLetter: React.FC<{ status: DiffFileStatus; oldPath?: string }> = ({ status, oldPath }) => {
+  // Match the file tree: only added/deleted/renamed get a badge; modified is
+  // bare (the +/- counts already convey that it changed within the file).
+  if (status === 'modified') return null;
+  const meta = STATUS_LETTER[status];
+  const title = status === 'renamed' && oldPath ? `Renamed from ${oldPath}` : meta.title;
+  return (
+    <span
+      className={`flex-none font-semibold leading-none ${meta.className}`}
+      title={title}
+      aria-label={title}
+    >
+      {meta.letter}
+    </span>
+  );
+};
+
+/** Count +/- lines in a unified patch (ignores the +++/--- file headers). */
+function countChanges(patch: string): { additions: number; deletions: number } {
+  let additions = 0;
+  let deletions = 0;
+  for (const line of patch.split('\n')) {
+    if (line[0] === '+' && !line.startsWith('+++')) additions++;
+    else if (line[0] === '-' && !line.startsWith('---')) deletions++;
+  }
+  return { additions, deletions };
 }
 
 /** Sticky file header with file path, Viewed toggle, Git Add, and Copy Diff button */
 export const FileHeader: React.FC<FileHeaderProps> = ({
   filePath,
   patch,
+  status,
+  oldPath,
   isViewed = false,
   onToggleViewed,
   isStaged = false,
@@ -25,23 +101,101 @@ export const FileHeader: React.FC<FileHeaderProps> = ({
   canStage = false,
   stageError,
   onFileComment,
+  fileCommentButtonRef,
+  collapseToggle,
+  onCollapseToggle,
 }) => {
-  const [copied, setCopied] = useState(false);
+  const [headerWidth, setHeaderWidth] = useState<number>(0);
+  const state = useReviewStateOptional();
+  const headerRef = useRef<HTMLDivElement>(null);
   const fileCommentRef = useRef<HTMLButtonElement>(null);
+  const { directory, name } = splitFilePath(filePath);
+  const isCompact = headerWidth > 0 && headerWidth < 760;
+  const isVeryTight = headerWidth > 0 && headerWidth < 480;
+  const showFilenameOnly = headerWidth > 0 && headerWidth < 560;
+  const truncatedName = showFilenameOnly
+    ? frontEllipsize(
+        name,
+        headerWidth < 360 ? 14 : headerWidth < 420 ? 18 : headerWidth < 500 ? 24 : 32,
+      )
+    : name;
+
+  useEffect(() => {
+    if (!headerRef.current || typeof ResizeObserver === 'undefined') return;
+
+    const node = headerRef.current;
+    const observer = new ResizeObserver(([entry]) => {
+      setHeaderWidth(entry.contentRect.width);
+    });
+
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, []);
+
+  const stageLabel = isVeryTight ? '' : isCompact ? (isStaging ? 'Adding' : isStaged ? 'Added' : 'Add') : (isStaging ? 'Adding...' : isStaged ? 'Added' : 'Git Add');
+  const commentLabel = isVeryTight ? '' : 'Comment';
+  const viewedLabel = isVeryTight ? '' : 'Viewed';
+  const { additions, deletions } = React.useMemo(() => countChanges(patch), [patch]);
 
   return (
-    <div className="flex-shrink-0 px-4 bg-card border-b border-border flex items-center justify-between" style={{ height: 'var(--panel-header-h)' }}>
-      <span className="text-xs font-semibold text-foreground">{filePath}</span>
-      <div className="flex items-center gap-2">
+    <div
+      ref={headerRef}
+      className="flex-shrink-0 px-3 border-b border-border/50 flex items-center justify-between gap-2"
+      style={{ height: 'var(--panel-header-h)' }}
+    >
+      <div className="min-w-0 flex flex-1 items-center" onClick={onCollapseToggle} style={onCollapseToggle ? { cursor: 'pointer' } : undefined}>
+        {collapseToggle}
+        <span
+          className="min-w-0 flex items-center text-xs font-semibold leading-normal whitespace-nowrap"
+          title={status === 'renamed' && oldPath ? `${oldPath} → ${filePath}` : filePath}
+        >
+          {/* Rename: dimmed old path → new path (diffshub treatment). Dropped
+              under tight widths — the icon + tooltip still carry it. */}
+          {status === 'renamed' && oldPath && !showFilenameOnly && (
+            <>
+              <span className="min-w-0 overflow-hidden text-ellipsis text-muted-foreground/60">
+                {oldPath}
+              </span>
+              <svg
+                className="w-3 h-3 mx-1 flex-none text-muted-foreground/60"
+                fill="none"
+                viewBox="0 0 24 24"
+                stroke="currentColor"
+                strokeWidth={2}
+              >
+                <path strokeLinecap="round" strokeLinejoin="round" d="M5 12h14M13 6l6 6-6 6" />
+              </svg>
+            </>
+          )}
+          {!showFilenameOnly && directory && (
+            <span className="min-w-0 overflow-hidden text-ellipsis text-muted-foreground/70">
+              {directory}
+            </span>
+          )}
+          <span
+            className={showFilenameOnly ? 'block min-w-0 overflow-hidden whitespace-nowrap text-foreground' : 'flex-none whitespace-nowrap text-foreground'}
+          >
+            {truncatedName}
+          </span>
+        </span>
+        {(additions > 0 || deletions > 0 || (status && status !== 'modified')) && (
+          <span className="flex-none ml-2 flex items-center gap-1.5 text-xs leading-none">
+            {additions > 0 && <span className="font-mono text-success">+{additions}</span>}
+            {deletions > 0 && <span className="font-mono text-destructive">-{deletions}</span>}
+            {status && <FileStatusLetter status={status} oldPath={oldPath} />}
+          </span>
+        )}
+      </div>
+      <div className={`flex flex-shrink-0 items-center pl-2 ${isCompact ? 'gap-1' : 'gap-2'}`}>
         {onToggleViewed && (
           <button
             onClick={onToggleViewed}
-            className={`text-xs px-2 py-1 rounded transition-colors flex items-center gap-1 ${
+            className={`text-xs rounded transition-colors flex items-center ${viewedLabel ? 'gap-1 px-2 py-1' : 'px-1.5 py-1'} ${
               isViewed
                 ? 'bg-success/15 text-success'
                 : 'text-muted-foreground hover:text-foreground hover:bg-muted'
             }`}
-            title={isViewed ? "Mark as not viewed" : "Mark as viewed"}
+            title={isViewed ? "Mark as not viewed (V)" : "Mark as viewed (V)"}
           >
             {isViewed ? (
               <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
@@ -52,21 +206,21 @@ export const FileHeader: React.FC<FileHeaderProps> = ({
                 <circle cx="12" cy="12" r="9" />
               </svg>
             )}
-            Viewed
+            {viewedLabel && <span>{viewedLabel}</span>}
           </button>
         )}
         {canStage && onStage && (
           <button
             onClick={onStage}
             disabled={isStaging}
-            className={`text-xs px-2 py-1 rounded transition-colors flex items-center gap-1 ${
+            className={`text-xs rounded transition-colors flex items-center ${stageLabel ? 'gap-1 px-2 py-1' : 'px-1.5 py-1'} ${
               isStaging
                 ? 'opacity-50 cursor-not-allowed text-muted-foreground'
                 : isStaged
                   ? 'bg-primary/15 text-primary'
                   : 'text-muted-foreground hover:text-foreground hover:bg-muted'
             }`}
-            title={isStaged ? "Unstage this file (git reset)" : "Stage this file (git add)"}
+            title={isStaged ? "Unstage this file (A)" : "Stage this file (A)"}
           >
             {isStaging ? (
               <svg className="w-3.5 h-3.5 animate-spin" fill="none" viewBox="0 0 24 24">
@@ -82,54 +236,46 @@ export const FileHeader: React.FC<FileHeaderProps> = ({
                 <path strokeLinecap="round" strokeLinejoin="round" d="M12 4v16m8-8H4" />
               </svg>
             )}
-            {isStaging ? 'Adding...' : isStaged ? 'Added' : 'Git Add'}
+            {stageLabel && <span>{stageLabel}</span>}
           </button>
         )}
         {stageError && (
-          <span className="text-xs text-destructive">{stageError}</span>
+          <span className="max-w-24 truncate text-xs text-destructive" title={stageError}>
+            {stageError}
+          </span>
         )}
         {onFileComment && (
           <button
-            ref={fileCommentRef}
+            ref={(el) => {
+              fileCommentRef.current = el;
+              fileCommentButtonRef?.(el);
+            }}
             onClick={() => fileCommentRef.current && onFileComment(fileCommentRef.current)}
-            className="text-xs px-2 py-1 rounded transition-colors flex items-center gap-1 text-muted-foreground hover:text-foreground hover:bg-muted"
+            className={`text-xs rounded transition-colors flex items-center text-muted-foreground hover:text-foreground hover:bg-muted ${commentLabel ? 'gap-1 px-2 py-1' : 'px-1.5 py-1'}`}
             title="Add file-scoped comment"
           >
             <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
               <path strokeLinecap="round" strokeLinejoin="round" d="M8 10h.01M12 10h.01M16 10h.01M9 16H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-4l-4 4v-4z" />
             </svg>
-            File Comment
+            {commentLabel && <span>{commentLabel}</span>}
           </button>
         )}
-        <button
-          onClick={async () => {
-            try {
-              await navigator.clipboard.writeText(patch);
-              setCopied(true);
-              setTimeout(() => setCopied(false), 2000);
-            } catch (err) {
-              console.error('Failed to copy:', err);
-            }
-          }}
-          className="text-xs text-muted-foreground hover:text-foreground px-2 py-1 rounded hover:bg-muted transition-colors flex items-center gap-1"
-          title="Copy this file's diff"
-        >
-          {copied ? (
-            <>
-              <svg className="w-3.5 h-3.5 text-success" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
-              </svg>
-              Copied!
-            </>
-          ) : (
-            <>
-              <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                <path strokeLinecap="round" strokeLinejoin="round" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
-              </svg>
-              Copy Diff
-            </>
-          )}
-        </button>
+        <SemanticFileBadge filePath={filePath} />
+        {/* File actions: open in app (when the live checkout matches this
+            snapshot), copy path, copy file diff. Copy actions remain when a
+            PR has no checkout or a committed GitButler layer is selected. */}
+        {/* Icon-only in the header (the picked app's name shows in the dropdown),
+            matching the plan/annotate side. */}
+        <OpenInAppButton
+          filePath={filePath}
+          base={state?.agentCwd ?? null}
+          diffText={patch}
+          canOpen={
+            state?.canUseLiveWorkspaceActions !== false &&
+            !(state?.prMetadata && !state?.agentCwd) &&
+            status !== 'deleted'
+          }
+        />
       </div>
     </div>
   );

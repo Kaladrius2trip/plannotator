@@ -1,61 +1,92 @@
 import React from 'react';
-import { useTheme, type Mode } from './ThemeProvider';
+import { useTheme } from './ThemeProvider';
+import { THEME_MODES } from './themeModes';
+import { isThemeModeAvailable, resolveThemeMode } from '../utils/themeRegistry';
 
-export const ThemeTab: React.FC = () => {
-  const { mode, setMode, colorTheme, setColorTheme, availableThemes, resolvedMode } = useTheme();
+interface ThemeTabProps {
+  onPreview?: () => void;
+  compact?: boolean;
+}
+
+export const ThemeTab: React.FC<ThemeTabProps> = ({ onPreview, compact }) => {
+  const {
+    mode,
+    setMode,
+    colorTheme,
+    setColorTheme,
+    availableThemes,
+    preferredMode,
+  } = useTheme();
 
   return (
-    <>
+    <div className={compact ? '' : 'space-y-5'}>
       {/* Mode */}
-      <div className="space-y-2">
-        <label className="text-xs font-medium text-muted-foreground uppercase tracking-wide">Mode</label>
+      <div className={compact ? 'flex items-center gap-3 mb-2' : 'space-y-2'}>
+        {!compact && <label className="text-xs font-medium text-muted-foreground uppercase tracking-wide">Mode</label>}
         <div className="flex gap-1">
-          {(['dark', 'light', 'system'] as Mode[]).map(m => (
-            <button
-              key={m}
-              onClick={() => setMode(m)}
-              className={`px-2.5 py-1.5 rounded-md text-xs font-medium transition-colors ${
-                mode === m
-                  ? 'bg-primary text-primary-foreground'
-                  : 'bg-muted text-muted-foreground hover:text-foreground'
-              }`}
-            >
-              {m === 'dark' && (
+          {THEME_MODES.map(({ id, label, Icon }) => {
+            const available = isThemeModeAvailable(colorTheme, id);
+            return (
+              <button
+                key={id}
+                disabled={!available}
+                title={available ? undefined : 'Not supported by the current color theme'}
+                onClick={() => setMode(id)}
+                className={`px-2.5 py-1.5 rounded-md text-xs font-medium transition-colors ${
+                  !available
+                    ? 'cursor-not-allowed bg-muted text-muted-foreground opacity-40'
+                    : mode === id
+                      ? 'bg-primary text-primary-foreground'
+                      : 'bg-muted text-muted-foreground hover:text-foreground'
+                }`}
+              >
                 <span className="flex items-center gap-1.5">
-                  <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                    <path strokeLinecap="round" strokeLinejoin="round" d="M21.752 15.002A9.718 9.718 0 0118 15.75c-5.385 0-9.75-4.365-9.75-9.75 0-1.33.266-2.597.748-3.752A9.753 9.753 0 003 11.25C3 16.635 7.365 21 12.75 21a9.753 9.753 0 009.002-5.998z" />
-                  </svg>
-                  Dark
+                  <Icon className="w-3 h-3" />
+                  {label}
                 </span>
-              )}
-              {m === 'light' && (
-                <span className="flex items-center gap-1.5">
-                  <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                    <path strokeLinecap="round" strokeLinejoin="round" d="M12 3v2.25m6.364.386l-1.591 1.591M21 12h-2.25m-.386 6.364l-1.591-1.591M12 18.75V21m-4.773-4.227l-1.591 1.591M5.25 12H3m4.227-4.773L5.636 5.636M15.75 12a3.75 3.75 0 11-7.5 0 3.75 3.75 0 017.5 0z" />
-                  </svg>
-                  Light
-                </span>
-              )}
-              {m === 'system' && (
-                <span className="flex items-center gap-1.5">
-                  <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                    <path strokeLinecap="round" strokeLinejoin="round" d="M9 17.25v1.007a3 3 0 01-.879 2.122L7.5 21h9l-.621-.621A3 3 0 0115 18.257V17.25m6-12V15a2.25 2.25 0 01-2.25 2.25H5.25A2.25 2.25 0 013 15V5.25m18 0A2.25 2.25 0 0018.75 3H5.25A2.25 2.25 0 003 5.25m18 0V12a2.25 2.25 0 01-2.25 2.25H5.25A2.25 2.25 0 013 12V5.25" />
-                  </svg>
-                  System
-                </span>
-              )}
-            </button>
-          ))}
+              </button>
+            );
+          })}
         </div>
+        {compact && (
+          <span className="text-[10px] text-muted-foreground/60 ml-auto flex items-center gap-1">
+            <svg className="w-2.5 h-2.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M4 6h16M4 12h16M4 18h7" />
+            </svg>
+            syntax match
+          </span>
+        )}
       </div>
 
       {/* Theme */}
-      <div className="space-y-2">
-        <label className="text-xs font-medium text-muted-foreground uppercase tracking-wide">Theme</label>
-        <div className="grid grid-cols-3 gap-2 overflow-y-auto pr-1">
+      <div className={compact ? '' : 'space-y-3'}>
+        {!compact && (
+          <div className="flex items-center justify-between border-t border-border pt-5">
+            <label className="text-xs font-medium text-muted-foreground uppercase tracking-wide">Theme</label>
+            <div className="flex items-center gap-3">
+              <span className="text-[10px] text-muted-foreground/70 flex items-center gap-1">
+                <svg className="w-2.5 h-2.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M4 6h16M4 12h16M4 18h7" />
+                </svg>
+                = matched syntax colors
+              </span>
+              {onPreview && (
+                <button
+                  onClick={onPreview}
+                  className="px-1.5 py-0.5 rounded text-[10px] font-medium bg-primary/10 text-primary border border-primary/20 hover:bg-primary/20 hover:border-primary/40 transition-colors"
+                >
+                  Preview Mode
+                </button>
+              )}
+            </div>
+          </div>
+        )}
+        <div className={`grid gap-2 overflow-y-auto pr-1 ${compact ? 'grid-cols-4' : 'grid-cols-3'}`}>
           {availableThemes.map(theme => {
             const isSelected = colorTheme === theme.id;
-            const colors = theme.colors[resolvedMode];
+            const previewMode = resolveThemeMode(theme.id, preferredMode);
+            const colors = theme.colors[previewMode];
+            const modeUnavailable = !isThemeModeAvailable(theme.id, preferredMode);
             return (
               <button
                 key={theme.id}
@@ -63,9 +94,19 @@ export const ThemeTab: React.FC = () => {
                 className={`relative p-2 rounded-md border text-left transition-colors ${
                   isSelected
                     ? 'border-primary bg-primary/5'
-                    : 'border-border hover:border-muted-foreground/30 hover:bg-muted/30'
+                    : modeUnavailable
+                      ? 'border-border/50 opacity-45'
+                      : 'border-border hover:border-muted-foreground/30 hover:bg-muted/30'
                 }`}
               >
+                {/* Syntax highlighting badge */}
+                {theme.syntaxHighlighting && (
+                  <div className="absolute top-1 right-1" title="Matched syntax highlighting in diffs">
+                    <svg className="w-2.5 h-2.5 text-muted-foreground/50" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M4 6h16M4 12h16M4 18h7" />
+                    </svg>
+                  </div>
+                )}
                 {/* Color swatches */}
                 <div className="flex gap-1 mb-1.5">
                   {[colors.primary, colors.secondary, colors.accent, colors.background, colors.foreground].map((color, i) => (
@@ -90,6 +131,6 @@ export const ThemeTab: React.FC = () => {
           })}
         </div>
       </div>
-    </>
+    </div>
   );
 };

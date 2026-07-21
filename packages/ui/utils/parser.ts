@@ -1,5 +1,5 @@
-import { Block, type Annotation, type EditorAnnotation, type ImageAttachment } from '../types';
-import { planDenyFeedback } from '@plannotator/shared/feedback-templates';
+import type { Block, Annotation, CodeAnnotation, EditorAnnotation, ImageAttachment } from '../types';
+import { planDenyFeedback } from '@plannotator/core/feedback-templates';
 
 /**
  * Parsed YAML frontmatter as key-value pairs.
@@ -10,23 +10,34 @@ export interface Frontmatter {
 
 /**
  * Extract YAML frontmatter from markdown if present.
- * Returns both the parsed frontmatter and the remaining markdown.
+ * Returns the parsed frontmatter, the remaining markdown, and the 1-based
+ * line number where content begins in the original file (so downstream
+ * line references stay accurate).
  */
-export function extractFrontmatter(markdown: string): { frontmatter: Frontmatter | null; content: string } {
+export function extractFrontmatter(markdown: string): { frontmatter: Frontmatter | null; content: string; contentStartLine: number } {
   const trimmed = markdown.trimStart();
   if (!trimmed.startsWith('---')) {
-    return { frontmatter: null, content: markdown };
+    return { frontmatter: null, content: markdown, contentStartLine: 1 };
   }
 
   // Find the closing ---
   const endIndex = trimmed.indexOf('\n---', 3);
   if (endIndex === -1) {
-    return { frontmatter: null, content: markdown };
+    return { frontmatter: null, content: markdown, contentStartLine: 1 };
   }
 
   // Extract frontmatter content (between the --- delimiters)
   const frontmatterRaw = trimmed.slice(4, endIndex).trim();
-  const afterFrontmatter = trimmed.slice(endIndex + 4).trimStart();
+  const rawAfterFrontmatter = trimmed.slice(endIndex + 4);
+  const afterFrontmatter = rawAfterFrontmatter.trimStart();
+
+  // Compute the 1-based line where content begins in the original file.
+  // Account for: leading whitespace trimmed from original, the frontmatter
+  // block itself, and any blank lines between closing --- and first content.
+  const leadingChars = markdown.length - trimmed.length;
+  const consumedInTrimmed = endIndex + 4 + (rawAfterFrontmatter.length - afterFrontmatter.length);
+  const consumedTotal = leadingChars + consumedInTrimmed;
+  const contentStartLine = (markdown.slice(0, consumedTotal).match(/\n/g) || []).length + 1;
 
   // Parse simple YAML (key: value pairs)
   const frontmatter: Frontmatter = {};
@@ -60,7 +71,44 @@ export function extractFrontmatter(markdown: string): { frontmatter: Frontmatter
     }
   }
 
-  return { frontmatter, content: afterFrontmatter };
+  return { frontmatter, content: afterFrontmatter, contentStartLine };
+}
+
+/**
+ * Tag names that trigger a raw HTML block per CommonMark §4.6, Type 6.
+ * A line starting with `<tag` or `</tag` (where `tag` is in this set) opens
+ * an HTML block that continues verbatim until a blank line or EOF.
+ *
+ * Inline-only tags (`kbd`, `sub`, `sup`, `mark`, etc.) are NOT here — a line
+ * that happens to start with one of those still goes through the paragraph
+ * path and renders as escaped text, matching prior behavior.
+ */
+export const HTML_BLOCK_TAGS: ReadonlySet<string> = new Set([
+  'details', 'summary',
+  'div', 'section', 'article', 'aside', 'header', 'footer',
+  'blockquote', 'pre',
+  'table', 'thead', 'tbody', 'tr', 'td', 'th',
+  'ul', 'ol', 'li', 'p',
+  // Media: GitHub embeds screenshots/videos as raw HTML on their own line.
+  'img', 'video', 'picture',
+]);
+
+/** Void elements — no closing tag, so the block is a single line (don't scan
+ *  ahead for a `</tag>` that will never come). */
+const VOID_HTML_TAGS: ReadonlySet<string> = new Set([
+  'img', 'br', 'hr', 'source', 'input', 'wbr', 'area', 'col', 'embed',
+]);
+
+const HTML_BLOCK_OPEN_RE = /^<\/?([a-zA-Z][a-zA-Z0-9]*)(?:\s|>|\/|$)/;
+
+export interface ParseMarkdownOptions {
+  /**
+   * Strip a leading `--- ... ---` pair as frontmatter (default true).
+   * Pass false for non-markdown plain-text sources (.yaml/.json/.txt/…)
+   * where the delimiters are real content — a multi-document YAML starts
+   * with them (see shouldStripFrontmatter in @plannotator/core/annotatable).
+   */
+  frontmatter?: boolean;
 }
 
 /**
@@ -68,8 +116,11 @@ export function extractFrontmatter(markdown: string): { frontmatter: Frontmatter
  * For a production app, we would use a robust AST walker (remark),
  * but for this demo, we want predictable text-anchoring.
  */
-export const parseMarkdownToBlocks = (markdown: string): Block[] => {
-  const { content: cleanMarkdown } = extractFrontmatter(markdown);
+export const parseMarkdownToBlocks = (markdown: string, options?: ParseMarkdownOptions): Block[] => {
+  const { content: cleanMarkdown, contentStartLine } =
+    options?.frontmatter === false
+      ? { content: markdown, contentStartLine: 1 }
+      : extractFrontmatter(markdown);
   const lines = cleanMarkdown.split('\n');
   const blocks: Block[] = [];
   let currentId = 0;
@@ -77,7 +128,8 @@ export const parseMarkdownToBlocks = (markdown: string): Block[] => {
   let buffer: string[] = [];
   let currentType: Block['type'] = 'paragraph';
   let currentLevel = 0;
-  let bufferStartLine = 1; // Track the start line of the current buffer
+  let bufferStartLine = contentStartLine;
+  let lastLineWasBlank = false;
 
   const flush = () => {
     if (buffer.length > 0) {
@@ -97,7 +149,9 @@ export const parseMarkdownToBlocks = (markdown: string): Block[] => {
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
     const trimmed = line.trim();
-    const currentLineNum = i + 1; // 1-based index
+    const currentLineNum = i + contentStartLine;
+    const prevLineWasBlank = lastLineWasBlank;
+    lastLineWasBlank = false;
 
     // Headings
     if (trimmed.startsWith('#')) {
@@ -128,7 +182,8 @@ export const parseMarkdownToBlocks = (markdown: string): Block[] => {
     }
 
     // List Items (Simple detection)
-    if (trimmed.match(/^(\*|-|\d+\.)\s/)) {
+    const listMatch = trimmed.match(/^(\*|-|(\d+)\.)\s/);
+    if (listMatch) {
       flush(); // Treat each list item as a separate block for easier annotation
       // Calculate indentation level from leading whitespace
       const leadingWhitespace = line.match(/^(\s*)/)?.[1] || '';
@@ -136,8 +191,12 @@ export const parseMarkdownToBlocks = (markdown: string): Block[] => {
       const spaceCount = leadingWhitespace.replace(/\t/g, '  ').length;
       const listLevel = Math.floor(spaceCount / 2);
 
+      // Distinguish numeric markers (\d+.) from bullet markers (* / -)
+      const ordered = listMatch[2] !== undefined;
+      const orderedStart = ordered ? parseInt(listMatch[2]!, 10) : undefined;
+
       // Remove list marker
-      let content = trimmed.replace(/^(\*|-|\d+\.)\s/, '');
+      let content = trimmed.slice(listMatch[0].length);
 
       // Check for checkbox syntax: [ ] or [x] or [X]
       let checked: boolean | undefined = undefined;
@@ -153,24 +212,71 @@ export const parseMarkdownToBlocks = (markdown: string): Block[] => {
         content,
         level: listLevel,
         checked,
+        ordered: ordered || undefined,
+        orderedStart,
         order: currentId,
         startLine: currentLineNum
       });
       continue;
     }
 
-    // Blockquotes
+    // Blockquotes — consecutive `>` lines merge into one block so wrapped
+    // paragraph quotes render as a single continuous quote box. A blank line
+    // breaks the blockquote so the next `>` starts a fresh one.
+    //
+    // Exception: if the stripped content starts with a block-level marker
+    // (list item, heading, code fence, nested blockquote) we do NOT merge.
+    // Our flat block model can't render a list-inside-a-quote as an actual
+    // nested list, so merging would flatten the markers into run-on inline
+    // text. Leaving them as separate blockquote blocks preserves each line's
+    // visual identity (a stacked-box layout) — imperfect but legible. A
+    // proper recursive blockquote parser is tracked as a follow-up.
     if (trimmed.startsWith('>')) {
-       // Check if previous was blockquote, if so, merge? No, separate for now
-       flush();
-       blocks.push({
-         id: `block-${currentId++}`,
-         type: 'blockquote',
-         content: trimmed.replace(/^>\s*/, ''),
-         order: currentId,
-         startLine: currentLineNum
-       });
-       continue;
+      flush();
+      const stripped = trimmed.replace(/^>\s*/, '');
+      // List markers require trailing whitespace to avoid matching inline
+      // text like "-hyphen" or "1.5 seconds"; headings, code fences, and
+      // nested blockquote markers don't require it (``` can be followed
+      // directly by a language tag, # can start a dense heading).
+      const blockMarkerRe = /^(?:(?:\*|-|\d+\.)\s|#|```|>)/;
+      const hasBlockMarker = blockMarkerRe.test(stripped);
+      const prevBlock = blocks.length > 0 ? blocks[blocks.length - 1] : null;
+      // Don't merge into a previous blockquote whose content itself starts
+      // with a block marker — otherwise a `> some text` line following a
+      // `> 1. item` line would get glued onto the list-item block.
+      const prevIsMarkerQuote =
+        prevBlock?.type === 'blockquote' && blockMarkerRe.test(prevBlock.content);
+      // Alerts own their body: once a blockquote is tagged as an alert,
+      // subsequent `>` lines always merge into it (until a blank line).
+      // Without this, `> [!NOTE]\n> - item` splits the list item off into
+      // a separate plain quote, losing the callout.
+      const prevIsAlert = prevBlock?.type === 'blockquote' && !!prevBlock.alertKind;
+      const shouldMergeIntoAlert = prevIsAlert && !prevLineWasBlank;
+      const shouldMergeNormal =
+        !hasBlockMarker &&
+        !prevIsMarkerQuote &&
+        !prevLineWasBlank &&
+        prevBlock?.type === 'blockquote';
+      if (shouldMergeIntoAlert || shouldMergeNormal) {
+        prevBlock!.content = prevBlock!.content
+          ? prevBlock!.content + '\n' + stripped
+          : stripped;
+      } else {
+        // GitHub alert marker: a blockquote whose first line is [!KIND].
+        // We strip the marker from content and tag the block; rendering decides the style.
+        const alertMatch = stripped.match(/^\[!(NOTE|TIP|WARNING|CAUTION|IMPORTANT)\]\s*$/i);
+        blocks.push({
+          id: `block-${currentId++}`,
+          type: 'blockquote',
+          content: alertMatch ? '' : stripped,
+          alertKind: alertMatch
+            ? (alertMatch[1].toLowerCase() as 'note' | 'tip' | 'warning' | 'caution' | 'important')
+            : undefined,
+          order: currentId,
+          startLine: currentLineNum
+        });
+      }
+      continue;
     }
     
     // Code blocks (naive)
@@ -179,7 +285,7 @@ export const parseMarkdownToBlocks = (markdown: string): Block[] => {
       const codeStartLine = currentLineNum;
       // Count backticks in opening fence to support nested fences (e.g. ```` wrapping ```)
       const fenceLen = trimmed.match(/^`+/)?.[0].length ?? 3;
-      const closingFence = new RegExp('^`{' + fenceLen + ',}\\s*$');
+      const closingFence = new RegExp('^\\s*`{' + fenceLen + ',}');
       // Extract language from fence (e.g., ```rust → "rust")
       const language = trimmed.slice(fenceLen).trim() || undefined;
       // Fast forward until end of code block
@@ -200,8 +306,131 @@ export const parseMarkdownToBlocks = (markdown: string): Block[] => {
       continue;
     }
 
-    // Tables (lines starting and containing |)
-    if (trimmed.startsWith('|') || (trimmed.includes('|') && trimmed.match(/^\|?.+\|.+\|?$/))) {
+    // Display math: $$ ... $$ — only when a closing $$ actually exists. An
+    // unclosed $$ (a stray delimiter or informal money like "$$100k for infra")
+    // must NOT swallow the rest of the document: scan ahead without committing,
+    // and if there's no close, fall through and treat the line as ordinary text.
+    if (trimmed.startsWith('$$')) {
+      const mathStartLine = currentLineNum;
+      const afterOpen = trimmed.slice(2);
+      const mathLines: string[] = [];
+      let remainder = '';
+      let closed = false;
+      let closeLine = i;
+      // Find the closing $$ anywhere on the opening line (not just at its end),
+      // so `$$x$$.` or `$$x$$ trailing` close correctly instead of running on.
+      const inlineClose = afterOpen.indexOf('$$');
+      if (inlineClose !== -1) {
+        const body = afterOpen.slice(0, inlineClose).trim();
+        if (body) mathLines.push(body);
+        remainder = afterOpen.slice(inlineClose + 2).trim();
+        closed = true;
+      } else {
+        const scanned: string[] = afterOpen.trim() ? [afterOpen.trim()] : [];
+        let j = i;
+        while (j + 1 < lines.length) {
+          j++;
+          // A blank line ends the search: real $$…$$ has no blank line before its
+          // close, so a blank means this opener was never closed. Stopping here
+          // also prevents matching a stray $$ far below (e.g. inside a later code
+          // fence) and swallowing everything in between.
+          if (lines[j].trim() === '') break;
+          const closeAt = lines[j].indexOf('$$');
+          if (closeAt !== -1) {
+            const before = lines[j].slice(0, closeAt);
+            if (before.trim()) scanned.push(before);
+            remainder = lines[j].slice(closeAt + 2).trim();
+            closed = true;
+            closeLine = j;
+            break;
+          }
+          scanned.push(lines[j]);
+        }
+        if (closed) for (const s of scanned) mathLines.push(s);
+      }
+
+      if (closed) {
+        flush();
+        i = closeLine;
+        blocks.push({
+          id: `block-${currentId++}`,
+          type: 'math',
+          content: mathLines.join('\n'),
+          order: currentId,
+          startLine: mathStartLine,
+          sourceLineCount: i + contentStartLine - mathStartLine + 1,
+        });
+        // Trailing text after the closing $$ isn't math — reprocess it as its own
+        // line so it renders normally instead of being swallowed into the block.
+        if (remainder) {
+          lines[i] = remainder;
+          i--;
+        }
+        continue;
+      }
+      // No closing $$ found — not display math; fall through to normal handling.
+    }
+
+    // Display math: \[ ... \] — same unclosed-guard as $$ above: only treat as
+    // math when the closing \] exists, so a stray `\[deprecated\]`-style line or
+    // an unclosed `\[` doesn't swallow the rest of the document.
+    if (trimmed.startsWith('\\[')) {
+      const mathStartLine = currentLineNum;
+      const afterOpen = trimmed.slice(2);
+      const mathLines: string[] = [];
+      let remainder = '';
+      let closed = false;
+      let closeLine = i;
+      const inlineClose = afterOpen.indexOf('\\]');
+      if (inlineClose !== -1) {
+        const body = afterOpen.slice(0, inlineClose).trim();
+        if (body) mathLines.push(body);
+        remainder = afterOpen.slice(inlineClose + 2).trim();
+        closed = true;
+      } else {
+        const scanned: string[] = afterOpen.trim() ? [afterOpen.trim()] : [];
+        let j = i;
+        while (j + 1 < lines.length) {
+          j++;
+          // Blank line ends the search (see the $$ branch): unclosed \[ must not
+          // swallow later blocks or match a stray \] inside a later code fence.
+          if (lines[j].trim() === '') break;
+          const closeAt = lines[j].indexOf('\\]');
+          if (closeAt !== -1) {
+            const before = lines[j].slice(0, closeAt);
+            if (before.trim()) scanned.push(before);
+            remainder = lines[j].slice(closeAt + 2).trim();
+            closed = true;
+            closeLine = j;
+            break;
+          }
+          scanned.push(lines[j]);
+        }
+        if (closed) for (const s of scanned) mathLines.push(s);
+      }
+
+      if (closed) {
+        flush();
+        i = closeLine;
+        blocks.push({
+          id: `block-${currentId++}`,
+          type: 'math',
+          content: mathLines.join('\n'),
+          order: currentId,
+          startLine: mathStartLine,
+          sourceLineCount: i + contentStartLine - mathStartLine + 1,
+        });
+        if (remainder) {
+          lines[i] = remainder;
+          i--;
+        }
+        continue;
+      }
+      // No closing \] found — not display math; fall through to normal handling.
+    }
+
+    // Tables (lines starting with |)
+    if (trimmed.startsWith('|')) {
       flush();
       const tableStartLine = currentLineNum;
       const tableLines: string[] = [line];
@@ -209,8 +438,8 @@ export const parseMarkdownToBlocks = (markdown: string): Block[] => {
       // Collect all consecutive table lines
       while (i + 1 < lines.length) {
         const nextLine = lines[i + 1].trim();
-        // Continue if line has table structure (contains | and looks like table content)
-        if (nextLine.startsWith('|') || (nextLine.includes('|') && nextLine.match(/^\|?.+\|.+\|?$/))) {
+        // Continue if line starts with | (table row or separator)
+        if (nextLine.startsWith('|')) {
           i++;
           tableLines.push(lines[i]);
         } else {
@@ -228,10 +457,111 @@ export const parseMarkdownToBlocks = (markdown: string): Block[] => {
       continue;
     }
 
+    // Raw HTML blocks. A line starting with a known block-level HTML tag
+    // opens an HTML block. For opening tags we accumulate until the matching
+    // close tag is balanced (so `<details>…blank line…</details>` renders as
+    // one unit, matching GitHub's flavored behavior rather than strict
+    // CommonMark §4.6 Type 6 blank-line termination). For a line that starts
+    // with a close tag, we fall back to blank-line termination. Content is
+    // sanitized at render time, not here.
+    // Directive container: `:::kind` opens, `:::` closes. Inline kind is
+    // restricted to simple identifiers (letters, digits, hyphens). Body is
+    // accumulated verbatim and rendered with inline markdown.
+    const directiveOpen = trimmed.match(/^:::\s*([a-zA-Z][a-zA-Z0-9-]*)\s*$/);
+    if (directiveOpen) {
+      flush();
+      const directiveStartLine = currentLineNum;
+      const kind = directiveOpen[1].toLowerCase();
+      const bodyLines: string[] = [];
+      while (i + 1 < lines.length) {
+        i++;
+        if (lines[i].trim() === ':::') break;
+        bodyLines.push(lines[i]);
+      }
+      blocks.push({
+        id: `block-${currentId++}`,
+        type: 'directive',
+        content: bodyLines.join('\n'),
+        directiveKind: kind,
+        order: currentId,
+        startLine: directiveStartLine,
+      });
+      continue;
+    }
+
+    const htmlTagMatch = trimmed.match(HTML_BLOCK_OPEN_RE);
+    if (htmlTagMatch && HTML_BLOCK_TAGS.has(htmlTagMatch[1].toLowerCase())) {
+      flush();
+      const htmlStartLine = currentLineNum;
+      const tagName = htmlTagMatch[1].toLowerCase();
+      const isCloseTag = trimmed.startsWith('</');
+      const htmlLines: string[] = [line];
+
+      if (isCloseTag) {
+        while (i + 1 < lines.length && lines[i + 1].trim() !== '') {
+          i++;
+          htmlLines.push(lines[i]);
+        }
+      } else if (VOID_HTML_TAGS.has(tagName)) {
+        // Void element (e.g. <img>): no closing tag, but attributes can wrap across
+        // lines. Consume until the line that actually closes the tag with `>` so a
+        // multi-line <img> isn't truncated to a bare `<img` fragment.
+        while (!lines[i].includes('>') && i + 1 < lines.length && lines[i + 1].trim() !== '') {
+          i++;
+          htmlLines.push(lines[i]);
+        }
+      } else {
+        const openRe = new RegExp(`<${tagName}(?:\\s|>|/|$)`, 'gi');
+        const closeRe = new RegExp(`</${tagName}\\s*>`, 'gi');
+        const depth = (line.match(openRe) || []).length - (line.match(closeRe) || []).length;
+        if (depth > 0) {
+          // Scan ahead for the matching close tag. If none is ever found — a
+          // self-closing <video/>, or an unclosed <picture>/<div> — do NOT swallow
+          // the rest of the document into this block; keep it to the opening line.
+          let j = i;
+          let d = depth;
+          const scanned: string[] = [];
+          while (d > 0 && j + 1 < lines.length) {
+            j++;
+            scanned.push(lines[j]);
+            d += (lines[j].match(openRe) || []).length;
+            d -= (lines[j].match(closeRe) || []).length;
+          }
+          if (d === 0) {
+            i = j;
+            for (const s of scanned) htmlLines.push(s);
+          }
+        }
+      }
+
+      blocks.push({
+        id: `block-${currentId++}`,
+        type: 'html',
+        content: htmlLines.join('\n'),
+        order: currentId,
+        startLine: htmlStartLine,
+      });
+      continue;
+    }
+
     // Empty lines separate paragraphs
     if (trimmed === '') {
       flush();
       currentType = 'paragraph';
+      lastLineWasBlank = true;
+      continue;
+    }
+    // List continuation: indented line after a list item merges into it.
+    // Tight (no blank line): 1+ whitespace, joined with \n (same paragraph).
+    // Loose (after blank line): 2+ spaces, joined with \n\n (new paragraph within the item).
+    if (
+      buffer.length === 0 &&
+      blocks.length > 0 &&
+      blocks[blocks.length - 1].type === 'list-item' &&
+      (prevLineWasBlank ? /^\s{2,}/ : /^\s+/).test(line)
+    ) {
+      const sep = prevLineWasBlank ? '\n\n' : '\n';
+      blocks[blocks.length - 1].content += sep + trimmed;
       continue;
     }
 
@@ -247,11 +577,116 @@ export const parseMarkdownToBlocks = (markdown: string): Block[] => {
   return blocks;
 };
 
+/**
+ * Compute the display index for each list item in a contiguous list group.
+ *
+ * Returns a parallel array where each entry is either:
+ *   - a positive integer (the numeral to render for an ordered item), or
+ *   - null (the item is unordered, render a bullet symbol).
+ *
+ * Semantics:
+ *   - A run of consecutive ordered items at the same level increments
+ *     sequentially. The first item in a run uses its `orderedStart` (the
+ *     number from the source markdown); subsequent items renumber from there
+ *     so `1. / 2. / 5.` renders as 1, 2, 3 (matches CommonMark).
+ *   - An unordered item at level L breaks the ordered streak at L. The next
+ *     ordered item at L restarts from its own `orderedStart`.
+ *   - Visiting a level shallower than the current one truncates deeper-level
+ *     state, so re-entering that depth later starts fresh. Top-level numbering
+ *     continues across nested children of any kind.
+ */
+export const computeListIndices = (blocks: Block[]): (number | null)[] => {
+  const counters: number[] = [];
+  const lastOrderedAtLevel: boolean[] = [];
+
+  return blocks.map(block => {
+    const lvl = block.level || 0;
+    // Sibling change at any deeper level resets those levels.
+    counters.length = lvl + 1;
+    lastOrderedAtLevel.length = lvl + 1;
+
+    if (!block.ordered) {
+      lastOrderedAtLevel[lvl] = false;
+      return null;
+    }
+
+    if (lastOrderedAtLevel[lvl]) {
+      counters[lvl] = (counters[lvl] ?? 0) + 1;
+    } else {
+      counters[lvl] = block.orderedStart ?? 1;
+    }
+    lastOrderedAtLevel[lvl] = true;
+    return counters[lvl];
+  });
+};
+
+/** A run of blocks to render: a single block, or consecutive list items grouped
+ *  together so list numbering/indent can be computed across the run. */
+export type RenderGroup =
+  | { type: 'single'; block: Block }
+  | { type: 'list-group'; blocks: Block[]; key: string };
+
+/** Groups consecutive list-item blocks so a list renders as one unit. */
+export function groupBlocks(blocks: Block[]): RenderGroup[] {
+  const groups: RenderGroup[] = [];
+  let i = 0;
+  while (i < blocks.length) {
+    if (blocks[i].type === 'list-item') {
+      const listBlocks: Block[] = [];
+      while (i < blocks.length && blocks[i].type === 'list-item') {
+        listBlocks.push(blocks[i]);
+        i++;
+      }
+      groups.push({ type: 'list-group', blocks: listBlocks, key: `list-${listBlocks[0].id}` });
+    } else {
+      groups.push({ type: 'single', block: blocks[i] });
+      i++;
+    }
+  }
+  return groups;
+}
+
 /** Wrap feedback output with the deny preamble for pasting into agent sessions */
 export const wrapFeedbackForAgent = (feedback: string): string =>
   planDenyFeedback(feedback);
 
-export const exportAnnotations = (blocks: Block[], annotations: any[], globalAttachments: ImageAttachment[] = [], title: string = 'Plan Feedback', subject: string = 'plan'): string => {
+export interface ExportAnnotationsOptions {
+  sourceConverted?: boolean;
+}
+
+/** Compute the end line of a block from its content and type. */
+const blockEndLine = (block: Block): number => {
+  if (block.sourceLineCount && block.sourceLineCount > 0) {
+    return block.startLine + block.sourceLineCount - 1;
+  }
+  if (!block.content) return block.startLine;
+  const contentLines = block.content.split('\n').length;
+  if (block.type === 'code') return block.startLine + contentLines + 1;
+  if (block.type === 'directive') return block.startLine + contentLines + 1;
+  if (block.alertKind) return block.startLine + contentLines;
+  return block.startLine + contentLines - 1;
+};
+
+/** Resolve the source-line label for a single annotation.
+ *  Returns null for global comments, diff-view annotations, or missing blocks. */
+const lineLabelForAnnotation = (blocks: Block[], ann: any): string | null => {
+  if (!ann.blockId || ann.type === 'GLOBAL_COMMENT') return null;
+  if (typeof ann.blockId === 'string' && ann.blockId.startsWith('diff-block-')) return null;
+  const block = blocks.find(b => b.id === ann.blockId);
+  if (!block || typeof block.startLine !== 'number') return null;
+  const end = blockEndLine(block);
+  if (end <= block.startLine) return `line ${block.startLine}`;
+  return `lines ${block.startLine}–${end}`;
+};
+
+export const exportAnnotations = (
+  blocks: Block[],
+  annotations: any[],
+  globalAttachments: ImageAttachment[] = [],
+  title: string = 'Plan Feedback',
+  subject: string = 'plan',
+  opts: ExportAnnotationsOptions = {},
+): string => {
   if (annotations.length === 0 && globalAttachments.length === 0) {
     return 'No changes detected.';
   }
@@ -265,6 +700,10 @@ export const exportAnnotations = (blocks: Block[], annotations: any[], globalAtt
   });
 
   let output = `# ${title}\n\n`;
+
+  if (opts.sourceConverted) {
+    output += `> Note: Line numbers below refer to the converted markdown, not the original HTML/URL source.\n\n`;
+  }
 
   // Add global reference images section if any
   if (globalAttachments.length > 0) {
@@ -281,13 +720,14 @@ export const exportAnnotations = (blocks: Block[], annotations: any[], globalAtt
   }
 
   sortedAnns.forEach((ann, index) => {
-    const block = blocks.find(b => b.id === ann.blockId);
-
     output += `## ${index + 1}. `;
 
     // Add diff context label if annotation was created in diff view
     if (ann.diffContext) {
       output += `[In diff content] `;
+    } else {
+      const lineLabel = lineLabelForAnnotation(blocks, ann);
+      if (lineLabel) output += `(${lineLabel}) `;
     }
 
     switch (ann.type) {
@@ -295,17 +735,6 @@ export const exportAnnotations = (blocks: Block[], annotations: any[], globalAtt
         output += `Remove this\n`;
         output += `\`\`\`\n${ann.originalText}\n\`\`\`\n`;
         output += `> I don't want this in the ${subject}.\n`;
-        break;
-
-      case 'INSERTION':
-        output += `Add this\n`;
-        output += `\`\`\`\n${ann.text}\n\`\`\`\n`;
-        break;
-
-      case 'REPLACEMENT':
-        output += `Change this\n`;
-        output += `**From:**\n\`\`\`\n${ann.originalText}\n\`\`\`\n`;
-        output += `**To:**\n\`\`\`\n${ann.text}\n\`\`\`\n`;
         break;
 
       case 'COMMENT':
@@ -357,15 +786,23 @@ export const exportAnnotations = (blocks: Block[], annotations: any[], globalAtt
   return output;
 };
 
+export interface LinkedDocAnnotationEntry {
+  annotations: Annotation[];
+  globalAttachments: ImageAttachment[];
+  markdown?: string;
+  blocks?: Block[];
+  isConverted?: boolean;
+}
+
 export const exportLinkedDocAnnotations = (
-  docAnnotations: Map<string, { annotations: Annotation[]; globalAttachments: ImageAttachment[] }>
+  docAnnotations: Map<string, LinkedDocAnnotationEntry>
 ): string => {
   let output = `\n# Linked Document Feedback\n\nThe following feedback is on documents referenced in the plan.\n\n`;
 
-  for (const [filepath, { annotations, globalAttachments }] of docAnnotations) {
+  for (const [filepath, { annotations, globalAttachments, blocks: docBlocks, isConverted }] of docAnnotations) {
     if (annotations.length === 0 && globalAttachments.length === 0) continue;
 
-    output += `## ${filepath}\n\n`;
+    output += `## ${filepath}${isConverted ? ' (converted from HTML — line numbers refer to converted markdown)' : ''}\n\n`;
 
     if (globalAttachments.length > 0) {
       output += `### Reference Images\n`;
@@ -387,22 +824,14 @@ export const exportLinkedDocAnnotations = (
     sortedAnns.forEach((ann, index) => {
       output += `### ${index + 1}. `;
 
+      const lineLabel = docBlocks ? lineLabelForAnnotation(docBlocks, ann) : null;
+      if (lineLabel) output += `(${lineLabel}) `;
+
       switch (ann.type) {
         case 'DELETION':
           output += `Remove this\n`;
           output += `\`\`\`\n${ann.originalText}\n\`\`\`\n`;
           output += `> I don't want this in the document.\n`;
-          break;
-
-        case 'INSERTION':
-          output += `Add this\n`;
-          output += `\`\`\`\n${ann.text}\n\`\`\`\n`;
-          break;
-
-        case 'REPLACEMENT':
-          output += `Change this\n`;
-          output += `**From:**\n\`\`\`\n${ann.originalText}\n\`\`\`\n`;
-          output += `**To:**\n\`\`\`\n${ann.text}\n\`\`\`\n`;
           break;
 
         case 'COMMENT':
@@ -453,4 +882,123 @@ export const exportEditorAnnotations = (editorAnnotations: EditorAnnotation[]): 
 
   output += `---\n`;
   return output;
+};
+
+export const exportCodeFileAnnotations = (annotations: CodeAnnotation[]): string => {
+  if (annotations.length === 0) return '';
+
+  let output = `\n# Code File Feedback\n\nThe following feedback is on code files referenced from the reviewed document.\n\n`;
+  const sorted = [...annotations].sort((a, b) => {
+    if (a.filePath !== b.filePath) return a.filePath.localeCompare(b.filePath);
+    if (a.lineStart !== b.lineStart) return a.lineStart - b.lineStart;
+    return a.createdAt - b.createdAt;
+  });
+
+  sorted.forEach((ann, index) => {
+    const lineRange = ann.lineStart === ann.lineEnd
+      ? `line ${ann.lineStart}`
+      : `lines ${ann.lineStart}-${ann.lineEnd}`;
+
+    output += `## ${index + 1}. ${ann.filePath} (${lineRange})\n`;
+    if (ann.originalCode) {
+      output += `\`\`\`\n${ann.originalCode}\n\`\`\`\n`;
+    }
+    if (ann.text) {
+      output += `> ${ann.text}\n`;
+    }
+    if (ann.images && ann.images.length > 0) {
+      output += `**Attached images:**\n`;
+      ann.images.forEach((img) => {
+        output += `- [${img.name}] \`${img.path}\`\n`;
+      });
+    }
+    output += '\n';
+  });
+
+  output += `---\n`;
+  return output;
+};
+
+export interface MessageAnnotationEntry {
+  messageId: string;
+  text: string;
+  timestamp?: string;
+  annotations: Annotation[];
+  globalAttachments: ImageAttachment[];
+  blocks?: Block[];
+  linkedDocs?: Map<string, LinkedDocAnnotationEntry>;
+  codeAnnotations?: CodeAnnotation[];
+}
+
+const MESSAGE_EXCERPT_MAX_CHARS = 1200;
+
+const excerptMessageText = (text: string): string => {
+  const trimmed = text.trim();
+  if (trimmed.length <= MESSAGE_EXCERPT_MAX_CHARS) return trimmed;
+  return `${trimmed.slice(0, MESSAGE_EXCERPT_MAX_CHARS).trimEnd()}...`;
+};
+
+const fencedBlock = (text: string, language = ''): string => {
+  let fence = '```';
+  while (text.includes(fence)) fence += '`';
+  return `${fence}${language}\n${text}\n${fence}\n`;
+};
+
+export const exportMessageAnnotations = (entries: MessageAnnotationEntry[]): string => {
+  const nonEmpty = entries.filter((entry) => {
+    const linkedDocCount = entry.linkedDocs
+      ? Array.from(entry.linkedDocs.values()).reduce(
+          (sum, doc) => sum + doc.annotations.length + doc.globalAttachments.length,
+          0
+        )
+      : 0;
+    return (
+      entry.annotations.length > 0 ||
+      entry.globalAttachments.length > 0 ||
+      (entry.codeAnnotations?.length ?? 0) > 0 ||
+      linkedDocCount > 0
+    );
+  });
+
+  if (nonEmpty.length === 0) {
+    return 'User reviewed the messages and has no feedback.';
+  }
+
+  let output = `# Message Feedback\n\nThe following feedback spans ${nonEmpty.length} assistant message${nonEmpty.length === 1 ? '' : 's'}. Each section includes an excerpt of the message it applies to.\n\n`;
+
+  nonEmpty.forEach((entry, index) => {
+    const label = entry.timestamp ? ` (${entry.timestamp})` : '';
+    output += `## Message ${index + 1}${label}\n\n`;
+    output += `Message excerpt:\n`;
+    output += fencedBlock(excerptMessageText(entry.text), 'markdown');
+    output += '\n';
+
+    if (entry.annotations.length > 0 || entry.globalAttachments.length > 0) {
+      output += exportAnnotations(
+        entry.blocks ?? parseMarkdownToBlocks(entry.text),
+        entry.annotations,
+        entry.globalAttachments,
+        `Feedback for Message ${index + 1}`,
+        'message',
+      );
+      output += '\n';
+    }
+
+    const hasLinkedDocFeedback = entry.linkedDocs
+      ? Array.from(entry.linkedDocs.values()).some(
+          (doc) => doc.annotations.length > 0 || doc.globalAttachments.length > 0
+        )
+      : false;
+    if (entry.linkedDocs && hasLinkedDocFeedback) {
+      output += exportLinkedDocAnnotations(entry.linkedDocs);
+      output += '\n';
+    }
+
+    if (entry.codeAnnotations?.length) {
+      output += exportCodeFileAnnotations(entry.codeAnnotations);
+      output += '\n';
+    }
+  });
+
+  return output.trimEnd();
 };
